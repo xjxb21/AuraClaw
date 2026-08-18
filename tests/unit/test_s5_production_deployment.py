@@ -122,6 +122,14 @@ def test_production_compose_mounts_least_privilege_secrets() -> None:
         "vault_token" not in secret_sources(service)
         for service in APPLICATION_SERVICES - {"credential-proxy"}
     )
+    # Session binding occurs in Task API and Java Tool execution occurs in
+    # Action Hands. No other service should be able to read the shared Token.
+    workload_token_readers = {
+        service
+        for service in APPLICATION_SERVICES
+        if "java_agent_runtime_workload_token" in secret_sources(service)
+    }
+    assert workload_token_readers == {"task-api", "action-hands"}
     assert {"seaweedfs_access_key", "seaweedfs_secret_key"} <= secret_sources(
         "artifact-service"
     )
@@ -220,6 +228,8 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
         "POLICY",
         "DELIVERY",
     )
+    java_workload_token = tmp_path / "java-workload-token"
+    java_workload_token.write_text("java-workload-token-" + "t" * 40 + "\n")
     lines = [
         "AURACLAW_IMAGE=registry.example/auraclaw:sha-0123456789",
         "AURACLAW_MIGRATION_DATABASE_URL=postgresql://migration:secret@db/auraclaw",
@@ -232,6 +242,13 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
         "SEAWEEDFS_HOST=seaweed.example",
         "SEAWEEDFS_ACCESS_KEY=test-access",
         "SEAWEEDFS_SECRET_KEY=test-secret",
+        # Java is the default Price Insight backend; preflight must see the
+        # shared runtime URL even when the env file omits the backend flag.
+        "AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL=http://agent-runtime-server",
+        # Exercise the deployment-safe path: the env file contains only a
+        # Token filename, while materialization copies its content into the
+        # ignored Compose secret directory.
+        f"AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE={java_workload_token}",
     ]
     lines.extend(
         f"{variable}=postgresql://{role}:secret@db/auraclaw"
@@ -260,6 +277,9 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
         text=True,
     )
     assert materialized.returncode == 0, materialized.stdout + materialized.stderr
+    assert (
+        secret_dir / "java_agent_runtime_workload_token"
+    ).read_text() == java_workload_token.read_text().rstrip("\r\n")
     result = subprocess.run(
         [
             sys.executable,

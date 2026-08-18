@@ -82,6 +82,10 @@ from auraclaw.composition.business_skills import (
     signed_price_insight_dependency_packages,
     signed_price_insight_package,
 )
+from auraclaw.composition.java_price_insight import (
+    build_java_agent_runtime_auth_client,
+    build_java_price_insight_executor,
+)
 from auraclaw.composition.worker_wake import WorkerWakeGate
 from auraclaw.config import Settings, get_settings
 from auraclaw.contracts.capabilities import (
@@ -109,6 +113,9 @@ from auraclaw.infrastructure.artifacts.seaweedfs import (
 from auraclaw.infrastructure.artifacts.store import ArtifactStore, InMemoryObjectStorage
 from auraclaw.infrastructure.clients.artifact import RemoteArtifactWriter
 from auraclaw.infrastructure.clients.credential import RemoteCredentialProxy
+from auraclaw.infrastructure.clients.java_price_insight import (
+    JavaPriceInsightToolExecutor,
+)
 from auraclaw.infrastructure.clients.model import RemoteModelClient
 from auraclaw.infrastructure.clients.policy import (
     RemotePolicyClient,
@@ -452,6 +459,11 @@ def _task_api_app(settings: Settings) -> FastAPI:
         task_projection = InMemoryTaskProjection()
         approval_projection = InMemoryApprovalProjection()
         collaboration_projection = InMemoryCollaborationProjection()
+    agent_session_authorizer = (
+        build_java_agent_runtime_auth_client(settings)
+        if settings.price_insight_tool_backend == "java"
+        else None
+    )
     task_service = TaskService(
         event_store=remote_session,
         relay=NoOpOutboxRelay(),
@@ -459,6 +471,7 @@ def _task_api_app(settings: Settings) -> FastAPI:
         admission=RemoteTaskAdmissionController(policy),
         approvals=approval_projection,
         approval_notifier=policy,
+        agent_session_authorizer=agent_session_authorizer,
     )
     gateway = TaskCommandGateway(task_service)
     query = TaskQueryService(task_projection, collaboration_projection, remote_session)
@@ -474,6 +487,7 @@ def _task_api_app(settings: Settings) -> FastAPI:
     app.state.closeables = (
         remote_session,
         policy,
+        *((agent_session_authorizer,) if agent_session_authorizer is not None else ()),
         *(
             (task_projection, approval_projection, collaboration_projection)
             if settings.sql_storage_enabled
@@ -1042,6 +1056,7 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
         and (
             settings.model_skill_source_configured
             or settings.resolved_price_insight_source != "disabled"
+            or settings.price_insight_tool_backend == "java"
         )
         and configured_signing_key is None
     ):
@@ -1092,6 +1107,12 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
         capability_catalog_store,
         policy if isinstance(policy, RemotePolicyClient) else None,
     )
+    java_price_executor: JavaPriceInsightToolExecutor | None = None
+    if settings.price_insight_tool_backend == "java":
+        auth_client = build_java_agent_runtime_auth_client(settings)
+        java_price_executor = build_java_price_insight_executor(settings, auth_client)
+        closeables += (auth_client, java_price_executor)
+        app.state.closeables = closeables
     price_insight_source: PriceInsightSource | None = None
     resolved_price_source = settings.resolved_price_insight_source
     if (
@@ -1120,12 +1141,15 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
             password=mysql_password.get_secret_value(),
             database=settings.price_insight_mysql_database,
         )
-    if price_insight_source is not None:
+    price_insight_enabled = (
+        java_price_executor is not None or price_insight_source is not None
+    )
+    if price_insight_enabled:
         for resource in price_insight_resources(
             settings.price_insight_target_tenant_id
         ):
             resources.register_resource(resource)
-    price_tools = price_insight_tools() if price_insight_source is not None else ()
+    price_tools = price_insight_tools() if price_insight_enabled else ()
     registry = ToolRegistry(
         (
             capability_search_tool(),
@@ -1148,7 +1172,7 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
                         policy=policy,
                     )
                 )
-        if price_insight_source is not None:
+        if price_insight_enabled:
             tenant_id = settings.price_insight_target_tenant_id
             await capability_catalog.register_server(
                 McpServerDefinition(
@@ -1192,9 +1216,12 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
     app.state.catalog_reconciler = None
     app.state.initialize = initialize_registry
     price_executor = (
-        PriceInsightToolExecutor(PriceInsightService(price_insight_source))
-        if price_insight_source is not None
-        else None
+        java_price_executor
+        or (
+            PriceInsightToolExecutor(PriceInsightService(price_insight_source))
+            if price_insight_source is not None
+            else None
+        )
     )
     routed_hands = RoutedHandsExecutor(
         LocalHandsService(workspace_root=Path.cwd()),

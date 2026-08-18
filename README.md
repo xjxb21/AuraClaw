@@ -463,6 +463,90 @@ Metrics Pipeline 和 Alert Receiver 通过同一观测端口接入。
 都不接收数据库地址、凭证、表名或原始 SQL。完整流程与回滚见
 [M12 价格洞察业务 Skill 实施与运维](docs/M12%20价格洞察业务%20Skill%20实施与运维.md)。
 
+价格洞察原子 Tool 默认由 Java Agent Runtime 执行，Skill、ToolCapability 名称和模型
+输入 Schema 不变。需要同时配置 Java 地址和共享 Workload Token：
+
+```dotenv
+AURACLAW_PRICE_INSIGHT_TOOL_BACKEND=java
+AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL=http://agent-runtime-server
+AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE=/run/secrets/java_agent_runtime_workload_token
+```
+
+仅离线调试可设 `AURACLAW_PRICE_INSIGHT_TOOL_BACKEND=python`，改回进程内 fixture/MySQL 计算。
+
+### Workload Token 首次部署与轮换
+
+不再使用 workload 公钥、私钥或 RS256。首次部署时，在 Secret Manager 中生成一个至少 32
+字符的随机 Token，并将同一个 Secret 注入 Python 和 Java：
+
+```powershell
+$bytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+[Convert]::ToHexString($bytes).ToLower()
+```
+
+Python 只配置 Token 文件：
+
+```dotenv
+AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE=/secure/secrets/auraclaw-java-workload-token
+```
+
+Java 配置 `chaintower.agent-authorization.workload-token` 和 `workload-subject`，Token
+通过 Secret 或配置中心注入，不写入仓库。生产 Compose 使用文件 Secret，将上面的 `_FILE`
+写入生产 env 文件后，先物化 Secret，再启动 `task-api` 和 `action-hands`；物化脚本会读取
+Token 文件并写入被 `.gitignore` 忽略的
+`.runtime/compose-secrets/java_agent_runtime_workload_token`：
+
+```powershell
+uv run python scripts/materialize_compose_secrets.py `
+  --env-file .env.production `
+  --output-dir .runtime/compose-secrets
+docker compose --env-file .env.production -f compose.production.yml up -d task-api action-hands
+```
+
+轮换时生成新的随机 Token，同时更新 Java Secret 和 Python Secret，安排短暂维护窗口后
+滚动重启 Java、`task-api` 和 `action-hands`。这一版只配置一个当前 Token，不保留双 Token
+兼容窗口；回滚时恢复旧 Token 并重启相关服务。
+
+创建任务时，页面桥接层应优先传入一次性 handoff 证明：
+
+```json
+{
+  "goal": "分析 2026 年第一季度采购价格",
+  "agentSessionId": "agent-session-uuid",
+  "conversationId": "conversation-001",
+  "handoffCode": "one-time-handoff-code"
+}
+```
+
+恢复兼容场景可传 `conversationId + accessToken` 进行 resolve。`POST /v1/tasks`、消息追加、
+`POST /v1/sessions/{session_id}/runs` 与 resume 均接受同一组可选授权字段，但只允许
+`agentSessionId + handoffCode` 或不含 `agentSessionId` 的 `conversationId + accessToken`；裸
+`agentSessionId` 和混合证明会被拒绝。Python 只在入站阶段消费 `handoffCode/accessToken`，
+事件与 Runtime 仅保存 `agentSessionId/conversationId`；每次业务 Tool 调用前单独签发
+Assertion，业务请求只携带 `X-CT-Tool-Assertion`、`X-CT-Invocation-Id` 与 `Content-Type`。
+Java 返回 `TOOL_ASSERTION_EXPIRED` 时最多重新签发并重试一次；Session 失效或 Grant
+过期、撤销时返回稳定的 `reauthorization_required` Tool 错误，页面应重新建立授权会话。
+
+可使用真实 Java 冒烟脚本顺序验证 claim/resolve、Assertion、11 个原子 Tool 和
+`source_revision` 一致性。handoff code 与 access token 默认通过不可回显的交互提示读取，
+不得放入命令行参数：
+
+```powershell
+$env:AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL = "http://192.168.0.100:48080"
+$env:AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN = "<shared-workload-token>"
+$env:PYTHONPATH = "src"
+uv run python scripts/smoke_test_java_price_insight.py `
+  --auth-mode claim `
+  --agent-session-id "<fresh-agent-session-id>" `
+  --conversation-id "<conversation-id>"
+```
+
+已认领且仍为 ACTIVE 的会话可使用 `--auth-mode existing`；该模式仅供持有 workload Token
+的受信任运维人员直接诊断，会绕过页面/API 入站绑定，不得暴露为业务接口。恢复场景使用
+`--auth-mode resolve` 并在安全提示中输入页面 access token。脚本只打印 Tool 名称、状态和
+非敏感的 `source_revision`，任一 Tool 失败或修订号不一致时返回非零退出码。
+
 本机真实 DWD 可用 `scripts/seed_price_insight_mysql.py` 重复初始化；启动
 `AuraClaw: Debug local frontend + backend` 后访问
 `http://localhost:3000/price-insight`。外部模型端点不可用时，可仅在 development 设置

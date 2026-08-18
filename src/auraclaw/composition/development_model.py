@@ -40,14 +40,20 @@ class DevelopmentPriceInsightModel:
         arguments: dict[str, Any]
         name: str
 
-        if "auraclaw.capabilities.search" not in called:
+        if (
+            "auraclaw.capabilities.search" in available
+            and "auraclaw.capabilities.search" not in called
+        ):
             name = "auraclaw.capabilities.search"
             arguments = {
                 "query": "采购 价格洞察 行业均价",
                 "kinds": ["skill"],
                 "limit": 5,
             }
-        elif "auraclaw.capabilities.load" not in called:
+        elif (
+            "auraclaw.capabilities.load" in available
+            and "auraclaw.capabilities.load" not in called
+        ):
             skill_id = _price_skill_id(request.messages)
             if skill_id is None:
                 name = "auraclaw.capabilities.search"
@@ -59,7 +65,10 @@ class DevelopmentPriceInsightModel:
             else:
                 name = "auraclaw.capabilities.load"
                 arguments = {"capability_ids": [skill_id]}
-        elif "auraclaw.skills.activate" not in called:
+        elif (
+            "auraclaw.skills.activate" in available
+            and "auraclaw.skills.activate" not in called
+        ):
             skill_id = _price_skill_id(request.messages)
             if skill_id is None:
                 raise RuntimeError(

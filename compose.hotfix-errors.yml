@@ -1,0 +1,6 @@
+# Overlay kept so existing `docker compose -f compose.hotfix-errors.yml`
+# commands still parse. action-hands now uses auraclaw:dev (Java Tool client).
+# The previous s5 pin worked around a MySQL UPDATE ... RETURNING claim_finalize
+# bug; that adapter emulation is fixed in mysql_pool.py.
+services:
+  action-hands: {}

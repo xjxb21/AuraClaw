@@ -8,6 +8,7 @@ from typing import Any
 from auraclaw.action.mcp_primitives import McpPromptRegistry, McpResourceRegistry
 from auraclaw.action.ports import McpResourceReader
 from auraclaw.action.tool_gateway import ToolGateway, ToolRegistry
+from auraclaw.contracts.auth import AgentSessionBinding
 from auraclaw.contracts.errors import AuraClawError
 from auraclaw.contracts.mcp import (
     MCP_PROTOCOL_VERSION,
@@ -251,6 +252,10 @@ class HandsMcpServer:
                 if deadline is not None
                 else requested_deadline
             )
+        # Only the already-sanitized binding is accepted from Runtime metadata.
+        # Raw access tokens, handoff codes and Java Tool Assertions are never parsed
+        # here, which keeps them out of ToolInvocation persistence and result events.
+        agent_auth = AgentSessionBinding.from_event_payload(meta.get("agentAuth"))
         invocation = ToolInvocation(
             tool_invocation_id=invocation_id,
             tenant_id=trusted.tenant_id,
@@ -267,6 +272,7 @@ class HandsMcpServer:
             actor_id=trusted.runtime_id,
             approval_id=_optional_string(meta.get("approvalId")),
             credential_ref=_optional_string(meta.get("credentialRef")),
+            agent_auth=agent_auth,
         )
         result = await self._gateway.execute(invocation)
         serialized = result.as_dict()

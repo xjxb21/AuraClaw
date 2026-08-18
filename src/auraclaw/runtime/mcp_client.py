@@ -293,6 +293,10 @@ class HandsMcpClient:
         call: ToolCall,
     ) -> dict[str, Any]:
         await self._ensure_initialized(assignment)
+        # `agent_auth` is a safe handle created before Runtime scheduling. Runtime
+        # forwards it as MCP metadata so Action Hands can issue Java Tool Assertions
+        # without exposing credentials to model-visible Tool arguments.
+        agent_auth = assignment.resource_profile.get("agent_auth")
         response = await self._transport.send(
             McpJsonRpcRequest(
                 id=self._next_id(),
@@ -308,6 +312,11 @@ class HandsMcpClient:
                             "idempotencyKey": call.idempotency_key or call.tool_invocation_id,
                             "approvalId": call.approval_id,
                             "credentialRef": call.credential_ref,
+                            "agentAuth": (
+                                dict(agent_auth)
+                                if isinstance(agent_auth, Mapping)
+                                else None
+                            ),
                             "deadline": (
                                 assignment.deadline.isoformat()
                                 if assignment.deadline is not None

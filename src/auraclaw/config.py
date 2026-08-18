@@ -29,6 +29,7 @@ _SECRET_FILE_VARIABLES = {
     "AURACLAW_MODEL_API_KEY",
     "AURACLAW_MODEL_SKILL_SIGNING_KEY",
     "AURACLAW_PRICE_INSIGHT_MYSQL_PASSWORD",
+    "AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN",
     "AURACLAW_CREDENTIAL_VAULT_TOKEN",
     "MYSQL_DB_PWD",
     "SEAWEEDFS_ACCESS_KEY",
@@ -129,6 +130,17 @@ class Settings(BaseSettings):
     price_insight_mysql_user: str | None = None
     price_insight_mysql_password: SecretStr | None = None
     price_insight_mysql_database: str | None = None
+    # Default executes the same ToolCapability names through Java Agent Runtime
+    # with per-call Tool Assertions. Set `python` only for offline in-process
+    # fixture/MySQL execution.
+    price_insight_tool_backend: Literal["python", "java"] = "java"
+    java_agent_runtime_base_url: str | None = None
+    # A single deployment-managed secret authenticates Python when it requests
+    # AgentSession binding or a one-time Tool Assertion from Java.
+    java_agent_runtime_workload_token: SecretStr | None = None
+    java_price_insight_user_id: int = Field(default=100, ge=0)
+    java_tool_assertion_retry_count: int = Field(default=1, ge=0, le=1)
+    java_tool_timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
     credential_vault_addr: str | None = None
     credential_vault_token: SecretStr | None = None
     credential_vault_mount: str = "secret"
@@ -394,6 +406,15 @@ class Settings(BaseSettings):
             and self.price_insight_mysql_password is not None
             and self.price_insight_mysql_password.get_secret_value()
             and self.price_insight_mysql_database
+        )
+
+    @property
+    def java_price_insight_configured(self) -> bool:
+        return bool(
+            self.price_insight_tool_backend == "java"
+            and self.java_agent_runtime_base_url
+            and self.java_agent_runtime_workload_token is not None
+            and len(self.java_agent_runtime_workload_token.get_secret_value()) >= 32
         )
 
     def workload_token_value(self, service_name: str) -> str | None:

@@ -12,6 +12,7 @@ from auraclaw.contracts.errors import (
     ApprovalValidationError,
     ArtifactAccessError,
     CredentialAccessError,
+    ReauthorizationRequiredError,
     SandboxViolationError,
     SchemaValidationError,
 )
@@ -56,6 +57,16 @@ class RecordingHands(LocalHandsService):
         self.calls += 1
         del arguments
         return self.result
+
+
+class ReauthorizationHands(LocalHandsService):
+    def __init__(self) -> None:
+        super().__init__(workspace_root=Path.cwd(), handlers={"managed": self._handle})
+
+    @staticmethod
+    def _handle(arguments: dict[str, Any]) -> Any:
+        del arguments
+        raise ReauthorizationRequiredError("AgentSession authorization must be renewed")
 
 
 def _capability(
@@ -127,7 +138,7 @@ def _event(event_type: str, payload: dict[str, Any], version: int) -> CanonicalE
 
 
 def _gateway(
-    hands: RecordingHands,
+    hands: LocalHandsService,
     approvals: InMemoryApprovalProjection,
     *,
     permission: ToolPermission = ToolPermission.WRITE_WITH_APPROVAL,
@@ -261,6 +272,23 @@ def test_large_output_becomes_tenant_scoped_artifact_ref() -> None:
         derived_metadata = await artifacts.metadata("tenant-m3", derived.artifact_id)
         assert derived.version == 2
         assert derived_metadata.lineage_refs == (artifact_id,)
+
+    asyncio.run(scenario())
+
+
+def test_reauthorization_required_is_preserved_as_a_stable_tool_error() -> None:
+    async def scenario() -> None:
+        gateway, _ = _gateway(
+            ReauthorizationHands(),
+            InMemoryApprovalProjection(),
+            permission=ToolPermission.READ_ONLY,
+        )
+
+        result = await gateway.execute(_invocation())
+
+        assert result.status.value == "denied"
+        assert result.error_code == "reauthorization_required"
+        assert result.side_effect_status == "not_started"
 
     asyncio.run(scenario())
 

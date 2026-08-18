@@ -1,6 +1,6 @@
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, Response, status
+from fastapi import APIRouter, Body, Depends, Header, Response, status
 
 from auraclaw.api.dependencies import (
     RequestIdentity,
@@ -10,6 +10,7 @@ from auraclaw.api.dependencies import (
     request_identity,
 )
 from auraclaw.api.models import (
+    AgentSessionCommandRequest,
     AppendMessageRequest,
     ApprovalCommandResponse,
     ApprovalResponseRequest,
@@ -27,6 +28,10 @@ router = APIRouter(prefix="/v1", tags=["tasks"])
 Identity = Annotated[RequestIdentity, Depends(request_identity)]
 TaskCommandDependency = Annotated[TaskCommandGateway, Depends(get_task_command_gateway)]
 TaskQueryDependency = Annotated[TaskQueryService, Depends(get_task_query_service)]
+# The run/resume commands historically accepted an empty body. Annotated keeps
+# that compatibility while allowing callers to attach an optional Java
+# AgentSession proof without evaluating FastAPI's Body() at import time.
+AgentSessionCommandBody = Annotated[AgentSessionCommandRequest | None, Body()]
 
 
 @router.post("/tasks", response_model=TaskAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -42,7 +47,11 @@ async def create_task(
         expected_version=0,
         operation="create_task",
     )
-    return await service.create_task(goal=request.goal, context=context)
+    return await service.create_task(
+        goal=request.goal,
+        context=context,
+        agent_auth=request.agent_auth_request(),
+    )
 
 
 @router.get("/tasks/{session_id}", response_model=TaskView)
@@ -129,7 +138,10 @@ async def append_message(
         operation="append_message",
     )
     return await service.append_message(
-        session_id=session_id, message=request.message, context=context
+        session_id=session_id,
+        message=request.message,
+        context=context,
+        agent_auth=request.agent_auth_request(),
     )
 
 
@@ -142,6 +154,7 @@ async def request_run(
     session_id: str,
     identity: Identity,
     service: TaskCommandDependency,
+    request: AgentSessionCommandBody = None,
     idempotency_key: str = Header(alias="Idempotency-Key", min_length=1),
     expected_version: int = Header(alias="X-Expected-Version"),
 ) -> dict[str, Any]:
@@ -151,7 +164,11 @@ async def request_run(
         expected_version=expected_version,
         operation="request_run",
     )
-    return await service.request_run(session_id=session_id, context=context)
+    return await service.request_run(
+        session_id=session_id,
+        context=context,
+        agent_auth=None if request is None else request.agent_auth_request(),
+    )
 
 
 @router.post(
@@ -215,6 +232,7 @@ async def resume_task(
     session_id: str,
     identity: Identity,
     service: TaskCommandDependency,
+    request: AgentSessionCommandBody = None,
     idempotency_key: str = Header(alias="Idempotency-Key", min_length=1),
     expected_version: int = Header(alias="X-Expected-Version"),
 ) -> dict[str, Any]:
@@ -224,7 +242,11 @@ async def resume_task(
         expected_version=expected_version,
         operation="resume_task",
     )
-    return await service.resume_task(session_id=session_id, context=context)
+    return await service.resume_task(
+        session_id=session_id,
+        context=context,
+        agent_auth=None if request is None else request.agent_auth_request(),
+    )
 
 
 @router.post(

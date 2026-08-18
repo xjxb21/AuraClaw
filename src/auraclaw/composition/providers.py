@@ -6,6 +6,9 @@ from auraclaw.composition.development_capabilities import (
     build_development_capability_client,
 )
 from auraclaw.composition.development_model import DevelopmentPriceInsightModel
+from auraclaw.composition.java_price_insight import (
+    build_java_agent_runtime_auth_client,
+)
 from auraclaw.config import get_settings
 from auraclaw.control.orchestrator import LocalRuntimeProvisioner, ManagedOrchestrator
 from auraclaw.gateways.query.reader import TaskQueryService
@@ -46,6 +49,7 @@ from auraclaw.runtime.clients import FencedSessionClient, FencedToolClient, Idem
 from auraclaw.runtime.harness import AgentHarness
 from auraclaw.runtime.model_gateway import ModelGateway, StaticCredentialResolver
 from auraclaw.runtime.ports import ModelClient
+from auraclaw.session.ports import AgentSessionAuthorizer
 from auraclaw.session.task_service import TaskService
 
 Store = InMemoryEventStore | PostgresEventStore
@@ -110,11 +114,21 @@ def get_task_service() -> TaskService:
         reader=projection,
         admission=AllowAllAdmissionController(),
         approvals=approvals,
+        agent_session_authorizer=_agent_session_authorizer(),
     )
 
 
 def get_task_command_gateway() -> TaskCommandGateway:
     return TaskCommandGateway(get_task_service())
+
+
+def _agent_session_authorizer() -> AgentSessionAuthorizer | None:
+    settings = get_settings()
+    if settings.price_insight_tool_backend != "java":
+        return None
+    # Java is the default atomic-Tool path. Incomplete URL/token must fail
+    # during composition instead of accepting tasks that can only fail later.
+    return build_java_agent_runtime_auth_client(settings)
 
 
 def get_task_query_service() -> TaskQueryService:

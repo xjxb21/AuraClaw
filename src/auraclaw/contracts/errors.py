@@ -30,6 +30,11 @@ class AuthorizationError(AuraClawError):
     status_code = 403
 
 
+class ReauthorizationRequiredError(AuraClawError):
+    code = "reauthorization_required"
+    status_code = 401
+
+
 class LeaseConflictError(AuraClawError):
     code = "lease_conflict"
     status_code = 409

@@ -457,7 +457,15 @@ class PostgresControlStateStore(_LazyPool):
             ORDER BY count(assignment.task_id),runtime.last_heartbeat_at DESC,runtime.runtime_id
             LIMIT 1""",
             item.role,
-            _json(item.required_capability),
+            # agent_auth is assignment metadata for Action Hands, not a pool
+            # capability advertised by Runtime heartbeats.
+            _json(
+                {
+                    key: value
+                    for key, value in dict(item.required_capability).items()
+                    if key != "agent_auth"
+                }
+            ),
         )
         if row is None:
             return None

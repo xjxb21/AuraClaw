@@ -9,6 +9,14 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
+from auraclaw.action.price_insight import (
+    PRICE_DATASET_PROFILE_TOOL,
+    PRICE_DATASET_QUALITY_CHECK_TOOL,
+    PRICE_INSIGHT_TOOL_VERSION,
+    PRICE_METRIC_EVIDENCE_LIST_TOOL,
+    PRICE_METRIC_TOOLS,
+    price_insight_tools,
+)
 from auraclaw.contracts.events import NewEvent
 from auraclaw.contracts.skills import SkillActivation
 from auraclaw.control.ports import RuntimeAssignment
@@ -18,6 +26,14 @@ CAPABILITY_SEARCH = "auraclaw.capabilities.search"
 CAPABILITY_LOAD = "auraclaw.capabilities.load"
 SKILL_ACTIVATE = "auraclaw.skills.activate"
 RESOURCE_READ = "auraclaw.resources.read"
+JAVA_PRICE_INSIGHT_TOOL_NAMES = frozenset(
+    {
+        PRICE_DATASET_PROFILE_TOOL,
+        PRICE_DATASET_QUALITY_CHECK_TOOL,
+        PRICE_METRIC_EVIDENCE_LIST_TOOL,
+        *PRICE_METRIC_TOOLS.values(),
+    }
+)
 _TEMPLATE_FIELD = re.compile(r"\{([A-Za-z0-9_.-]+)\}")
 
 
@@ -59,88 +75,19 @@ class RuntimeCapabilityController:
         }
 
     def model_tools(self, state: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        # Chat-page Agents call Java Price Insight atomic Tools directly.
+        # Python catalog/search/activate Tools stay off the model surface.
         tools = [
             _function_tool(
-                CAPABILITY_SEARCH,
-                "Search the policy-visible capability catalog when the task needs "
-                "external data, an action, or a governed Skill.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "maxLength": 1024},
-                        "kinds": {
-                            "type": "array",
-                            "items": {
-                                "type": "string",
-                                "enum": [
-                                    "resource",
-                                    "resource_template",
-                                    "tool",
-                                    "skill",
-                                ],
-                            },
-                        },
-                        "required_permissions": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": self._max_candidates,
-                        },
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-            ),
-            _function_tool(
-                CAPABILITY_LOAD,
-                "Load authoritative contracts for a small set of capability ids "
-                "returned by capability search.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "capability_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "maxItems": self._max_loaded,
-                        }
-                    },
-                    "required": ["capability_ids"],
-                    "additionalProperties": False,
-                },
-            ),
-            _function_tool(
-                SKILL_ACTIVATE,
-                "Request activation of one loaded Skill. Runtime and Policy make "
-                "the authoritative decision.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "capability_id": {"type": "string"},
-                        "inputs": {"type": "object"},
-                    },
-                    "required": ["capability_id", "inputs"],
-                    "additionalProperties": False,
-                },
-            ),
-            _function_tool(
-                RESOURCE_READ,
-                "Read one loaded Resource or Resource Template through the "
-                "governed Resource Gateway.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "capability_id": {"type": "string"},
-                        "arguments": {"type": "object"},
-                    },
-                    "required": ["capability_id"],
-                    "additionalProperties": False,
-                },
-            ),
+                capability.name,
+                capability.description,
+                dict(capability.input_schema),
+            )
+            for capability in price_insight_tools()
+            if capability.name in JAVA_PRICE_INSIGHT_TOOL_NAMES
         ]
         for loaded in dict(state.get("loaded", {})).values():
+
             if not isinstance(loaded, dict):
                 continue
             model_tool = loaded.get("model_tool")
@@ -233,6 +180,18 @@ class RuntimeCapabilityController:
         state: dict[str, Any],
     ) -> CapabilityExecution:
         current = copy.deepcopy(state)
+        if call.name in JAVA_PRICE_INSIGHT_TOOL_NAMES:
+            invocation = ToolCall(
+                **{
+                    **call.__dict__,
+                    "version": PRICE_INSIGHT_TOOL_VERSION,
+                    "expected_side_effect": "read",
+                }
+            )
+            return CapabilityExecution(
+                result=await self._client.execute(assignment, invocation),
+                state=current,
+            )
         if call.name == CAPABILITY_SEARCH:
             search_count = int(current.get("search_count", 0))
             if search_count >= self._max_searches:

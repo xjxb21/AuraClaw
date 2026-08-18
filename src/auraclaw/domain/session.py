@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from auraclaw.contracts.auth import AgentSessionBinding
 from auraclaw.contracts.errors import InvalidTransitionError
 from auraclaw.contracts.events import CanonicalEvent, NewEvent
 from auraclaw.contracts.state import (
@@ -33,6 +34,7 @@ class SessionAggregate:
     dependency_ids: list[str] = field(default_factory=list)
     output_contract: dict[str, Any] = field(default_factory=dict)
     owner: str | None = None
+    agent_auth: AgentSessionBinding | None = None
     _pending: list[NewEvent] = field(default_factory=list, repr=False)
 
     @classmethod
@@ -85,6 +87,7 @@ class SessionAggregate:
             dependency_ids=list(state.get("dependency_ids", [])),
             output_contract=dict(state.get("output_contract", {})),
             owner=state.get("owner"),
+            agent_auth=AgentSessionBinding.from_event_payload(state.get("agent_auth")),
         )
         return aggregate
 
@@ -118,11 +121,27 @@ class SessionAggregate:
             "dependency_ids": list(self.dependency_ids),
             "output_contract": dict(self.output_contract),
             "owner": self.owner,
+            "agent_auth": (
+                self.agent_auth.as_event_payload()
+                if self.agent_auth is not None
+                else None
+            ),
         }
 
-    def create(self, *, goal: str, run_id: str) -> None:
+    def create(
+        self,
+        *,
+        goal: str,
+        run_id: str,
+        agent_auth: AgentSessionBinding | None = None,
+    ) -> None:
         if self.version or self.status is not None:
             raise InvalidTransitionError("Session already exists")
+        auth_payload = (
+            {"auth": agent_auth.as_event_payload()}
+            if agent_auth is not None
+            else {}
+        )
         self._raise(
             NewEvent(
                 type="session.created",
@@ -132,6 +151,7 @@ class SessionAggregate:
                     "role": "root",
                     "root_session_id": self.session_id,
                     "parent_session_id": None,
+                    **auth_payload,
                 },
             )
         )
@@ -139,7 +159,7 @@ class SessionAggregate:
             NewEvent(
                 type="run.requested",
                 visibility=Visibility.USER,
-                payload={"run_id": run_id},
+                payload={"run_id": run_id, **auth_payload},
             )
         )
 
@@ -157,31 +177,50 @@ class SessionAggregate:
             )
         )
 
-    def append_message(self, *, message: str) -> None:
+    def append_message(
+        self,
+        *,
+        message: str,
+        agent_auth: AgentSessionBinding | None = None,
+    ) -> None:
         self._require_existing()
         if self.status in TERMINAL_SESSION_STATUSES:
             status = self.status
             assert status is not None
             raise InvalidTransitionError(f"cannot append message to Session in {status.value}")
+        auth_payload = (
+            {"auth": agent_auth.as_event_payload()}
+            if agent_auth is not None
+            else {}
+        )
         self._raise(
             NewEvent(
                 type="user.message.appended",
                 visibility=Visibility.USER,
-                payload={"message": message},
+                payload={"message": message, **auth_payload},
             )
         )
 
-    def request_run(self, run_id: str) -> None:
+    def request_run(
+        self,
+        run_id: str,
+        agent_auth: AgentSessionBinding | None = None,
+    ) -> None:
         self._require_existing()
         status = self.status
         assert status is not None
         if status not in {SessionStatus.CREATED, SessionStatus.READY, SessionStatus.PAUSED}:
             raise InvalidTransitionError(f"cannot request run for Session in {status.value}")
+        auth_payload = (
+            {"auth": agent_auth.as_event_payload()}
+            if agent_auth is not None
+            else {}
+        )
         self._raise(
             NewEvent(
                 type="run.requested",
                 visibility=Visibility.USER,
-                payload={"run_id": run_id},
+                payload={"run_id": run_id, **auth_payload},
             )
         )
 
@@ -201,7 +240,11 @@ class SessionAggregate:
             )
         )
 
-    def resume(self, run_id: str) -> None:
+    def resume(
+        self,
+        run_id: str,
+        agent_auth: AgentSessionBinding | None = None,
+    ) -> None:
         self._require_existing()
         status = self.status
         assert status is not None
@@ -216,7 +259,14 @@ class SessionAggregate:
             NewEvent(
                 type="session.resumed",
                 visibility=Visibility.USER,
-                payload={"run_id": run_id},
+                payload={
+                    "run_id": run_id,
+                    **(
+                        {"auth": agent_auth.as_event_payload()}
+                        if agent_auth is not None
+                        else {}
+                    ),
+                },
             )
         )
 
@@ -270,6 +320,7 @@ class SessionAggregate:
             self.root_session_id = str(payload["root_session_id"])
             self.parent_session_id = payload.get("parent_session_id")
             self.role = str(payload.get("role", "root"))
+            self._apply_agent_auth(payload)
             self.status = SessionStatus.CREATED
         elif event_type == "child.created":
             self.goal = str(payload["goal"])
@@ -283,6 +334,7 @@ class SessionAggregate:
             )
         elif event_type == "run.requested":
             self.run_id = str(payload["run_id"])
+            self._apply_agent_auth(payload)
             self.run_status = RunStatus.PENDING
             self.result_summary = None
             self.result_ref = None
@@ -312,6 +364,7 @@ class SessionAggregate:
             self.run_status = RunStatus.RETRY_WAIT
         elif event_type == "session.resumed":
             self.run_id = str(payload["run_id"])
+            self._apply_agent_auth(payload)
             self.status = SessionStatus.PENDING
             self.run_status = RunStatus.PENDING
         elif event_type == "run.completed":
@@ -357,6 +410,8 @@ class SessionAggregate:
             self.status = SessionStatus.READY if self.role == "root" else SessionStatus.FAILED
         elif event_type == "session.closed":
             self.status = SessionStatus.CLOSED
+        elif event_type == "user.message.appended":
+            self._apply_agent_auth(payload)
 
     def _raise(self, event: NewEvent) -> None:
         self.apply(event.type, event.payload)
@@ -365,3 +420,10 @@ class SessionAggregate:
     def _require_existing(self) -> None:
         if self.status is None:
             raise InvalidTransitionError("Session does not exist")
+
+    def _apply_agent_auth(self, payload: dict[str, Any]) -> None:
+        # Only the sanitized binding is retained on the aggregate. Inbound
+        # handoff codes and access tokens are consumed before events are raised.
+        binding = AgentSessionBinding.from_event_payload(payload.get("auth"))
+        if binding is not None:
+            self.agent_auth = binding

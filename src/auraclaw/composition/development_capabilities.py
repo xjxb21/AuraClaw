@@ -20,7 +20,7 @@ from auraclaw.action.capability_catalog import (
 from auraclaw.action.mcp import HandsMcpServer
 from auraclaw.action.mcp_primitives import McpResourceRegistry
 from auraclaw.action.policy import PolicyEngine
-from auraclaw.action.ports import PriceInsightSource
+from auraclaw.action.ports import HandsExecutor, PriceInsightSource
 from auraclaw.action.price_insight import (
     PriceInsightService,
     PriceInsightToolExecutor,
@@ -39,6 +39,10 @@ from auraclaw.composition.business_skills import (
     price_insight_resource_descriptors,
     price_insight_resources,
     signed_price_insight_package,
+)
+from auraclaw.composition.java_price_insight import (
+    build_java_agent_runtime_auth_client,
+    build_java_price_insight_executor,
 )
 from auraclaw.config import Settings
 from auraclaw.contracts.capabilities import (
@@ -108,32 +112,43 @@ def build_development_capability_client(
 ) -> HandsMcpClient | None:
     """Build the governed in-process capability plane for the combined dev server."""
     source_kind = settings.resolved_price_insight_source
-    if source_kind == "disabled":
+    java_backend = settings.price_insight_tool_backend == "java"
+    if source_kind == "disabled" and not java_backend:
         return None
-    source: PriceInsightSource
-    if source_kind == "fixture":
-        source = JsonPriceInsightSource(
-            PRICE_INSIGHT_SKILL_DIR / "tests" / "golden-data.json"
-        )
-    elif source_kind == "mysql":
-        password = settings.price_insight_mysql_password
-        if (
-            not settings.price_insight_mysql_configured
-            or settings.price_insight_mysql_host is None
-            or settings.price_insight_mysql_user is None
-            or password is None
-            or settings.price_insight_mysql_database is None
-        ):
-            raise ValueError("Price Insight MySQL source configuration is incomplete")
-        source = MySqlPriceInsightSource(
-            host=settings.price_insight_mysql_host,
-            port=settings.price_insight_mysql_port,
-            user=settings.price_insight_mysql_user,
-            password=password.get_secret_value(),
-            database=settings.price_insight_mysql_database,
-        )
+
+    price_executor: HandsExecutor
+    if java_backend:
+        # Development uses the same MCP metadata path as production, so this
+        # executor receives the sanitized AgentSession binding without exposing
+        # it to the model-visible Tool arguments.
+        auth_client = build_java_agent_runtime_auth_client(settings)
+        price_executor = build_java_price_insight_executor(settings, auth_client)
     else:
-        raise ValueError(f"Unsupported development Price Insight source: {source_kind}")
+        source: PriceInsightSource
+        if source_kind == "fixture":
+            source = JsonPriceInsightSource(
+                PRICE_INSIGHT_SKILL_DIR / "tests" / "golden-data.json"
+            )
+        elif source_kind == "mysql":
+            password = settings.price_insight_mysql_password
+            if (
+                not settings.price_insight_mysql_configured
+                or settings.price_insight_mysql_host is None
+                or settings.price_insight_mysql_user is None
+                or password is None
+                or settings.price_insight_mysql_database is None
+            ):
+                raise ValueError("Price Insight MySQL source configuration is incomplete")
+            source = MySqlPriceInsightSource(
+                host=settings.price_insight_mysql_host,
+                port=settings.price_insight_mysql_port,
+                user=settings.price_insight_mysql_user,
+                password=password.get_secret_value(),
+                database=settings.price_insight_mysql_database,
+            )
+        else:
+            raise ValueError(f"Unsupported development Price Insight source: {source_kind}")
+        price_executor = PriceInsightToolExecutor(PriceInsightService(source))
 
     tenant_id = settings.price_insight_target_tenant_id
     catalog_store = InMemoryCapabilityCatalogStore()
@@ -152,7 +167,6 @@ def build_development_capability_client(
         resources=resources,
     )
     resolver = SkillResolver(skills, catalog_store)
-    price_executor = PriceInsightToolExecutor(PriceInsightService(source))
     tools = price_insight_tools()
     registry = ToolRegistry(
         (
@@ -192,7 +206,10 @@ def build_development_capability_client(
                 title="AuraClaw Procurement Price Insight",
                 endpoint="https://price-insight.internal/mcp",
                 trust_level=CapabilityTrustLevel.PLATFORM,
-                allowed_tool_prefixes=("procurement.price_insight.",),
+                allowed_tool_prefixes=(
+                    "procurement.price.",
+                    "procurement.price_insight.",
+                ),
                 allowed_resource_schemes=("repo",),
                 status=CapabilityStatus.ACTIVE,
                 enabled=True,

@@ -213,6 +213,7 @@ class InMemoryControlStateStore:
                 if any(
                     runtime.capabilities.get(key) != value
                     for key, value in item.required_capability.items()
+                    if key != "agent_auth"
                 ):
                     continue
                 active = sum(

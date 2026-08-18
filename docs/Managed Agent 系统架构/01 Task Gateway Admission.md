@@ -60,6 +60,25 @@ POST /v1/approvals/{approval_id}/responses
 }
 ```
 
+价格洞察使用 Java 原子 Tool 时，创建、消息追加、request-run 和 resume 请求可携带同一组
+可选 AgentSession 授权字段。新会话优先使用 claim：
+
+```json
+{
+  "goal": "分析采购价格",
+  "agentSessionId": "agent-session-uuid",
+  "conversationId": "conversation-001",
+  "handoffCode": "one-time-handoff-code"
+}
+```
+
+恢复兼容场景可改传 `conversationId + accessToken` 执行 resolve。Gateway 只允许
+`agentSessionId + handoffCode` 或不含 `agentSessionId` 的 `conversationId + accessToken`，
+裸 `agentSessionId` 和混合证明必须拒绝。临时证明只交给 Session Service；claim/resolve
+成功后，Canonical Event 仅记录
+`agent_session_id/conversation_id/resolved_by`。`handoffCode`、`accessToken` 和 Tool Assertion
+不得进入事件、Snapshot、日志、响应或模型上下文。
+
 ## 下游命令
 
 ```text

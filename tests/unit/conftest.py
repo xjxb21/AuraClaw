@@ -26,4 +26,7 @@ def _clear_ambient_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in list(os.environ):
         if name.startswith(_AMBIENT_PREFIXES) or name.endswith("_DATABASE_URL"):
             monkeypatch.delenv(name, raising=False)
+    # Product default is Java; unit tests stay on the in-process executor
+    # unless a test opts into Java credentials.
+    monkeypatch.setenv("AURACLAW_PRICE_INSIGHT_TOOL_BACKEND", "python")
     get_settings.cache_clear()

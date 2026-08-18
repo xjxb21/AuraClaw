@@ -38,6 +38,19 @@ x-common-environment: &common-environment
   AURACLAW_WORKER_WAKE_ENABLED: ${AURACLAW_WORKER_WAKE_ENABLED:-true}
   AURACLAW_WORKER_IDLE_INTERVAL: ${AURACLAW_WORKER_IDLE_INTERVAL:-0.25}
 
+# Only Task API binds AgentSession handles and Action Hands invokes Java Tools.
+# Keep this workload configuration out of unrelated service environments.
+x-java-price-insight-environment: &java-price-insight-environment
+  AURACLAW_PRICE_INSIGHT_TOOL_BACKEND: ${AURACLAW_PRICE_INSIGHT_TOOL_BACKEND:-java}
+  AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL: ${AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL:-}
+  AURACLAW_JAVA_PRICE_INSIGHT_USER_ID: ${AURACLAW_JAVA_PRICE_INSIGHT_USER_ID:-100}
+  AURACLAW_JAVA_TOOL_ASSERTION_RETRY_COUNT: ${AURACLAW_JAVA_TOOL_ASSERTION_RETRY_COUNT:-1}
+  AURACLAW_JAVA_TOOL_TIMEOUT_SECONDS: ${AURACLAW_JAVA_TOOL_TIMEOUT_SECONDS:-30}
+  # Page sessions use ChainTower tenant id "1"; catalog search is tenant-scoped.
+  AURACLAW_PRICE_INSIGHT_TARGET_TENANT_ID: ${AURACLAW_PRICE_INSIGHT_TARGET_TENANT_ID:-1}
+  AURACLAW_MODEL_SKILL_SOURCE_TENANT_ID: ${AURACLAW_MODEL_SKILL_SOURCE_TENANT_ID:-1}
+  AURACLAW_MODEL_SKILL_TARGET_TENANT_ID: ${AURACLAW_MODEL_SKILL_TARGET_TENANT_ID:-1}
+
 x-healthcheck: &healthcheck
   test:
     - CMD
@@ -96,11 +109,17 @@ services:
     <<: *auraclaw-service
     networks: [auraclaw, platform]
     environment:
-      <<: *common-environment
+      <<: [*common-environment, *java-price-insight-environment]
       AURACLAW_HEALTH_PORT: "8000"
       AURACLAW_DATABASE_URL_FILE: /run/secrets/task_query_database_url
       AURACLAW_TASK_API_WORKLOAD_TOKEN_FILE: /run/secrets/task_api_workload_token
-    secrets: [task_query_database_url, task_api_workload_token]
+      # The shared token is read through the allowlisted `_FILE` loader and is
+      # never represented as a regular container environment variable.
+      AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE: /run/secrets/java_agent_runtime_workload_token
+    secrets:
+      - task_query_database_url
+      - task_api_workload_token
+      - java_agent_runtime_workload_token
     command: ["api", "run", "--host", "0.0.0.0", "--port", "8000"]
     expose: ["8000"]
     healthcheck: *healthcheck
@@ -285,17 +304,22 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=1g
       - /workspace:rw,nosuid,nodev,size=2g
     environment:
-      <<: *common-environment
+      <<: [*common-environment, *java-price-insight-environment]
       AURACLAW_HEALTH_PORT: "8006"
       AURACLAW_DATABASE_URL_FILE: /run/secrets/hands_database_url
       AURACLAW_LEASE_SIGNING_KEY_FILE: /run/secrets/lease_signing_key
       AURACLAW_RUNTIME_WORKLOAD_TOKEN_FILE: /run/secrets/runtime_workload_token
       AURACLAW_ACTION_HANDS_WORKLOAD_TOKEN_FILE: /run/secrets/action_hands_workload_token
+      # Action Hands uses the same workload Secret to request one-time Tool
+      # Assertions; the Token is never forwarded to a business Tool endpoint.
+      AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE: /run/secrets/java_agent_runtime_workload_token
+      AURACLAW_MODEL_SKILL_SIGNING_KEY: ${AURACLAW_MODEL_SKILL_SIGNING_KEY}
     secrets:
       - hands_database_url
       - lease_signing_key
       - runtime_workload_token
       - action_hands_workload_token
+      - java_agent_runtime_workload_token
     command: ["hands", "run", "--host", "0.0.0.0", "--port", "8006"]
     expose: ["8006"]
     healthcheck: *healthcheck
@@ -552,6 +576,9 @@ secrets:
   delivery_workload_token: {file: "${AURACLAW_SECRET_DIR:-.runtime/compose-secrets}/delivery_workload_token"}
   lease_signing_key: {file: "${AURACLAW_SECRET_DIR:-.runtime/compose-secrets}/lease_signing_key"}
   model_api_key: {file: "${AURACLAW_SECRET_DIR:-.runtime/compose-secrets}/model_api_key"}
+  # Shared with Java through its own Secret/configuration channel and copied
+  # into the ignored directory by materialize_compose_secrets.py.
+  java_agent_runtime_workload_token: {file: "${AURACLAW_SECRET_DIR:-.runtime/compose-secrets}/java_agent_runtime_workload_token"}
   vault_token: {file: "${AURACLAW_SECRET_DIR:-.runtime/compose-secrets}/vault_token"}
   seaweedfs_access_key: {file: "${AURACLAW_SECRET_DIR:-.runtime/compose-secrets}/seaweedfs_access_key"}
   seaweedfs_secret_key: {file: "${AURACLAW_SECRET_DIR:-.runtime/compose-secrets}/seaweedfs_secret_key"}
