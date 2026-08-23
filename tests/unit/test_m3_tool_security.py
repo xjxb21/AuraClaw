@@ -12,7 +12,7 @@ from auraclaw.contracts.errors import (
     ApprovalValidationError,
     ArtifactAccessError,
     CredentialAccessError,
-    ReauthorizationRequiredError,
+    PolicyDeniedError,
     SandboxViolationError,
     SchemaValidationError,
 )
@@ -57,16 +57,6 @@ class RecordingHands(LocalHandsService):
         self.calls += 1
         del arguments
         return self.result
-
-
-class ReauthorizationHands(LocalHandsService):
-    def __init__(self) -> None:
-        super().__init__(workspace_root=Path.cwd(), handlers={"managed": self._handle})
-
-    @staticmethod
-    def _handle(arguments: dict[str, Any]) -> Any:
-        del arguments
-        raise ReauthorizationRequiredError("AgentSession authorization must be renewed")
 
 
 def _capability(
@@ -138,7 +128,7 @@ def _event(event_type: str, payload: dict[str, Any], version: int) -> CanonicalE
 
 
 def _gateway(
-    hands: LocalHandsService,
+    hands: RecordingHands,
     approvals: InMemoryApprovalProjection,
     *,
     permission: ToolPermission = ToolPermission.WRITE_WITH_APPROVAL,
@@ -156,6 +146,31 @@ def _gateway(
         ),
         artifacts,
     )
+
+
+def test_tool_gateway_surfaces_controlled_boundary_reason() -> None:
+    class DenyingHands:
+        async def execute(self, invocation: ToolInvocation, capability: ToolCapability) -> object:
+            del invocation, capability
+            raise PolicyDeniedError("chaintower MCP call is missing trusted user context")
+
+    async def scenario() -> None:
+        artifacts = ArtifactStore(
+            InMemoryObjectStorage(), signing_key=b"m3-test-signing-key"
+        )
+        gateway = ToolGateway(
+            registry=ToolRegistry((_capability(ToolPermission.READ_ONLY),)),
+            policy=PolicyEngine(),
+            approvals=InMemoryApprovalProjection(),
+            hands=DenyingHands(),
+            artifacts=artifacts,
+        )
+        result = await gateway.execute(_invocation())
+        assert result.status.value == "denied"
+        assert result.error_code == "policy_denied"
+        assert result.summary == "chaintower MCP call is missing trusted user context"
+
+    asyncio.run(scenario())
 
 
 def test_schema_validation_happens_before_hands_execution() -> None:
@@ -272,23 +287,6 @@ def test_large_output_becomes_tenant_scoped_artifact_ref() -> None:
         derived_metadata = await artifacts.metadata("tenant-m3", derived.artifact_id)
         assert derived.version == 2
         assert derived_metadata.lineage_refs == (artifact_id,)
-
-    asyncio.run(scenario())
-
-
-def test_reauthorization_required_is_preserved_as_a_stable_tool_error() -> None:
-    async def scenario() -> None:
-        gateway, _ = _gateway(
-            ReauthorizationHands(),
-            InMemoryApprovalProjection(),
-            permission=ToolPermission.READ_ONLY,
-        )
-
-        result = await gateway.execute(_invocation())
-
-        assert result.status.value == "denied"
-        assert result.error_code == "reauthorization_required"
-        assert result.side_effect_status == "not_started"
 
     asyncio.run(scenario())
 

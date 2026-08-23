@@ -10,7 +10,7 @@ from urllib.parse import quote
 from pydantic import Field, SecretStr, TypeAdapter, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from auraclaw.contracts.capabilities import McpServerDefinition
+from auraclaw.contracts.capabilities import JavaApiServerDefinition, McpServerDefinition
 
 _SECRET_FILE_VARIABLES = {
     "AURACLAW_DATABASE_URL",
@@ -25,11 +25,13 @@ _SECRET_FILE_VARIABLES = {
     "AURACLAW_ARTIFACT_SERVICE_WORKLOAD_TOKEN",
     "AURACLAW_POLICY_WORKLOAD_TOKEN",
     "AURACLAW_DELIVERY_WORKLOAD_TOKEN",
+    "AURACLAW_STREAMING_GATEWAY_WORKLOAD_TOKEN",
+    "AURACLAW_CHAINTOWER_WORKLOAD_TOKEN",
+    "AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON",
     "AURACLAW_LEASE_SIGNING_KEY",
     "AURACLAW_MODEL_API_KEY",
     "AURACLAW_MODEL_SKILL_SIGNING_KEY",
     "AURACLAW_PRICE_INSIGHT_MYSQL_PASSWORD",
-    "AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN",
     "AURACLAW_CREDENTIAL_VAULT_TOKEN",
     "MYSQL_DB_PWD",
     "SEAWEEDFS_ACCESS_KEY",
@@ -56,6 +58,18 @@ def load_secret_files(environ: dict[str, str] | None = None) -> None:
         selected[variable] = value
 
 
+def _resolve_settings_env_file() -> str | None:
+    if os.environ.get("AURACLAW_DISABLE_ENV_FILE") == "1":
+        return None
+    configured = os.environ.get("AURACLAW_ENV_FILE")
+    if configured:
+        return configured
+    for candidate in (".env.debug", ".env"):
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="AURACLAW_", extra="ignore"
@@ -76,7 +90,17 @@ class Settings(BaseSettings):
     artifact_port: int = 8009
     streaming_port: int = 8010
     delivery_port: int = 8011
+    ingress_port: int = 8080
+    ingress_enabled: bool = True
     lease_signing_key: SecretStr | None = None
+    allow_insecure_identity_headers: bool | None = None
+    chaintower_workload_token: SecretStr | None = None
+    agent_context_issuer: str = "chaintower"
+    agent_context_audience: str = "auraclaw-task-api"
+    agent_context_signing_keys_json: str = "{}"
+    agent_context_max_ttl_seconds: int = Field(default=300, ge=30, le=600)
+    agent_context_clock_skew_seconds: int = Field(default=30, ge=0, le=120)
+    agent_context_required_scope: str = "agent.task.invoke"
     task_api_workload_token: SecretStr | None = None
     orchestrator_workload_token: SecretStr | None = None
     projection_workload_token: SecretStr | None = None
@@ -87,17 +111,22 @@ class Settings(BaseSettings):
     artifact_service_workload_token: SecretStr | None = None
     policy_workload_token: SecretStr | None = None
     delivery_workload_token: SecretStr | None = None
+    streaming_gateway_workload_token: SecretStr | None = None
     session_base_url: str = "http://127.0.0.1:8001"
     projection_base_url: str = "http://127.0.0.1:8002"
     control_base_url: str = "http://127.0.0.1:8003"
     runtime_base_url: str = "http://127.0.0.1:8004"
     model_gateway_base_url: str = "http://127.0.0.1:8005"
-    hands_mcp_url: str = "http://127.0.0.1:8006/mcp"
+    hands_url: str = "http://127.0.0.1:8006"
     policy_base_url: str = "http://127.0.0.1:8007"
     credential_proxy_base_url: str = "http://127.0.0.1:8008"
     credential_egress_allowlist: str = ""
     mcp_egress_servers_json: str = "[]"
+    mcp_egress_servers_file: str | None = None
+    java_api_servers_json: str = "[]"
+    debug_vault_secrets_json: str = "{}"
     mcp_reconcile_interval_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
+    mcp_trust_remote_tool_annotations: bool = False
     model_skill_source_enabled: bool = True
     model_skill_source_tenant_id: int = Field(default=1, ge=0)
     model_skill_target_tenant_id: str = Field(default="development", min_length=1)
@@ -130,17 +159,6 @@ class Settings(BaseSettings):
     price_insight_mysql_user: str | None = None
     price_insight_mysql_password: SecretStr | None = None
     price_insight_mysql_database: str | None = None
-    # Default executes the same ToolCapability names through Java Agent Runtime
-    # with per-call Tool Assertions. Set `python` only for offline in-process
-    # fixture/MySQL execution.
-    price_insight_tool_backend: Literal["python", "java"] = "java"
-    java_agent_runtime_base_url: str | None = None
-    # A single deployment-managed secret authenticates Python when it requests
-    # AgentSession binding or a one-time Tool Assertion from Java.
-    java_agent_runtime_workload_token: SecretStr | None = None
-    java_price_insight_user_id: int = Field(default=100, ge=0)
-    java_tool_assertion_retry_count: int = Field(default=1, ge=0, le=1)
-    java_tool_timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
     credential_vault_addr: str | None = None
     credential_vault_token: SecretStr | None = None
     credential_vault_mount: str = "secret"
@@ -222,6 +240,15 @@ class Settings(BaseSettings):
     model_tenant_token_limit_per_hour: int = Field(default=1_000_000, ge=1)
     # None omits the field; True/False maps to OpenAI-compatible thinking.type enabled/disabled.
     model_thinking_enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_identity_settings(self) -> Settings:
+        if (
+            self.deployment_profile == "production"
+            and self.allow_insecure_identity_headers is True
+        ):
+            raise ValueError("insecure identity headers cannot be enabled in production")
+        return self
 
     @model_validator(mode="after")
     def validate_artifact_backend(self) -> Settings:
@@ -369,11 +396,32 @@ class Settings(BaseSettings):
 
     @property
     def mcp_egress_servers(self) -> tuple[McpServerDefinition, ...]:
+        raw = self.mcp_egress_servers_json
+        if self.mcp_egress_servers_file:
+            raw = Path(self.mcp_egress_servers_file).read_text(encoding="utf-8")
         try:
-            payload = json.loads(self.mcp_egress_servers_json)
+            payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise ValueError("MCP egress server configuration is invalid JSON") from exc
         return TypeAdapter(tuple[McpServerDefinition, ...]).validate_python(payload)
+
+    @property
+    def debug_vault_secrets(self) -> dict[str, str]:
+        try:
+            payload = json.loads(self.debug_vault_secrets_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("debug vault secrets configuration is invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("debug vault secrets must be a JSON object")
+        return {str(key): str(value) for key, value in payload.items()}
+
+    @property
+    def java_api_servers(self) -> tuple[JavaApiServerDefinition, ...]:
+        try:
+            payload = json.loads(self.java_api_servers_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Java API server configuration is invalid JSON") from exc
+        return TypeAdapter(tuple[JavaApiServerDefinition, ...]).validate_python(payload)
 
     @property
     def model_gateway_configured(self) -> bool:
@@ -396,7 +444,9 @@ class Settings(BaseSettings):
     ) -> Literal["disabled", "fixture", "mysql"]:
         if self.price_insight_source != "auto":
             return self.price_insight_source
-        return "fixture" if self.deployment_profile == "development" else "disabled"
+        if self.price_insight_mysql_configured:
+            return "mysql"
+        return "disabled"
 
     @property
     def price_insight_mysql_configured(self) -> bool:
@@ -409,12 +459,34 @@ class Settings(BaseSettings):
         )
 
     @property
-    def java_price_insight_configured(self) -> bool:
+    def insecure_identity_headers_enabled(self) -> bool:
+        if self.deployment_profile == "production":
+            return False
+        return self.allow_insecure_identity_headers is True
+
+    @property
+    def agent_context_signing_keys(self) -> dict[str, bytes]:
+        try:
+            payload = json.loads(self.agent_context_signing_keys_json or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("agent context signing keys must be a JSON object") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("agent context signing keys must be a JSON object")
+        keys: dict[str, bytes] = {}
+        for key_id, value in payload.items():
+            encoded = str(value).encode()
+            if len(encoded) < 32:
+                raise ValueError("agent context signing key must contain at least 32 bytes")
+            keys[str(key_id)] = encoded
+        return keys
+
+    @property
+    def signed_identity_configured(self) -> bool:
+        token = self.chaintower_workload_token
         return bool(
-            self.price_insight_tool_backend == "java"
-            and self.java_agent_runtime_base_url
-            and self.java_agent_runtime_workload_token is not None
-            and len(self.java_agent_runtime_workload_token.get_secret_value()) >= 32
+            token is not None
+            and token.get_secret_value()
+            and self.agent_context_signing_keys
         )
 
     def workload_token_value(self, service_name: str) -> str | None:
@@ -429,6 +501,7 @@ class Settings(BaseSettings):
             "artifact-service": self.artifact_service_workload_token,
             "policy": self.policy_workload_token,
             "delivery-worker": self.delivery_workload_token,
+            "streaming-gateway": self.streaming_gateway_workload_token,
         }
         token = tokens.get(service_name)
         return token.get_secret_value() if token is not None else None
@@ -457,4 +530,4 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     load_secret_files()
-    return Settings()
+    return Settings(_env_file=_resolve_settings_env_file())

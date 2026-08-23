@@ -6,14 +6,14 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from auraclaw.action.ports import CredentialInvoker, ResourcePolicyEvaluator
-from auraclaw.contracts.capabilities import CapabilityStatus, McpServerDefinition
+from auraclaw.contracts.capabilities import CapabilityStatus, McpAuthStrategy, McpServerDefinition
 from auraclaw.contracts.errors import PolicyDeniedError
-from auraclaw.contracts.mcp import (
+from auraclaw.contracts.tools import PolicyDecision
+from auraclaw.infrastructure.connectors.mcp.wire import (
     McpJsonRpcRequest,
     McpJsonRpcResponse,
     McpTrustedContext,
 )
-from auraclaw.contracts.tools import PolicyDecision, ToolCapability, ToolInvocation
 
 
 class ManagedRemoteMcpTransport:
@@ -31,7 +31,11 @@ class ManagedRemoteMcpTransport:
             or server.status
             not in {CapabilityStatus.ACTIVE, CapabilityStatus.DEGRADED}
             or server.credential_ref is None
-            or server.oauth is None
+        ):
+            raise ValueError("remote MCP server is not callable")
+        if (
+            server.resolved_auth_strategy is McpAuthStrategy.OAUTH_CLIENT_CREDENTIALS
+            and server.oauth is None
         ):
             raise ValueError("remote MCP server is not callable")
         self._server = server
@@ -63,7 +67,35 @@ class ManagedRemoteMcpTransport:
             and self._server.tenant_id != trusted_context.tenant_id
         ):
             raise PolicyDeniedError("remote MCP server is outside tenant scope")
+        arguments = request.params.get("arguments")
+        if isinstance(arguments, dict):
+            declared_tenant = arguments.get("tenant_id")
+            declared_user = arguments.get("user_id")
+            if (
+                declared_tenant is not None
+                and str(declared_tenant) != trusted_context.tenant_id
+            ):
+                raise PolicyDeniedError("tool argument tenant_id is not an authorization source")
+            if (
+                declared_user is not None
+                and trusted_context.user_id is not None
+                and str(declared_user) != trusted_context.user_id
+            ):
+                raise PolicyDeniedError("tool argument user_id is not an authorization source")
         request_payload = request.model_dump(mode="json")
+        identity = {
+            "tenant_id": trusted_context.tenant_id,
+            "user_id": trusted_context.user_id,
+            "session_id": trusted_context.session_id,
+            "run_id": trusted_context.run_id,
+        }
+        if (
+            self._server.resolved_auth_strategy
+            is McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT
+            and not identity["user_id"]
+            and request.method in {"tools/call", "resources/read", "prompts/get"}
+        ):
+            raise PolicyDeniedError("chaintower MCP call is missing trusted user context")
         input_digest = hashlib.sha256(
             json.dumps(
                 request_payload,
@@ -98,6 +130,7 @@ class ManagedRemoteMcpTransport:
             request={
                 **request_payload,
                 "server_id": self._server.server_id,
+                "_auraclaw_identity": identity,
             },
             policy_decision_id=evaluation.decision_id,
         )
@@ -119,55 +152,9 @@ class ManagedRemoteMcpTransport:
                         method,
                         dict(params),
                     )
-        return McpJsonRpcResponse.model_validate(response)
-
-
-class RemoteMcpToolExecutor:
-    def __init__(
-        self,
-        server: McpServerDefinition,
-        transport: ManagedRemoteMcpTransport,
-    ) -> None:
-        self._server = server
-        self._transport = transport
-        self.route_owner = f"mcp:{server.server_id}:tools"
-
-    async def execute(
-        self,
-        invocation: ToolInvocation,
-        capability: ToolCapability,
-    ) -> dict[str, object]:
-        del capability
-        response = await self._transport.send(
-            McpJsonRpcRequest(
-                id=invocation.tool_invocation_id,
-                method="tools/call",
-                params={
-                    "name": invocation.tool_name,
-                    "arguments": invocation.arguments,
-                },
-            ),
-            trusted_context=McpTrustedContext(
-                tenant_id=invocation.tenant_id,
-                root_session_id=invocation.root_session_id,
-                session_id=invocation.session_id,
-                run_id=invocation.run_id,
-                runtime_id=invocation.actor_id,
-                lease_id=f"tool:{invocation.tool_invocation_id}",
-                fencing_token=invocation.fencing_token,
-                deadline=invocation.deadline,
-            ),
-        )
-        if response.error is not None:
-            return {
-                "isError": True,
-                "error": {
-                    "code": response.error.code,
-                    "message": response.error.message,
-                },
-            }
-        result = dict(response.result or {})
-        if result.get("isError") is True:
-            raise RuntimeError("remote MCP Tool returned an execution error")
-        structured = result.get("structuredContent")
-        return dict(structured) if isinstance(structured, dict) else result
+        parsed = McpJsonRpcResponse.model_validate(response)
+        if parsed.id != request.id:
+            raise ValueError("remote MCP response id does not match request")
+        if (parsed.result is None) == (parsed.error is None):
+            raise ValueError("remote MCP response must contain exactly one result or error")
+        return parsed

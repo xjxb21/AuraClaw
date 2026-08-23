@@ -16,7 +16,6 @@ dependencies = [
   "httpx>=0.27,<1",
   "pymysql[rsa]>=1.1,<2",
   "pydantic-settings>=2.6,<3",
-  "rfc8785>=0.1,<1",
   "socksio>=1.0,<2",
   "uvicorn[standard]>=0.32,<1",
   "aiomysql>=0.2,<1",
@@ -123,7 +122,12 @@ forbidden_modules = ["auraclaw.infrastructure"]
 name = "Runtime does not embed Action Hands"
 type = "forbidden"
 source_modules = ["auraclaw.runtime"]
-forbidden_modules = ["auraclaw.action", "auraclaw.infrastructure.hands"]
+forbidden_modules = [
+  "auraclaw.action",
+  "auraclaw.contracts.mcp",
+  "auraclaw.infrastructure.connectors",
+  "auraclaw.infrastructure.hands",
+]
 
 [[tool.importlinter.contracts]]
 name = "Action Hands does not depend on Runtime or Control"

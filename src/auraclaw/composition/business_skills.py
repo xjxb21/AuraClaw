@@ -16,10 +16,11 @@ from auraclaw.contracts.capabilities import (
     CapabilityStatus,
     CapabilityTrustLevel,
 )
-from auraclaw.contracts.mcp import McpResourceContent, McpResourceDescriptor
+from auraclaw.contracts.hands import HandsResourceContent, HandsResourceDescriptor
 from auraclaw.contracts.skills import SkillManifest
 
 PRICE_INSIGHT_SERVER_ID = "auraclaw-price-insight"
+PRICE_INSIGHT_DOCS_SERVER_ID = "auraclaw-price-insight-docs"
 PRICE_INSIGHT_SKILL_DIR = Path(__file__).parents[1] / "skills" / "procurement-price-insight"
 PRICE_DATA_VALIDATION_SKILL_DIR = (
     Path(__file__).parents[1] / "skills" / "procurement-price-data-validation"
@@ -85,64 +86,77 @@ def _signed_skill_package(
     return SkillPackage.from_files(files)
 
 
+def price_insight_publication_tenants(
+    *,
+    source_tenant_id: str | None = None,
+    mcp_tenant_ids: tuple[str | None, ...] = (),
+) -> tuple[str, ...]:
+    tenants: list[str] = []
+    if source_tenant_id:
+        tenants.append(source_tenant_id)
+    tenants.extend(tenant_id for tenant_id in mcp_tenant_ids if tenant_id)
+    return tuple(dict.fromkeys(tenants))
+
+
 def price_insight_resources(
-    tenant_id: str,
+    tenant_id: str | None = None,
+    *,
+    tenant_ids: tuple[str, ...] | None = None,
 ) -> tuple[RegisteredResource, ...]:
+    if tenant_ids is not None:
+        visible = tenant_ids
+    elif tenant_id is None:
+        visible = ()
+    else:
+        visible = (tenant_id,)
     resources = []
     for uri, (relative_path, title, description, mime_type) in _RESOURCE_FILES.items():
         content = (PRICE_INSIGHT_SKILL_DIR / relative_path).read_text(encoding="utf-8")
         digest = f"sha256:{hashlib.sha256(content.encode()).hexdigest()}"
         resources.append(
             RegisteredResource(
-                descriptor=McpResourceDescriptor(
+                descriptor=HandsResourceDescriptor(
                     uri=uri,
                     name=title,
                     title=title,
                     description=description,
                     mime_type=mime_type,
                     size=len(content.encode()),
-                    meta={
-                        "auraclaw": {
-                            "classification": "internal",
-                            "contentDigest": digest,
-                            "sourceRevision": "1.0.0",
-                        }
-                    },
+                    classification="internal",
+                    content_digest=digest,
+                    source_revision="1.0.0",
                 ),
                 contents=(
-                    McpResourceContent(
+                    HandsResourceContent(
                         uri=uri,
                         mime_type=mime_type,
                         text=content,
-                        meta={
-                            "auraclaw": {
-                                "classification": "internal",
-                                "contentDigest": digest,
-                                "sourceRevision": "1.0.0",
-                            }
-                        },
+                        classification="internal",
+                        content_digest=digest,
+                        source_revision="1.0.0",
                     ),
                 ),
-                tenant_ids=(tenant_id,),
+                tenant_ids=visible,
             )
         )
     return tuple(resources)
 
 
 def price_insight_resource_descriptors(
-    tenant_id: str,
+    tenant_id: str | None = None,
+    *,
+    server_id: str = PRICE_INSIGHT_SERVER_ID,
 ) -> tuple[CapabilityDescriptor, ...]:
     descriptors = []
     for resource in price_insight_resources(tenant_id):
         descriptor = resource.descriptor
-        auraclaw_meta = descriptor.meta["auraclaw"]
-        uri = descriptor.uri
-        digest = str(auraclaw_meta["contentDigest"])
+        uri = descriptor.uri or descriptor.name
+        digest = str(descriptor.content_digest or "")
         descriptors.append(
             CapabilityDescriptor(
                 capability_id=f"cap_{hashlib.sha256(uri.encode()).hexdigest()[:32]}",
                 kind=CapabilityKind.RESOURCE,
-                server_id=PRICE_INSIGHT_SERVER_ID,
+                server_id=server_id,
                 canonical_name=uri,
                 version="1.0.0",
                 content_digest=digest,

@@ -21,7 +21,6 @@ from auraclaw.contracts.errors import (
     ApprovalValidationError,
     CredentialAccessError,
     PolicyDeniedError,
-    ReauthorizationRequiredError,
     SandboxViolationError,
     SchemaValidationError,
 )
@@ -402,17 +401,10 @@ class ToolGateway:
                 error_code="tool_timeout",
                 side_effect_status="unknown",
             )
-        except ReauthorizationRequiredError as exc:
-            return ToolResult(
-                status=ToolResultStatus.DENIED,
-                summary=exc.message,
-                error_code=exc.code,
-                side_effect_status="not_started",
-            )
         except (CredentialAccessError, PolicyDeniedError, SandboxViolationError) as exc:
             return ToolResult(
                 status=ToolResultStatus.DENIED,
-                summary="controlled execution boundary denied the tool call",
+                summary=exc.message or "controlled execution boundary denied the tool call",
                 error_code=exc.code,
                 side_effect_status="not_started",
             )

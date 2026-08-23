@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Protocol
 
-from auraclaw.contracts.auth import AgentSessionAuthRequest, AgentSessionBinding
 from auraclaw.contracts.commands import CommandContext
 from auraclaw.contracts.events import CanonicalEvent, NewEvent
 from auraclaw.contracts.tools import ApprovalRecord
@@ -91,15 +90,6 @@ class OutboxRelayPort(Protocol):
 
 class AdmissionController(Protocol):
     async def admit(self, *, goal: str, context: CommandContext) -> None: ...
-
-
-class AgentSessionAuthorizer(Protocol):
-    async def bind(
-        self,
-        request: AgentSessionAuthRequest,
-        *,
-        default_conversation_id: str,
-    ) -> AgentSessionBinding: ...
 
 
 class HumanApprovalNotifier(Protocol):

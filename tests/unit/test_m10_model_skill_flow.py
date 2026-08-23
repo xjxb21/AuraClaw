@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from auraclaw.action.mcp import HandsMcpServer
+from auraclaw.action.hands import HandsGateway
 from auraclaw.action.mcp_primitives import McpResourceRegistry
 from auraclaw.action.model_skill_compiler import (
     ModelSkillCompiler,
@@ -28,8 +28,8 @@ from auraclaw.infrastructure.artifacts.store import (
     ArtifactStore,
     InMemoryObjectStorage,
 )
-from auraclaw.internal.mcp import InProcessMcpTransport
-from auraclaw.runtime.mcp_client import HandsMcpClient
+from auraclaw.internal.hands import InProcessHandsClient
+from auraclaw.runtime.hands_adapter import HandsRuntimeAdapter
 
 PRICE_INSIGHT_MODEL_CONFIG = (
     Path(__file__).parents[2]
@@ -45,6 +45,17 @@ class _SnapshotSource:
 
     async def load_snapshots(self) -> tuple[ModelSkillSnapshot, ...]:
         return self.snapshots
+
+
+class _LocalArtifactWriter(ArtifactStore):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        super().__init__(
+            InMemoryObjectStorage(), signing_key=b"auraclaw-s3-artifact-key"
+        )
+
+    async def aclose(self) -> None:
+        return None
 
 
 class _ConcurrentSource(_SnapshotSource):
@@ -212,9 +223,9 @@ def test_model_config_flows_through_skill_mcp_to_runtime_client() -> None:
         publications = await publisher.reconcile()
         assert len(publications) == 1
 
-        client = HandsMcpClient(
-            InProcessMcpTransport(
-                HandsMcpServer(
+        client = HandsRuntimeAdapter(
+            InProcessHandsClient(
+                HandsGateway(
                     registry=ToolRegistry(),
                     gateway=_UnusedGateway(),  # type: ignore[arg-type]
                     resources=resources,
@@ -497,9 +508,15 @@ def test_action_hands_lifespan_reconciles_and_revokes_model_skills() -> None:
         model_skill_reconcile_interval_seconds=5,
     )
 
-    with patch(
-        "auraclaw.composition.services.MySqlModelSkillSource",
-        return_value=source,
+    with (
+        patch(
+            "auraclaw.composition.services.MySqlModelSkillSource",
+            return_value=source,
+        ),
+        patch(
+            "auraclaw.composition.services.RemoteArtifactWriter",
+            return_value=_LocalArtifactWriter(),
+        ),
     ):
         app = create_service_app("hands", settings)
 

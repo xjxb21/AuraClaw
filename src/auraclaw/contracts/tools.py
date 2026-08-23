@@ -5,8 +5,6 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from auraclaw.contracts.auth import AgentSessionBinding
-
 
 class ToolPermission(StrEnum):
     READ_ONLY = "read-only"
@@ -89,10 +87,7 @@ class ToolInvocation:
     actor_id: str
     approval_id: str | None = None
     credential_ref: str | None = None
-    # Safe Java AgentSession handle propagated from RuntimeAssignment metadata.
-    # Sensitive handoff codes, access tokens and one-time Tool Assertions are
-    # intentionally excluded from this contract.
-    agent_auth: AgentSessionBinding | None = None
+    user_id: str | None = None
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,7 @@ from auraclaw.contracts.errors import (
     LeaseConflictError,
 )
 from auraclaw.control.ports import (
+    DEFAULT_RUNTIME_MAX_STEPS,
     ClaimedAssignment,
     ClaimedRunnable,
     RunnableItem,
@@ -28,6 +29,23 @@ from auraclaw.infrastructure.persistence.postgres_common import (
 from auraclaw.infrastructure.persistence.postgres_common import (
     json_loads as _decode_json,
 )
+
+_USER_ID_PROFILE_KEY = "_auraclaw_user_id"
+
+
+def _profile_with_user_id(profile: dict[str, Any], user_id: str | None) -> dict[str, Any]:
+    encoded = dict(profile)
+    if user_id:
+        encoded[_USER_ID_PROFILE_KEY] = user_id
+    else:
+        encoded.pop(_USER_ID_PROFILE_KEY, None)
+    return encoded
+
+
+def _split_user_id(profile: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    decoded = dict(profile)
+    user_id = decoded.pop(_USER_ID_PROFILE_KEY, None)
+    return decoded, None if user_id is None else str(user_id)
 
 
 class PostgresControlStateStore(_LazyPool):
@@ -50,7 +68,7 @@ class PostgresControlStateStore(_LazyPool):
             item.run_id,
             item.source_version,
             item.priority,
-            _json(item.required_capability),
+            _json(_profile_with_user_id(item.required_capability, item.user_id)),
             item.queue_partition,
             item.role,
             item.deadline,
@@ -377,7 +395,11 @@ class PostgresControlStateStore(_LazyPool):
                     assignment.deadline,
                     assignment.fencing_token,
                     assignment.role,
-                    _json(assignment.resource_profile),
+                    _json(
+                        _profile_with_user_id(
+                            assignment.resource_profile, assignment.user_id
+                        )
+                    ),
                 )
             else:
                 inserted = await connection.fetchval(
@@ -407,7 +429,11 @@ class PostgresControlStateStore(_LazyPool):
                     assignment.deadline,
                     assignment.fencing_token,
                     assignment.role,
-                    _json(assignment.resource_profile),
+                    _json(
+                        _profile_with_user_id(
+                            assignment.resource_profile, assignment.user_id
+                        )
+                    ),
                 )
                 if inserted is None:
                     return False
@@ -427,6 +453,7 @@ class PostgresControlStateStore(_LazyPool):
             "SELECT budget FROM control.runnable_item WHERE task_id=$1", task_id
         )
         budget = self._budget(_decode_json(budget_row) if budget_row is not None else {})
+        profile, user_id = _split_user_id(dict(_decode_json(row["resource_profile"])))
         return RuntimeAssignment(
             tenant_id=str(row["tenant_id"]),
             root_session_id=str(row["root_session_id"]),
@@ -436,9 +463,10 @@ class PostgresControlStateStore(_LazyPool):
             lease_id=str(row["lease_id"]),
             fencing_token=int(row["fencing_token"]),
             role=str(row["role"]),
-            resource_profile=dict(_decode_json(row["resource_profile"])),
+            resource_profile=profile,
             deadline=row["deadline"],
             budget=budget,
+            user_id=user_id,
         )
 
     async def select_runtime(self, item: RunnableItem) -> RuntimeInstance | None:
@@ -457,15 +485,7 @@ class PostgresControlStateStore(_LazyPool):
             ORDER BY count(assignment.task_id),runtime.last_heartbeat_at DESC,runtime.runtime_id
             LIMIT 1""",
             item.role,
-            # agent_auth is assignment metadata for Action Hands, not a pool
-            # capability advertised by Runtime heartbeats.
-            _json(
-                {
-                    key: value
-                    for key, value in dict(item.required_capability).items()
-                    if key != "agent_auth"
-                }
-            ),
+            _json(item.required_capability),
         )
         if row is None:
             return None
@@ -937,6 +957,7 @@ class PostgresControlStateStore(_LazyPool):
 
     @classmethod
     def _item_from_row(cls, row: Any) -> RunnableItem:
+        capability, user_id = _split_user_id(dict(_decode_json(row["required_capability"])))
         return RunnableItem(
             task_id=str(row["task_id"]),
             tenant_id=str(row["tenant_id"]),
@@ -947,16 +968,17 @@ class PostgresControlStateStore(_LazyPool):
             priority=int(row["priority"]),
             queue_partition=str(row["queue_partition"]),
             role=str(row["role"]),
-            required_capability=dict(_decode_json(row["required_capability"])),
+            required_capability=capability,
             deadline=row["deadline"],
             budget=cls._budget(_decode_json(row["budget"])),
+            user_id=user_id,
         )
 
     @staticmethod
     def _budget(data: Any) -> RuntimeBudget:
         values = dict(data or {})
         return RuntimeBudget(
-            max_steps=int(values.get("max_steps", 16)),
+            max_steps=int(values.get("max_steps", DEFAULT_RUNTIME_MAX_STEPS)),
             max_output_tokens=int(values.get("max_output_tokens", 8192)),
             max_cost=float(values["max_cost"]) if values.get("max_cost") is not None else None,
         )

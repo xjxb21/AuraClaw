@@ -36,6 +36,7 @@ from auraclaw.api.routes.operations import router as operations_router
 from auraclaw.api.routes.streams import router as stream_router
 from auraclaw.api.routes.tasks import router as task_router
 from auraclaw.composition import providers
+from auraclaw.composition.identity import build_identity_verifier
 from auraclaw.config import get_settings
 from auraclaw.contracts.errors import AuraClawError
 from auraclaw.contracts.observability import TraceContext
@@ -44,7 +45,7 @@ from auraclaw.infrastructure.observability.stores import StructuredLogger
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    app.state.service_name = "development-combined"
+    app.state.service_name = "combined"
     settings = get_settings()
     producer = providers.get_runtime_event_producer()
     ingestor = providers.get_streaming_ingestor()
@@ -54,51 +55,52 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.model_gateway_ready = settings.model_gateway_configured
     app.state.runtime_event_producer_ready = not settings.kafka_enabled
     app.state.runtime_event_ingestor_ready = not settings.kafka_enabled
-    try:
-        if settings.kafka_enabled:
-            start = getattr(producer, "start", None)
-            if start is not None:
-                try:
-                    await asyncio.wait_for(start(), timeout=10)
-                    app.state.runtime_event_producer_ready = True
-                except Exception:
-                    # Runtime events are best-effort; Canonical writes remain available.
-                    app.state.runtime_event_producer_ready = False
-        if ingestor is not None:
+    if settings.kafka_enabled:
+        start = getattr(producer, "start", None)
+        if start is not None:
             try:
-                await asyncio.wait_for(ingestor.start(), timeout=10)
-                app.state.runtime_event_ingestor_ready = True
+                await asyncio.wait_for(start(), timeout=10)
+                app.state.runtime_event_producer_ready = True
             except Exception:
-                # Streaming is best-effort; Canonical Session APIs must remain available.
-                app.state.runtime_event_ingestor_ready = False
-        app.state.runtime_event_bus_ready = bool(
-            app.state.runtime_event_producer_ready
-            and app.state.runtime_event_ingestor_ready
+                # Runtime events are best-effort; Canonical writes remain available.
+                app.state.runtime_event_producer_ready = False
+    if ingestor is not None:
+        try:
+            await asyncio.wait_for(ingestor.start(), timeout=10)
+            app.state.runtime_event_ingestor_ready = True
+        except Exception:
+            # Streaming is best-effort; Canonical Session APIs must remain available.
+            app.state.runtime_event_ingestor_ready = False
+    app.state.runtime_event_bus_ready = bool(
+        app.state.runtime_event_producer_ready
+        and app.state.runtime_event_ingestor_ready
+    )
+    if settings.runtime_enabled and settings.model_gateway_configured:
+        runtime_worker = providers.build_runtime_worker()
+        runtime_worker_task = asyncio.create_task(runtime_worker.run())
+        app.state.runtime_worker_ready = True
+        logging.getLogger(__name__).info(
+            "runtime worker started (storage=%s, runtime_events=%s, model_provider=%s)",
+            settings.storage_label,
+            "kafka" if settings.kafka_enabled else "memory",
+            settings.model_provider,
         )
-        if settings.runtime_enabled and settings.model_gateway_configured:
-            runtime_worker = providers.build_runtime_worker()
-            runtime_worker_task = asyncio.create_task(runtime_worker.run())
-            app.state.runtime_worker_ready = True
-            logging.getLogger(__name__).info(
-                "runtime worker started (storage=%s, runtime_events=%s, model_provider=%s)",
-                settings.storage_label,
-                "kafka" if settings.kafka_enabled else "memory",
-                settings.model_provider,
-            )
-        yield
-    finally:
-        if runtime_worker is not None and runtime_worker_task is not None:
-            await runtime_worker.stop()
-            with suppress(Exception):
-                await asyncio.wait_for(runtime_worker_task, timeout=10)
-        if ingestor is not None:
-            with suppress(Exception):
-                await asyncio.wait_for(ingestor.close(), timeout=10)
-        close = getattr(producer, "close", None)
-        if close is not None:
-            with suppress(Exception):
-                await asyncio.wait_for(close(), timeout=10)
-        await providers.get_runtime_replay_bus().close()
+    yield
+    if runtime_worker is not None and runtime_worker_task is not None:
+        await runtime_worker.stop()
+        with suppress(Exception):
+            await asyncio.wait_for(runtime_worker_task, timeout=10)
+    if ingestor is not None:
+        with suppress(Exception):
+            await asyncio.wait_for(ingestor.close(), timeout=10)
+    close = getattr(producer, "close", None)
+    if close is not None:
+        with suppress(Exception):
+            await asyncio.wait_for(close(), timeout=10)
+    await providers.get_runtime_replay_bus().close()
+    close_identity = getattr(app.state.identity_verifier, "close", None)
+    if close_identity is not None:
+        await close_identity()
 
 
 @asynccontextmanager
@@ -133,6 +135,9 @@ async def streaming_lifespan(app: FastAPI) -> AsyncIterator[None]:
             with suppress(Exception):
                 await asyncio.wait_for(ingestor.close(), timeout=10)
         await providers.get_runtime_replay_bus().close()
+        close_identity = getattr(app.state.identity_verifier, "close", None)
+        if close_identity is not None:
+            await close_identity()
 
 
 def create_app(*, profile: str = "development") -> FastAPI:
@@ -160,18 +165,21 @@ def create_app(*, profile: str = "development") -> FastAPI:
             observability_service_dependency: providers.get_observability_service,
         }
     )
+    app.state.identity_verifier = build_identity_verifier(settings)
     if settings.allowed_cors_origins:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=settings.allowed_cors_origins,
             allow_methods=["GET", "POST", "OPTIONS"],
             allow_headers=[
+                "Authorization",
                 "Content-Type",
                 "Idempotency-Key",
                 "If-None-Match",
                 "Last-Event-ID",
                 "X-Actor-ID",
                 "X-Correlation-ID",
+                "X-CT-Agent-Context",
                 "X-Expected-Version",
                 "X-Tenant-ID",
             ],
@@ -192,7 +200,7 @@ def create_app(*, profile: str = "development") -> FastAPI:
         trace_id = request.headers.get("traceparent", "").split("-")[1:2]
         trace = trace_id[0] if trace_id and len(trace_id[0]) == 32 else uuid4().hex
         span_id = uuid4().hex[:16]
-        tenant_id = request.headers.get("X-Tenant-ID", "local")
+        tenant_id = "unauthenticated"
         started_at = datetime.now(UTC)
         started = time.perf_counter()
         status = "error"
@@ -204,6 +212,7 @@ def create_app(*, profile: str = "development") -> FastAPI:
             response.headers["traceparent"] = f"00-{trace}-{span_id}-01"
             return response
         finally:
+            tenant_id = getattr(request.state, "tenant_id", None) or tenant_id
             duration_ms = (time.perf_counter() - started) * 1_000
             context = TraceContext(trace_id=trace, span_id=span_id, tenant_id=tenant_id)
             try:
@@ -218,7 +227,12 @@ def create_app(*, profile: str = "development") -> FastAPI:
                     operation=f"{request.method} {request.url.path}",
                     started_at=started_at,
                     status=status,
-                    attributes={"http_status": status_code, "duration_ms": duration_ms},
+                    attributes={
+                        "http_status": status_code,
+                        "duration_ms": duration_ms,
+                        "identity_kid": getattr(request.state, "identity_kid", None),
+                        "identity_jti": getattr(request.state, "identity_jti", None),
+                    },
                 )
                 await observability.metric(
                     "http.request.duration_ms",

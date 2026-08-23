@@ -9,9 +9,10 @@
 
 ## 1. 目标
 
-本文定义 AuraClaw 如何通过 MCP 为 Agent Runtime 提供数据、工具和技能的发现、加载与调用能力。
-设计建立在现有 `Runtime -> Action Hands MCP` 链路上，并扩展为统一的 Capability Plane。
-实现跟踪见 [GitHub Issue #21](https://github.com/sushaofei/AuraClaw/issues/21)。
+本文定义 AuraClaw 如何通过协议无关的 Hands Contract 为 Agent Runtime 提供数据、工具和技能。
+MCP 与 Java API 只作为 Hands 下游 Connector。Issue #43 之后，Runtime 不再使用内部 `/mcp`。
+实现跟踪见 [ADR-002](../ADR-002%20Hands%20稳定能力边界与下游%20Connector.md) 与
+[GitHub Issue #43](https://github.com/sushaofei/AuraClaw/issues/43)。
 
 目标：
 
@@ -25,17 +26,18 @@
 
 - MCP 不替代 Canonical Session Event、Control Lease、Hands Invocation Store 或 Artifact Store。
 - Runtime 不直接连接任意第三方 MCP Server，不接收 Server URL、启动命令或明文凭证。
-- 不把 MCP Runtime Event、订阅通知或实验性 MCP Task 当作 AuraClaw 的结果交付保证。
+- 不把 MCP Runtime Event、订阅通知或 MCP Tasks Extension 当作 AuraClaw 的结果交付保证。
 - 不把技能退化为单个 Tool；技能描述过程策略，Tool 执行物理动作。
 
 ### 1.1 当前基线与差距
 
 现有代码已经具备：
 
-- `contracts/mcp.py` 中的 MCP 2025-11-25 JSON-RPC、Trusted Context 和 Transport 契约。
-- Runtime 侧 `HandsMcpClient` 的 `initialize`、`tools/list`、`tools/call` 和取消。
+- `contracts/hands.py` 中的协议无关 Hands DTO 与内部路径。
+- Runtime 侧 `HandsClient` / `HttpHandsClient` 的 list/call/read/cancel。
+- 下游 `infrastructure/connectors/mcp` 中的 MCP 2026-07-28 wire 与 ManagedMcpConnector。
 - Action Hands 侧 Tool Registry、Schema、Policy、Approval、Invocation Store、Artifact 和 Credential 边界。
-- Streamable HTTP 的内部认证、协议版本和 Lease/Fencing 上下文。
+- 内部 Hands HTTP 的 workload/lease 认证与大小限制。
 
 尚缺：
 
@@ -80,7 +82,7 @@ flowchart LR
     LOCAL["Built-in / Tenant MCP Servers"]
     REMOTE["Approved Remote MCP Servers"]
 
-    RT -->|"MCP 2025-11-25<br/>trusted context"| GW
+    RT -->|"MCP 2026-07-28<br/>trusted context"| GW
     GW --> CAT
     GW --> POL
     GW --> ART
@@ -179,7 +181,7 @@ URI/tenant ACL
 
 ### 3.3 Tool
 
-Tool 延用现有 `ToolCapability`、`ToolInvocation` 和 `ToolResult`，并补齐 MCP 2025-11-25 语义：
+Tool 延用现有 `ToolCapability`、`ToolInvocation` 和 `ToolResult`，并补齐 MCP 2026-07-28 语义：
 
 - Schema 默认按 JSON Schema 2020-12 校验。
 - `inputSchema` 在 Gateway 校验；存在 `outputSchema` 时 Server 和 Gateway 均校验结构化结果。
@@ -267,12 +269,12 @@ skill://<publisher>/<name>/<version>/assets/<path>
 
 ## 4. 发现、加载与调用
 
-### 4.1 初始化和目录同步
+### 4.1 协议发现和目录同步
 
 ```text
 Gateway 注册受信 Server 配置
- -> 建立连接并 initialize
- -> 协商 resources / tools / prompts / tasks 能力
+ -> 逐请求声明 2026-07-28 profile，并调用 server/discover
+ -> 发现 resources / tools / prompts 能力（不声明 Tasks Extension）
  -> 分页拉取列表
  -> 规范化、校验、签名/信任分类
  -> Policy 生成可见范围
@@ -418,7 +420,7 @@ class CapabilityClient(Protocol):
     async def load_skill_part(...)
 ```
 
-协议传输 DTO 归 `contracts/mcp.py`；Runtime 使用的稳定 Port 和归一化模型归 `runtime/ports.py`；
+协议传输 DTO 归 `infrastructure/connectors/mcp/wire.py`；Runtime 使用的稳定 Port 和 Hands DTO 归 `contracts/hands.py` 与 `runtime/ports.py`；
 Capability Catalog、Resource、Skill 和 Tool 执行实现在 `action`，具体 MCP/HTTP/Artifact 适配器在
 `infrastructure`，对象图仍只由 `composition` 选择。
 
@@ -505,7 +507,8 @@ Capability Gateway -> External MCP Server
 | MCP Task 状态丢失 | 以 Invocation Store 记录 `unknown`，不把 MCP Task 当作 AuraClaw 事实源 |
 | Server 推送通知丢失 | 周期性全量/增量对账；通知只优化缓存时效 |
 
-MCP Tasks 在 2025-11-25 中仍是实验能力。首期不启用；后续只用于支持长 Tool 调用的远端轮询，
+MCP Tasks 在 2026-07-28 中已移到 `io.modelcontextprotocol/tasks` Extension。首期不启用；
+后续只用于支持长 Tool 调用的远端轮询，
 不得与 AuraClaw Task、Run、Session 或 Delivery 状态机合并。
 
 ## 8. 可观测性
@@ -514,7 +517,7 @@ MCP Tasks 在 2025-11-25 中仍是实验能力。首期不启用；后续只用�
 
 ```text
 mcp_server_connection_state
-mcp_initialize_latency
+mcp_server_discover_latency
 capability_catalog_sync_latency / sync_failure
 capability_search_latency / candidate_count
 resource_read_latency / bytes / cache_hit
@@ -541,7 +544,7 @@ Artifact 引用。
 
 ### Phase 1：统一目录与 Resource
 
-- 扩展 initialize 能力协商及 list 分页。
+- 实现协议发现及 list 分页。
 - 建立 Capability Catalog、Server Registry 和 `auraclaw.capabilities.search`。
 - 实现 Resource list/read、Artifact 化、分类、ACL 和缓存失效。
 - 保持现有 Tool 调用行为兼容。
@@ -577,11 +580,11 @@ Artifact 引用。
 
 ## 11. 规范依据
 
-- [MCP Server primitives overview](https://modelcontextprotocol.io/specification/2025-11-25/server/index)
-- [MCP Resources](https://modelcontextprotocol.io/specification/2025-11-25/server/resources)
-- [MCP Tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
-- [MCP Lifecycle and capability negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
-- [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
-- [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
-- [MCP Tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks)
+- [MCP Server primitives overview](https://modelcontextprotocol.io/specification/2026-07-28/server/index)
+- [MCP Resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources)
+- [MCP Tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
+- [MCP Server discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)
+- [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports)
+- [MCP Authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
+- [MCP Tasks Extension](https://modelcontextprotocol.io/extensions/tasks/overview)
 - [MCP Security Best Practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices)
