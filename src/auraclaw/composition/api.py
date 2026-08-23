@@ -54,49 +54,51 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.model_gateway_ready = settings.model_gateway_configured
     app.state.runtime_event_producer_ready = not settings.kafka_enabled
     app.state.runtime_event_ingestor_ready = not settings.kafka_enabled
-    if settings.kafka_enabled:
-        start = getattr(producer, "start", None)
-        if start is not None:
+    try:
+        if settings.kafka_enabled:
+            start = getattr(producer, "start", None)
+            if start is not None:
+                try:
+                    await asyncio.wait_for(start(), timeout=10)
+                    app.state.runtime_event_producer_ready = True
+                except Exception:
+                    # Runtime events are best-effort; Canonical writes remain available.
+                    app.state.runtime_event_producer_ready = False
+        if ingestor is not None:
             try:
-                await asyncio.wait_for(start(), timeout=10)
-                app.state.runtime_event_producer_ready = True
+                await asyncio.wait_for(ingestor.start(), timeout=10)
+                app.state.runtime_event_ingestor_ready = True
             except Exception:
-                # Runtime events are best-effort; Canonical writes remain available.
-                app.state.runtime_event_producer_ready = False
-    if ingestor is not None:
-        try:
-            await asyncio.wait_for(ingestor.start(), timeout=10)
-            app.state.runtime_event_ingestor_ready = True
-        except Exception:
-            # Streaming is best-effort; Canonical Session APIs must remain available.
-            app.state.runtime_event_ingestor_ready = False
-    app.state.runtime_event_bus_ready = bool(
-        app.state.runtime_event_producer_ready
-        and app.state.runtime_event_ingestor_ready
-    )
-    if settings.runtime_enabled and settings.model_gateway_configured:
-        runtime_worker = providers.build_runtime_worker()
-        runtime_worker_task = asyncio.create_task(runtime_worker.run())
-        app.state.runtime_worker_ready = True
-        logging.getLogger(__name__).info(
-            "runtime worker started (storage=%s, runtime_events=%s, model_provider=%s)",
-            settings.storage_label,
-            "kafka" if settings.kafka_enabled else "memory",
-            settings.model_provider,
+                # Streaming is best-effort; Canonical Session APIs must remain available.
+                app.state.runtime_event_ingestor_ready = False
+        app.state.runtime_event_bus_ready = bool(
+            app.state.runtime_event_producer_ready
+            and app.state.runtime_event_ingestor_ready
         )
-    yield
-    if runtime_worker is not None and runtime_worker_task is not None:
-        await runtime_worker.stop()
-        with suppress(Exception):
-            await asyncio.wait_for(runtime_worker_task, timeout=10)
-    if ingestor is not None:
-        with suppress(Exception):
-            await asyncio.wait_for(ingestor.close(), timeout=10)
-    close = getattr(producer, "close", None)
-    if close is not None:
-        with suppress(Exception):
-            await asyncio.wait_for(close(), timeout=10)
-    await providers.get_runtime_replay_bus().close()
+        if settings.runtime_enabled and settings.model_gateway_configured:
+            runtime_worker = providers.build_runtime_worker()
+            runtime_worker_task = asyncio.create_task(runtime_worker.run())
+            app.state.runtime_worker_ready = True
+            logging.getLogger(__name__).info(
+                "runtime worker started (storage=%s, runtime_events=%s, model_provider=%s)",
+                settings.storage_label,
+                "kafka" if settings.kafka_enabled else "memory",
+                settings.model_provider,
+            )
+        yield
+    finally:
+        if runtime_worker is not None and runtime_worker_task is not None:
+            await runtime_worker.stop()
+            with suppress(Exception):
+                await asyncio.wait_for(runtime_worker_task, timeout=10)
+        if ingestor is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(ingestor.close(), timeout=10)
+        close = getattr(producer, "close", None)
+        if close is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(close(), timeout=10)
+        await providers.get_runtime_replay_bus().close()
 
 
 @asynccontextmanager

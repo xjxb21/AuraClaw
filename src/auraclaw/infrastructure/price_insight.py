@@ -130,7 +130,7 @@ class JsonPriceInsightSource:
         tenant_id: str,
         filters: PriceInsightFilter,
     ) -> PriceInsightDataset:
-        payload = json.loads(self._path.read_text())
+        payload = json.loads(self._path.read_text(encoding="utf-8"))
         fixture = PriceInsightDataset.model_validate(payload)
         if fixture.tenant_id != tenant_id:
             return PriceInsightDataset(

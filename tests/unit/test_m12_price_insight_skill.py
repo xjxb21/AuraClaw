@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 from auraclaw.action.capability_catalog import (
     CAPABILITY_LOAD_TOOL_NAME,
@@ -93,6 +96,25 @@ class _NoApprovals:
         policy_version: str,
     ) -> None:
         del tenant_id, session_id, digest, policy_version
+
+
+def test_price_insight_resources_are_read_as_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_read_text = Path.read_text
+    encodings: list[str | None] = []
+
+    def tracked_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        encodings.append(kwargs.get("encoding"))
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracked_read_text)
+
+    resources = price_insight_resources("tenant-utf8")
+
+    assert resources
+    assert encodings
+    assert set(encodings) == {"utf-8"}
 
 
 class _CountingPriceSource:
@@ -197,7 +219,7 @@ def test_dwd_rule_drives_default_threshold_and_request_can_override(tmp_path: An
         payload = json.loads(
             (
                 PRICE_INSIGHT_SKILL_DIR / "tests" / "golden-data.json"
-            ).read_text()
+            ).read_text(encoding="utf-8")
         )
         payload["rules"] = [
             {
@@ -256,7 +278,7 @@ def test_dwd_rule_quality_minimums_exclude_weak_market_matches(
         payload = json.loads(
             (
                 PRICE_INSIGHT_SKILL_DIR / "tests" / "golden-data.json"
-            ).read_text()
+            ).read_text(encoding="utf-8")
         )
         payload["rules"] = [
             {
@@ -303,7 +325,7 @@ def test_simulated_market_benchmark_blocks_authoritative_insight(
         payload = json.loads(
             (
                 PRICE_INSIGHT_SKILL_DIR / "tests" / "golden-data.json"
-            ).read_text()
+            ).read_text(encoding="utf-8")
         )
         for event in payload["events"]:
             event["tax_basis_code"] = "UNKNOWN"

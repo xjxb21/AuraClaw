@@ -90,7 +90,7 @@ def price_insight_resources(
 ) -> tuple[RegisteredResource, ...]:
     resources = []
     for uri, (relative_path, title, description, mime_type) in _RESOURCE_FILES.items():
-        content = (PRICE_INSIGHT_SKILL_DIR / relative_path).read_text()
+        content = (PRICE_INSIGHT_SKILL_DIR / relative_path).read_text(encoding="utf-8")
         digest = f"sha256:{hashlib.sha256(content.encode()).hexdigest()}"
         resources.append(
             RegisteredResource(

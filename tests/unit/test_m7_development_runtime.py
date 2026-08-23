@@ -2,8 +2,10 @@ import asyncio
 import time
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from auraclaw.composition import api as composition_api
 from auraclaw.composition import providers
 from auraclaw.composition.providers import (
     get_approval_projection,
@@ -37,6 +39,18 @@ class DeterministicModelClient:
             deltas=deltas,
             usage={"input_tokens": 1, "output_tokens": len(deltas)},
         )
+
+
+class _TrackedAsyncResource:
+    def __init__(self) -> None:
+        self.started = False
+        self.closed = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def _clear_dependencies() -> None:
@@ -92,6 +106,44 @@ def test_runtime_logic_is_independent_of_resource_backends() -> None:
     assert settings.postgres_enabled is True
     assert settings.kafka_enabled is True
     assert settings.runtime_enabled is True
+
+
+def test_lifespan_closes_event_resources_when_worker_build_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        runtime_event_backend="kafka",
+        runtime_enabled=True,
+        model_api_key="test-secret",
+        model_base_url="https://models.example/v1",
+        model_name="test-model",
+    )
+    producer = _TrackedAsyncResource()
+    ingestor = _TrackedAsyncResource()
+    replay = _TrackedAsyncResource()
+    monkeypatch.setattr(composition_api, "get_settings", lambda: settings)
+    monkeypatch.setattr(providers, "get_runtime_event_producer", lambda: producer)
+    monkeypatch.setattr(providers, "get_streaming_ingestor", lambda: ingestor)
+    monkeypatch.setattr(providers, "get_runtime_replay_bus", lambda: replay)
+
+    def fail_to_build_worker() -> None:
+        raise RuntimeError("worker composition failed")
+
+    monkeypatch.setattr(providers, "build_runtime_worker", fail_to_build_worker)
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="worker composition failed"):
+            async with composition_api.lifespan(FastAPI()):
+                pass
+
+    asyncio.run(scenario())
+
+    assert producer.started is True
+    assert ingestor.started is True
+    assert producer.closed is True
+    assert ingestor.closed is True
+    assert replay.closed is True
 
 
 def test_unified_runtime_supports_three_runs_in_one_session(

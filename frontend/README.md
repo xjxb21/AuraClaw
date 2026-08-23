@@ -43,8 +43,11 @@ Tenant / Actor 默认 `local` / `local-user`，点「检查连接」即可。
 **AuraClaw: Debug local frontend + backend**，然后打开
 http://localhost:3000/price-insight 。也可分别启动：
 
-```bash
-AURACLAW_DEV_API_TARGET=http://127.0.0.1:8000 npm run dev
+```powershell
+$env:AURACLAW_DEV_API_TARGET = "http://127.0.0.1:8000"
+npm run dev
+
+# 在另一个 PowerShell 中启动后端
 uv run auraclaw serve
 ```
 
