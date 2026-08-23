@@ -8,7 +8,6 @@ from urllib.parse import parse_qs
 import pytest
 
 from auraclaw.action.ports import PolicyEvaluation
-from auraclaw.action.remote_mcp import ManagedRemoteMcpTransport
 from auraclaw.config import Settings
 from auraclaw.contracts.capabilities import (
     CapabilityStatus,
@@ -17,11 +16,15 @@ from auraclaw.contracts.capabilities import (
     McpServerDefinition,
 )
 from auraclaw.contracts.errors import CredentialAccessError, PolicyDeniedError
-from auraclaw.contracts.mcp import (
+from auraclaw.contracts.tools import CredentialReference, PolicyDecision
+from auraclaw.infrastructure.connectors.mcp.transport import ManagedRemoteMcpTransport
+from auraclaw.infrastructure.connectors.mcp.wire import (
+    MCP_CLIENT_CAPABILITIES_META_KEY,
+    MCP_PROTOCOL_VERSION,
+    MCP_PROTOCOL_VERSION_META_KEY,
     McpJsonRpcRequest,
     McpTrustedContext,
 )
-from auraclaw.contracts.tools import CredentialReference, PolicyDecision
 from auraclaw.infrastructure.credentials.mcp_egress import (
     ManagedMcpEgressAdapter,
     McpEgressResponse,
@@ -139,7 +142,14 @@ def _request() -> dict[str, object]:
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {"name": "github.issue.get", "arguments": {"number": 21}},
+        "params": {
+            "name": "github.issue.get",
+            "arguments": {"number": 21},
+            "_meta": {
+                MCP_PROTOCOL_VERSION_META_KEY: MCP_PROTOCOL_VERSION,
+                MCP_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        },
     }
 
 
@@ -236,6 +246,11 @@ def test_mcp_egress_uses_resource_indicator_pins_dns_and_hides_tokens() -> None:
         assert token_body["resource"] == ["https://mcp.example/v1/mcp"]
         assert token_body["client_secret"] == ["oauth-client-secret"]
         assert sender.calls[3]["url"] == "https://mcp.example/v1/mcp"
+        request_headers = sender.calls[3]["headers"]
+        assert isinstance(request_headers, dict)
+        assert request_headers["MCP-Protocol-Version"] == MCP_PROTOCOL_VERSION
+        assert request_headers["Mcp-Method"] == "tools/call"
+        assert request_headers["Mcp-Name"] == "github.issue.get"
         assert resolver.calls == [
             ("mcp.example", 443),
             ("auth.example", 443),
@@ -361,6 +376,64 @@ def test_mcp_egress_rejects_private_dns_and_redirects() -> None:
     asyncio.run(scenario())
 
 
+def test_mcp_egress_allows_loopback_http_when_private_host_allowlisted() -> None:
+    async def scenario() -> None:
+        class LoopbackSender:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def send(self, **request: object) -> McpEgressResponse:
+                self.calls.append(request)
+                return McpEgressResponse(
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    content=b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}',
+                )
+
+        sender = LoopbackSender()
+        adapter = ManagedMcpEgressAdapter(
+            McpServerDefinition(
+                server_id="java-mcp",
+                tenant_id="development",
+                title="Java Agent Runtime MCP Gateway",
+                endpoint="http://127.0.0.1:48080/rpc-api/agent-runtime/mcp",
+                credential_ref="vault/java-mcp#client_secret",
+                trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
+                allowed_tool_prefixes=("",),
+                allowed_private_hosts=("127.0.0.1",),
+                status=CapabilityStatus.ACTIVE,
+                enabled=True,
+            ),
+            resolver=_Resolver(("127.0.0.1",)),
+            sender=sender,
+        )
+        await adapter(
+            {
+                "server_id": "java-mcp",
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent.runtime.ping",
+                    "arguments": {},
+                    "_meta": {
+                        MCP_PROTOCOL_VERSION_META_KEY: MCP_PROTOCOL_VERSION,
+                        MCP_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                },
+            },
+            "local-java-mcp-debug",
+        )
+        assert sender.calls
+        assert (
+            sender.calls[0]["url"]
+            == "http://127.0.0.1:48080/rpc-api/agent-runtime/mcp"
+        )
+        assert sender.calls[0]["approved_ip"] == "127.0.0.1"
+
+    asyncio.run(scenario())
+
+
 def test_hands_remote_transport_passes_only_reference_and_policy_evidence() -> None:
     async def scenario() -> None:
         credentials = _Credentials()
@@ -400,6 +473,27 @@ def test_hands_remote_transport_passes_only_reference_and_policy_evidence() -> N
             await transport.send(
                 McpJsonRpcRequest(id=8, method="tools/list"),
                 trusted_context=_trusted("tenant-b"),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_hands_remote_transport_rejects_mismatched_response_id() -> None:
+    class MismatchedCredentials(_Credentials):
+        async def invoke(self, **arguments: object) -> dict[str, object]:
+            del arguments
+            return {"jsonrpc": "2.0", "id": "wrong", "result": {}}
+
+    async def scenario() -> None:
+        transport = ManagedRemoteMcpTransport(
+            _server(),
+            credentials=MismatchedCredentials(),
+            policy=_AllowPolicy(),
+        )
+        with pytest.raises(ValueError, match="response id"):
+            await transport.send(
+                McpJsonRpcRequest(id="expected", method="tools/list"),
+                trusted_context=_trusted(),
             )
 
     asyncio.run(scenario())

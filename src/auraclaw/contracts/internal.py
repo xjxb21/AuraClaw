@@ -73,6 +73,7 @@ class LeaseAssertion(ContractModel):
     session_id: str
     run_id: str
     runtime_id: str | None = None
+    user_id: str | None = None
     lease_id: str
     fencing_token: int = Field(ge=1)
     expires_at: datetime
@@ -327,7 +328,7 @@ class RuntimeServiceConfig(ContractModel):
     control_base_url: str
     session_base_url: str
     model_gateway_base_url: str
-    hands_mcp_url: str
+    hands_url: str
     artifact_base_url: str
     workload_token_file: str
 

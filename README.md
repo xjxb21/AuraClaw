@@ -131,17 +131,30 @@ Session 只接收 `artifact_ref`。
 发布带证据的三态决策，不能覆盖 Worker Artifact。Join 生成的 Root Result 保存 Child Result、
 Review Evidence 和 Artifact lineage。
 
+## 配置文件
+
+仓库只提交三份环境模板，真实密钥文件被 gitignore：
+
+| 模板 | 复制为 | 用途 |
+|------|--------|------|
+| `.env.example` | — | 变量目录。不要直接当运行配置。 |
+| `.env.debug.example` | `.env.debug` | 本地 12 入口 debug，内存存储，开箱即用。 |
+| `.env.production.example` | `.env.production` | Compose 生产发布。填镜像 digest、库密码、模型、Vault、SeaweedFS。 |
+
 ## 本地启动
 
-`auraclaw serve` 是显式的 development combined profile，不是生产入口：
+`auraclaw serve` 会按生产拓扑拉起全部 12 个独立入口（端口 8000–8011），并额外在
+`:8080` 提供本地 Ingress：`/v1/streams/*` 去 Streaming Gateway `:8010`，其余去
+Task API `:8000`。Java 智问代理应指向 `http://127.0.0.1:8080`，不要直连 8000。
+装配与生产相同，差异只来自环境配置：
 
 ```bash
 uv sync --extra dev
+cp .env.debug.example .env.debug
 uv run auraclaw serve
 ```
 
-development profile 的 API lifespan 内启动统一 Runtime Worker。正式服务使用同一镜像和不同
-entrypoint：
+也可单独启动某一个入口：
 
 ```text
 auraclaw api run                  auraclaw session run
@@ -158,7 +171,7 @@ auraclaw delivery run
 
 ### Model Skill 预览闭环
 
-`action-hands` 使用 `.env` 的 `MYSQL_DB_*` 在一致性只读快照中加载 `ct_model_*`，把每个模型版本
+`action-hands` 使用环境里的 `MYSQL_DB_*` 在一致性只读快照中加载 `ct_model_*`，把每个模型版本
 编译成签名 Skill Package，并通过 `skill://ct-model/...` MCP Resource 提供给 Runtime。启动时先
 完成一次全量对账，此后按配置间隔继续扫描；不再符合读取条件的版本会从 MCP Resource 撤销。
 当前草稿会映射为 `1.0.0-draft.<version_id>`，只用于配置解释，不执行权威计算或业务回写。
@@ -214,35 +227,12 @@ S3 生产装配已切换为 owner HTTP/MCP Client：Session、Control、Model、
 Artifact 和 Admin 写路径不再共享跨域 Store。Action Hands 以 MCP Server 暴露工具，并通过持久
 Invocation Store、Policy、Credential Proxy 和 Artifact Service 执行；Runtime 只持有 MCP Client。
 SeaweedFS 管理密钥只注入 Artifact Service，Vault Token 只注入 Credential Proxy，Runtime 位于
-无 platform egress 的内部 Docker network。development combined profile 继续使用进程内适配器。
-所有环境都经过相同的
-Runnable Queue、Orchestrator、Agent Harness、Model Gateway 和 Runtime Event Producer SDK；
-环境差异只来自各自 `.env` 提供的 PostgreSQL/内存、Kafka/内存、模型端点和 CORS 等资源。
-已部署外部 Runtime 时可设置 `AURACLAW_RUNTIME_ENABLED=false` 关闭同进程 Worker。
+无 platform egress 的内部 Docker network。本地 `auraclaw serve` 与生产 Compose 使用同一组
+12 个入口；环境差异只来自 `.env.debug` / `.env.production` 提供的存储、事件总线、模型端点和 CORS
+等资源。CLI 与 VS Code debug 都读取 `.env.debug`（可用 `AURACLAW_ENV_FILE` 覆盖）。
 
-每套部署使用自己的 gitignored 配置文件，例如 `.env.development` 与 `.env.production`，无需
-在文件内容中加入环境标签。启动时由文件名选择资源集合：
-
-```bash
-uv run uvicorn auraclaw.main:app --reload --env-file .env.development
-uv run uvicorn auraclaw.main:app --env-file .env.production
-```
-
-生产资源文件示例：
-
-```dotenv
-AURACLAW_MODEL_PROVIDER=openai_compatible
-AURACLAW_MODEL_API_KEY=replace-with-secret
-AURACLAW_MODEL_BASE_URL=https://models.example/v1
-AURACLAW_MODEL_NAME=example-model
-AURACLAW_MODEL_TIMEOUT_SECONDS=120
-# Optional: AURACLAW_MODEL_THINKING_ENABLED=false  # GLM/TokenHub thinking.type=disabled
-AURACLAW_RUNTIME_EVENT_BACKEND=kafka
-KAFKA_HOST=localhost
-KAFKA_PORT=9092
-DB_NAME=auraclaw
-AURACLAW_CORS_ALLOW_ORIGINS=https://console.example.com
-```
+生产发布复制 `.env.production.example` 为 gitignored 的 `.env.production`，填入不可变镜像和密钥后再跑
+`scripts/materialize_compose_secrets.py` 与 `scripts/compose_preflight.py`。
 
 Harness 的 delta 经 Runtime Event Producer SDK 排序、校验和脱敏后进入 Kafka，再由
 Streaming Ingestor 写入 Replay Bus 供 SSE 消费；Kafka 不可用只会令 `/health/ready` 降级，
@@ -462,90 +452,6 @@ Metrics Pipeline 和 Alert Receiver 通过同一观测端口接入。
 `dwd_pr_price_event_detail_di` 与 `dwd_pr_price_compare_pair_di`。Runtime 和 Skill
 都不接收数据库地址、凭证、表名或原始 SQL。完整流程与回滚见
 [M12 价格洞察业务 Skill 实施与运维](docs/M12%20价格洞察业务%20Skill%20实施与运维.md)。
-
-价格洞察原子 Tool 默认由 Java Agent Runtime 执行，Skill、ToolCapability 名称和模型
-输入 Schema 不变。需要同时配置 Java 地址和共享 Workload Token：
-
-```dotenv
-AURACLAW_PRICE_INSIGHT_TOOL_BACKEND=java
-AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL=http://agent-runtime-server
-AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE=/run/secrets/java_agent_runtime_workload_token
-```
-
-仅离线调试可设 `AURACLAW_PRICE_INSIGHT_TOOL_BACKEND=python`，改回进程内 fixture/MySQL 计算。
-
-### Workload Token 首次部署与轮换
-
-不再使用 workload 公钥、私钥或 RS256。首次部署时，在 Secret Manager 中生成一个至少 32
-字符的随机 Token，并将同一个 Secret 注入 Python 和 Java：
-
-```powershell
-$bytes = [byte[]]::new(32)
-[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-[Convert]::ToHexString($bytes).ToLower()
-```
-
-Python 只配置 Token 文件：
-
-```dotenv
-AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE=/secure/secrets/auraclaw-java-workload-token
-```
-
-Java 配置 `chaintower.agent-authorization.workload-token` 和 `workload-subject`，Token
-通过 Secret 或配置中心注入，不写入仓库。生产 Compose 使用文件 Secret，将上面的 `_FILE`
-写入生产 env 文件后，先物化 Secret，再启动 `task-api` 和 `action-hands`；物化脚本会读取
-Token 文件并写入被 `.gitignore` 忽略的
-`.runtime/compose-secrets/java_agent_runtime_workload_token`：
-
-```powershell
-uv run python scripts/materialize_compose_secrets.py `
-  --env-file .env.production `
-  --output-dir .runtime/compose-secrets
-docker compose --env-file .env.production -f compose.production.yml up -d task-api action-hands
-```
-
-轮换时生成新的随机 Token，同时更新 Java Secret 和 Python Secret，安排短暂维护窗口后
-滚动重启 Java、`task-api` 和 `action-hands`。这一版只配置一个当前 Token，不保留双 Token
-兼容窗口；回滚时恢复旧 Token 并重启相关服务。
-
-创建任务时，页面桥接层应优先传入一次性 handoff 证明：
-
-```json
-{
-  "goal": "分析 2026 年第一季度采购价格",
-  "agentSessionId": "agent-session-uuid",
-  "conversationId": "conversation-001",
-  "handoffCode": "one-time-handoff-code"
-}
-```
-
-恢复兼容场景可传 `conversationId + accessToken` 进行 resolve。`POST /v1/tasks`、消息追加、
-`POST /v1/sessions/{session_id}/runs` 与 resume 均接受同一组可选授权字段，但只允许
-`agentSessionId + handoffCode` 或不含 `agentSessionId` 的 `conversationId + accessToken`；裸
-`agentSessionId` 和混合证明会被拒绝。Python 只在入站阶段消费 `handoffCode/accessToken`，
-事件与 Runtime 仅保存 `agentSessionId/conversationId`；每次业务 Tool 调用前单独签发
-Assertion，业务请求只携带 `X-CT-Tool-Assertion`、`X-CT-Invocation-Id` 与 `Content-Type`。
-Java 返回 `TOOL_ASSERTION_EXPIRED` 时最多重新签发并重试一次；Session 失效或 Grant
-过期、撤销时返回稳定的 `reauthorization_required` Tool 错误，页面应重新建立授权会话。
-
-可使用真实 Java 冒烟脚本顺序验证 claim/resolve、Assertion、11 个原子 Tool 和
-`source_revision` 一致性。handoff code 与 access token 默认通过不可回显的交互提示读取，
-不得放入命令行参数：
-
-```powershell
-$env:AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL = "http://192.168.0.100:48080"
-$env:AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN = "<shared-workload-token>"
-$env:PYTHONPATH = "src"
-uv run python scripts/smoke_test_java_price_insight.py `
-  --auth-mode claim `
-  --agent-session-id "<fresh-agent-session-id>" `
-  --conversation-id "<conversation-id>"
-```
-
-已认领且仍为 ACTIVE 的会话可使用 `--auth-mode existing`；该模式仅供持有 workload Token
-的受信任运维人员直接诊断，会绕过页面/API 入站绑定，不得暴露为业务接口。恢复场景使用
-`--auth-mode resolve` 并在安全提示中输入页面 access token。脚本只打印 Tool 名称、状态和
-非敏感的 `source_revision`，任一 Tool 失败或修订号不一致时返回非零退出码。
 
 本机真实 DWD 可用 `scripts/seed_price_insight_mysql.py` 重复初始化；启动
 `AuraClaw: Debug local frontend + backend` 后访问

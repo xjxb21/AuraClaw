@@ -5,15 +5,13 @@ import time
 from typing import Any
 from uuid import uuid4
 
-from auraclaw.contracts.auth import AgentSessionAuthRequest, AgentSessionBinding
 from auraclaw.contracts.commands import CommandContext
-from auraclaw.contracts.errors import AuthorizationError, NotFoundError
+from auraclaw.contracts.errors import NotFoundError
 from auraclaw.domain.approval import ApprovalAggregate
 from auraclaw.domain.session import SessionAggregate
 from auraclaw.projection.ports import ApprovalViewReader, TaskReader
 from auraclaw.session.ports import (
     AdmissionController,
-    AgentSessionAuthorizer,
     AppendResult,
     EventStore,
     HumanApprovalNotifier,
@@ -34,7 +32,6 @@ class TaskService:
         admission: AdmissionController,
         approvals: ApprovalViewReader | None = None,
         approval_notifier: HumanApprovalNotifier | None = None,
-        agent_session_authorizer: AgentSessionAuthorizer | None = None,
     ) -> None:
         self._event_store = event_store
         self._relay = relay
@@ -42,25 +39,14 @@ class TaskService:
         self._admission = admission
         self._approvals = approvals
         self._approval_notifier = approval_notifier
-        self._agent_session_authorizer = agent_session_authorizer
 
-    async def create_task(
-        self,
-        *,
-        goal: str,
-        context: CommandContext,
-        agent_auth: AgentSessionAuthRequest | None = None,
-    ) -> dict[str, Any]:
+    async def create_task(self, *, goal: str, context: CommandContext) -> dict[str, Any]:
         started = time.perf_counter()
         await self._admission.admit(goal=goal, context=context)
         session_id = f"ses_{uuid4().hex}"
         run_id = f"run_{uuid4().hex}"
-        binding = await self._bind_agent_auth(
-            agent_auth,
-            default_conversation_id=session_id,
-        )
         session = SessionAggregate.empty(session_id, context.tenant_id)
-        session.create(goal=goal, run_id=run_id, agent_auth=binding)
+        session.create(goal=goal, run_id=run_id)
         response = {
             "session_id": session_id,
             "run_id": run_id,
@@ -87,19 +73,10 @@ class TaskService:
         return result.command_result
 
     async def append_message(
-        self,
-        *,
-        session_id: str,
-        message: str,
-        context: CommandContext,
-        agent_auth: AgentSessionAuthRequest | None = None,
+        self, *, session_id: str, message: str, context: CommandContext
     ) -> dict[str, Any]:
         session = await self._load(context.tenant_id, session_id)
-        binding = await self._bind_agent_auth(
-            agent_auth,
-            default_conversation_id=session_id,
-        )
-        session.append_message(message=message, agent_auth=binding)
+        session.append_message(message=message)
         response = {
             "session_id": session_id,
             "run_id": session.run_id,
@@ -117,20 +94,10 @@ class TaskService:
         await self._after_append(session, result)
         return result.command_result
 
-    async def request_run(
-        self,
-        *,
-        session_id: str,
-        context: CommandContext,
-        agent_auth: AgentSessionAuthRequest | None = None,
-    ) -> dict[str, Any]:
+    async def request_run(self, *, session_id: str, context: CommandContext) -> dict[str, Any]:
         session = await self._load(context.tenant_id, session_id)
         run_id = f"run_{uuid4().hex}"
-        binding = await self._bind_agent_auth(
-            agent_auth,
-            default_conversation_id=session_id,
-        )
-        session.request_run(run_id, agent_auth=binding)
+        session.request_run(run_id)
         response = {
             "session_id": session_id,
             "run_id": run_id,
@@ -205,15 +172,10 @@ class TaskService:
         *,
         session_id: str,
         context: CommandContext,
-        agent_auth: AgentSessionAuthRequest | None = None,
     ) -> dict[str, Any]:
         session = await self._load(context.tenant_id, session_id)
         run_id = f"run_{uuid4().hex}"
-        binding = await self._bind_agent_auth(
-            agent_auth,
-            default_conversation_id=session_id,
-        )
-        session.resume(run_id, agent_auth=binding)
+        session.resume(run_id)
         response = {
             "session_id": session_id,
             "run_id": run_id,
@@ -317,25 +279,3 @@ class TaskService:
                 )
             )
             await self._relay.relay_once()
-
-    async def _bind_agent_auth(
-        self,
-        request: AgentSessionAuthRequest | None,
-        *,
-        default_conversation_id: str,
-    ) -> AgentSessionBinding | None:
-        if request is None or request.is_empty:
-            return None
-        conversation_id = request.conversation_id or default_conversation_id
-        normalized = AgentSessionAuthRequest(
-            agent_session_id=request.agent_session_id,
-            conversation_id=conversation_id,
-            handoff_code=request.handoff_code,
-            access_token=request.access_token,
-        )
-        if self._agent_session_authorizer is None:
-            raise AuthorizationError("Java AgentSession authorizer is not configured")
-        return await self._agent_session_authorizer.bind(
-            normalized,
-            default_conversation_id=default_conversation_id,
-        )

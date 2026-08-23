@@ -12,7 +12,7 @@ from auraclaw.action.capability_catalog import (
     RoutedHandsExecutor,
     capability_search_tool,
 )
-from auraclaw.action.mcp import HandsMcpServer
+from auraclaw.action.hands import HandsGateway
 from auraclaw.action.policy import PolicyEngine
 from auraclaw.action.tool_gateway import ToolGateway, ToolRegistry
 from auraclaw.contracts.capabilities import (
@@ -24,8 +24,8 @@ from auraclaw.contracts.capabilities import (
 )
 from auraclaw.control.ports import RuntimeAssignment
 from auraclaw.infrastructure.artifacts.store import ArtifactStore, InMemoryObjectStorage
-from auraclaw.internal.mcp import InProcessMcpTransport
-from auraclaw.runtime.mcp_client import HandsMcpClient
+from auraclaw.internal.hands import InProcessHandsClient
+from auraclaw.runtime.hands_adapter import HandsRuntimeAdapter
 from auraclaw.runtime.ports import ToolCall
 
 
@@ -209,9 +209,9 @@ def test_capability_search_runs_through_tool_policy_and_trusted_tenant() -> None
                 signing_key=b"m9-capability-artifact-key-0001",
             ),
         )
-        client = HandsMcpClient(
-            InProcessMcpTransport(
-                HandsMcpServer(registry=registry, gateway=gateway)
+        client = HandsRuntimeAdapter(
+            InProcessHandsClient(
+                HandsGateway(registry=registry, gateway=gateway)
             )
         )
         assignment = _assignment()
@@ -226,5 +226,47 @@ def test_capability_search_runs_through_tool_policy_and_trusted_tenant() -> None
         assert result["status"] == "success"
         assert result["content"]["capabilities"][0]["capability_id"] == "cap-global"
         assert "tenant_id" not in result["content"]["capabilities"][0]
+
+    asyncio.run(scenario())
+
+
+def test_catalog_search_matches_chinese_query_without_year_token() -> None:
+    async def scenario() -> None:
+        store = InMemoryCapabilityCatalogStore()
+        catalog = CapabilityCatalog(store)
+        await catalog.register_server(
+            McpServerDefinition(
+                server_id="java-mcp",
+                tenant_id="1",
+                title="Java MCP",
+                endpoint="https://java-mcp.example.com/mcp",
+                trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
+                status=CapabilityStatus.ACTIVE,
+                enabled=True,
+            )
+        )
+        await catalog.replace_server_capabilities(
+            "java-mcp",
+            (
+                _descriptor(
+                    "cap-price-profile",
+                    "procurement.price.dataset.profile",
+                    tenant_id="1",
+                ).model_copy(
+                    update={
+                        "server_id": "java-mcp",
+                        "tags": ("价格洞察", "price_insight"),
+                        "description": "Profile a governed procurement price dataset.",
+                    }
+                ),
+            ),
+        )
+        matches = await catalog.search(
+            tenant_id="1",
+            query="价格洞察 2024",
+            kinds=(CapabilityKind.TOOL,),
+            limit=10,
+        )
+        assert [item.capability_id for item in matches] == ["cap-price-profile"]
 
     asyncio.run(scenario())

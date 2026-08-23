@@ -1,4 +1,4 @@
-"""Keep the test suite offline unless a test opts into Java Tool credentials."""
+"""Keep tests from picking up repo-root .env.debug / .env."""
 
 from __future__ import annotations
 
@@ -8,10 +8,8 @@ from auraclaw.config import get_settings
 
 
 @pytest.fixture(autouse=True)
-def _pin_python_price_insight_backend_for_offline_tests(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AURACLAW_PRICE_INSIGHT_TOOL_BACKEND", "python")
+def _disable_repo_env_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AURACLAW_DISABLE_ENV_FILE", "1")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

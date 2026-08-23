@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from auraclaw.config import load_secret_files
+from auraclaw.config import Settings, load_secret_files
 from auraclaw.infrastructure.persistence.migration_runner import (
     MigrationError,
     discover_migrations,
@@ -122,14 +122,6 @@ def test_production_compose_mounts_least_privilege_secrets() -> None:
         "vault_token" not in secret_sources(service)
         for service in APPLICATION_SERVICES - {"credential-proxy"}
     )
-    # Session binding occurs in Task API and Java Tool execution occurs in
-    # Action Hands. No other service should be able to read the shared Token.
-    workload_token_readers = {
-        service
-        for service in APPLICATION_SERVICES
-        if "java_agent_runtime_workload_token" in secret_sources(service)
-    }
-    assert workload_token_readers == {"task-api", "action-hands"}
     assert {"seaweedfs_access_key", "seaweedfs_secret_key"} <= secret_sources(
         "artifact-service"
     )
@@ -139,6 +131,8 @@ def test_production_compose_mounts_least_privilege_secrets() -> None:
         for service in APPLICATION_SERVICES - {"artifact-service"}
     )
     assert "runtime_workload_token" in secret_sources("agent-runtime")
+    assert "streaming_gateway_workload_token" in secret_sources("session")
+    assert "streaming_gateway_workload_token" in secret_sources("streaming-gateway")
     assert not any(
         item.endswith("database_url") for item in secret_sources("agent-runtime")
     )
@@ -146,6 +140,15 @@ def test_production_compose_mounts_least_privilege_secrets() -> None:
         "/runtime_workload_token"
     )
     assert secrets["lease_signing_key"]["file"].endswith("/lease_signing_key")
+    assert {
+        "chaintower_workload_token",
+        "agent_context_signing_keys_json",
+    } <= secret_sources("task-api")
+    assert all(
+        "chaintower_workload_token" not in secret_sources(service)
+        and "agent_context_signing_keys_json" not in secret_sources(service)
+        for service in APPLICATION_SERVICES - {"task-api"}
+    )
 
 
 def test_secret_file_loading_is_allowlisted_precedence_safe_and_redacted(
@@ -196,8 +199,51 @@ def test_committed_files_do_not_contain_environment_secret_values() -> None:
         for name in secret_names
         if (value := os.environ.get(name)) and len(value) >= 12
     }
-    committed = COMPOSE.read_text() + (ROOT / ".env.example").read_text()
+    committed = "".join(
+        path.read_text()
+        for path in (
+            COMPOSE,
+            ROOT / ".env.example",
+            ROOT / ".env.debug.example",
+            ROOT / ".env.production.example",
+        )
+    )
     assert all(value not in committed for value in local_values)
+
+
+def test_env_templates_are_ready_to_copy() -> None:
+    import importlib.util
+
+    from dotenv import dotenv_values
+
+    spec = importlib.util.spec_from_file_location(
+        "compose_preflight", ROOT / "scripts/compose_preflight.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    debug = Settings(_env_file=ROOT / ".env.debug.example")
+    assert debug.storage_backend == "memory"
+    assert debug.runtime_event_backend == "memory"
+    assert debug.artifact_backend == "local"
+    assert debug.insecure_identity_headers_enabled
+    assert debug.lease_signing_key is not None
+    assert debug.workload_token_value("task-api") == "local-task-api"
+    assert debug.workload_token_value("streaming-gateway") == "local-streaming-gateway"
+
+    production = dotenv_values(ROOT / ".env.production.example")
+    missing = [name for name in module.REQUIRED if not production.get(name)]
+    assert missing == []
+    assert production["AURACLAW_DEPLOYMENT_PROFILE"] == "production"
+    assert production["AURACLAW_ALLOW_INSECURE_IDENTITY_HEADERS"] == "false"
+    tokens = [
+        production[name] or ""
+        for name in module.REQUIRED
+        if name.endswith("_WORKLOAD_TOKEN")
+    ]
+    assert all(len(token) >= 32 for token in tokens)
+    assert len(set(tokens)) == len(tokens)
 
 
 def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
@@ -227,9 +273,8 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
         "ARTIFACT_SERVICE",
         "POLICY",
         "DELIVERY",
+        "STREAMING_GATEWAY",
     )
-    java_workload_token = tmp_path / "java-workload-token"
-    java_workload_token.write_text("java-workload-token-" + "t" * 40 + "\n")
     lines = [
         "AURACLAW_IMAGE=registry.example/auraclaw:sha-0123456789",
         "AURACLAW_MIGRATION_DATABASE_URL=postgresql://migration:secret@db/auraclaw",
@@ -242,13 +287,8 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
         "SEAWEEDFS_HOST=seaweed.example",
         "SEAWEEDFS_ACCESS_KEY=test-access",
         "SEAWEEDFS_SECRET_KEY=test-secret",
-        # Java is the default Price Insight backend; preflight must see the
-        # shared runtime URL even when the env file omits the backend flag.
-        "AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL=http://agent-runtime-server",
-        # Exercise the deployment-safe path: the env file contains only a
-        # Token filename, while materialization copies its content into the
-        # ignored Compose secret directory.
-        f"AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE={java_workload_token}",
+        "AURACLAW_CHAINTOWER_WORKLOAD_TOKEN=ct-" + "t" * 40,
+        'AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON={"k1":"chaintower-agent-context-signing-key-01"}',
     ]
     lines.extend(
         f"{variable}=postgresql://{role}:secret@db/auraclaw"
@@ -277,9 +317,6 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
         text=True,
     )
     assert materialized.returncode == 0, materialized.stdout + materialized.stderr
-    assert (
-        secret_dir / "java_agent_runtime_workload_token"
-    ).read_text() == java_workload_token.read_text().rstrip("\r\n")
     result = subprocess.run(
         [
             sys.executable,

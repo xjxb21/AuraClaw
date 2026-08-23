@@ -30,50 +30,15 @@ SECRET_VARIABLES = {
     "credential_proxy_workload_token": "AURACLAW_CREDENTIAL_PROXY_WORKLOAD_TOKEN",
     "artifact_service_workload_token": "AURACLAW_ARTIFACT_SERVICE_WORKLOAD_TOKEN",
     "delivery_workload_token": "AURACLAW_DELIVERY_WORKLOAD_TOKEN",
+    "streaming_gateway_workload_token": "AURACLAW_STREAMING_GATEWAY_WORKLOAD_TOKEN",
     "lease_signing_key": "AURACLAW_LEASE_SIGNING_KEY",
     "model_api_key": "AURACLAW_MODEL_API_KEY",
-    "java_agent_runtime_workload_token": (
-        "AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN"
-    ),
     "vault_token": "AURACLAW_CREDENTIAL_VAULT_TOKEN",
     "seaweedfs_access_key": "SEAWEEDFS_ACCESS_KEY",
     "seaweedfs_secret_key": "SEAWEEDFS_SECRET_KEY",
+    "chaintower_workload_token": "AURACLAW_CHAINTOWER_WORKLOAD_TOKEN",
+    "agent_context_signing_keys_json": "AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON",
 }
-
-
-def _secret_value(
-    variable: str,
-    configured: dict[str, str | None],
-    *,
-    env_file: Path,
-) -> str:
-    """Resolve one deployment secret from a direct value or a sibling `_FILE`.
-
-    Direct environment values retain precedence for compatibility. File paths
-    are resolved relative to the selected env file so deployment manifests can
-    refer to a private key kept beside, but never embedded in, that manifest.
-    """
-    direct_value = os.environ.get(variable) or configured.get(variable)
-    if direct_value:
-        return direct_value
-
-    file_variable = f"{variable}_FILE"
-    file_value = os.environ.get(file_variable) or configured.get(file_variable)
-    if not file_value:
-        return ""
-    source = Path(file_value)
-    if not source.is_absolute():
-        source = env_file.parent / source
-    if not source.is_file():
-        raise ValueError(f"secret source file is unavailable for {variable}")
-    # Match the runtime loader's bound so an accidental large file cannot be
-    # copied into a Compose secret or consumed into process memory.
-    if source.stat().st_size > 64 * 1024:
-        raise ValueError(f"secret source file is too large for {variable}")
-    value = source.read_text().rstrip("\r\n")
-    if not value:
-        raise ValueError(f"secret source file is empty for {variable}")
-    return value
 
 
 def main() -> int:
@@ -88,16 +53,10 @@ def main() -> int:
         print(f"secret materialization failed: env file not found: {env_file}")
         return 1
     configured = dotenv_values(env_file)
-    try:
-        values = {
-            variable: _secret_value(variable, configured, env_file=env_file)
-            for variable in SECRET_VARIABLES.values()
-        }
-    except ValueError as exc:
-        # Report only the variable-level failure. Secret contents are never
-        # included in diagnostics or exception tracebacks.
-        print(f"secret materialization failed: {exc}")
-        return 1
+    values = {
+        variable: os.environ.get(variable) or configured.get(variable) or ""
+        for variable in SECRET_VARIABLES.values()
+    }
     missing = [variable for variable, value in values.items() if not value]
     if missing:
         print("secret materialization failed")

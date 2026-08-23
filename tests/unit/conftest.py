@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+from auraclaw.composition import providers
 from auraclaw.config import get_settings
 
 # Unit tests construct Settings(_env_file=None, ...) with explicit kwargs.
@@ -26,7 +27,10 @@ def _clear_ambient_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in list(os.environ):
         if name.startswith(_AMBIENT_PREFIXES) or name.endswith("_DATABASE_URL"):
             monkeypatch.delenv(name, raising=False)
-    # Product default is Java; unit tests stay on the in-process executor
-    # unless a test opts into Java credentials.
-    monkeypatch.setenv("AURACLAW_PRICE_INSIGHT_TOOL_BACKEND", "python")
+    monkeypatch.setenv("AURACLAW_DISABLE_ENV_FILE", "1")
     get_settings.cache_clear()
+    for value in vars(providers).values():
+        cache_clear = getattr(value, "cache_clear", None)
+        if callable(cache_clear):
+            cache_clear()
+    get_settings().allow_insecure_identity_headers = True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -35,9 +36,7 @@ WORKLOAD_TOKENS = (
     "AURACLAW_ARTIFACT_SERVICE_WORKLOAD_TOKEN",
     "AURACLAW_POLICY_WORKLOAD_TOKEN",
     "AURACLAW_DELIVERY_WORKLOAD_TOKEN",
-)
-JAVA_WORKLOAD_CONFIGURATION = (
-    "AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL",
+    "AURACLAW_STREAMING_GATEWAY_WORKLOAD_TOKEN",
 )
 REQUIRED = (
     "AURACLAW_IMAGE",
@@ -53,6 +52,8 @@ REQUIRED = (
     "SEAWEEDFS_HOST",
     "SEAWEEDFS_ACCESS_KEY",
     "SEAWEEDFS_SECRET_KEY",
+    "AURACLAW_CHAINTOWER_WORKLOAD_TOKEN",
+    "AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON",
 )
 
 
@@ -75,10 +76,6 @@ def main() -> int:
         print(f"preflight failed: env file not found: {env_path}")
         return 1
     file_values = dotenv_values(env_path)
-    def configured_value(name: str) -> str:
-        """Read one non-secret deployment value without logging its contents."""
-        return os.environ.get(name) or file_values.get(name) or ""
-
     values = {
         name: os.environ.get(name) or file_values.get(name) or "" for name in REQUIRED
     }
@@ -112,47 +109,25 @@ def main() -> int:
     lease_key = values["AURACLAW_LEASE_SIGNING_KEY"]
     if lease_key and len(lease_key) < 32:
         failures.append("AURACLAW_LEASE_SIGNING_KEY must contain at least 32 characters")
-
-    price_insight_backend = (
-        configured_value("AURACLAW_PRICE_INSIGHT_TOOL_BACKEND") or "java"
-    )
-    if price_insight_backend == "java":
-        # Java is the default atomic-Tool path. Fail closed before Compose
-        # starts if the shared workload credential is incomplete; the Python
-        # process must never silently fall back to the in-process calculator.
-        failures.extend(
-            f"missing {name} for Java Price Insight backend"
-            for name in JAVA_WORKLOAD_CONFIGURATION
-            if not configured_value(name)
+    chaintower_token = values["AURACLAW_CHAINTOWER_WORKLOAD_TOKEN"]
+    if chaintower_token and len(chaintower_token) < 32:
+        failures.append("AURACLAW_CHAINTOWER_WORKLOAD_TOKEN must contain at least 32 characters")
+    if chaintower_token and chaintower_token in token_values:
+        failures.append(
+            "AURACLAW_CHAINTOWER_WORKLOAD_TOKEN must differ from internal service tokens"
         )
-        workload_token = configured_value(
-            "AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN"
-        )
-        workload_token_file = configured_value(
-            "AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE"
-        )
-        if not workload_token and not workload_token_file:
+    signing_keys = values["AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON"]
+    if signing_keys:
+        try:
+            payload = json.loads(signing_keys)
+        except json.JSONDecodeError:
+            payload = None
+        if not isinstance(payload, dict) or not payload:
             failures.append(
-                "missing AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE "
-                "for Java Price Insight backend"
+                "AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON must be a JSON object of kid to HMAC key"
             )
-        elif not workload_token and workload_token_file:
-            source = Path(workload_token_file)
-            if not source.is_absolute():
-                source = env_path.parent / source
-            if not source.is_file():
-                failures.append(
-                    "AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE "
-                    "does not point to a readable file"
-                )
-            else:
-                # Read only to enforce credential strength. The value is never
-                # printed or included in a diagnostic message.
-                workload_token = source.read_text().rstrip("\r\n")
-        if workload_token and len(workload_token) < 32:
-            failures.append(
-                "AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN must contain at least 32 characters"
-            )
+        elif any(len(str(value).encode()) < 32 for value in payload.values()):
+            failures.append("agent context signing keys must contain at least 32 bytes")
 
     completed = subprocess.run(
         [

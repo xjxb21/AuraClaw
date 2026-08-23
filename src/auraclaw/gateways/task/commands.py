@@ -1,6 +1,5 @@
 from typing import Any
 
-from auraclaw.contracts.auth import AgentSessionAuthRequest
 from auraclaw.contracts.commands import CommandContext
 from auraclaw.session.task_service import TaskService
 
@@ -11,46 +10,20 @@ class TaskCommandGateway:
     def __init__(self, service: TaskService) -> None:
         self._service = service
 
-    async def create_task(
-        self,
-        *,
-        goal: str,
-        context: CommandContext,
-        agent_auth: AgentSessionAuthRequest | None = None,
-    ) -> dict[str, Any]:
-        return await self._service.create_task(
-            goal=goal,
-            context=context,
-            agent_auth=agent_auth,
-        )
+    async def create_task(self, *, goal: str, context: CommandContext) -> dict[str, Any]:
+        return await self._service.create_task(goal=goal, context=context)
 
     async def append_message(
-        self,
-        *,
-        session_id: str,
-        message: str,
-        context: CommandContext,
-        agent_auth: AgentSessionAuthRequest | None = None,
+        self, *, session_id: str, message: str, context: CommandContext
     ) -> dict[str, Any]:
         return await self._service.append_message(
-            session_id=session_id,
-            message=message,
-            context=context,
-            agent_auth=agent_auth,
+            session_id=session_id, message=message, context=context
         )
 
     async def request_run(
-        self,
-        *,
-        session_id: str,
-        context: CommandContext,
-        agent_auth: AgentSessionAuthRequest | None = None,
+        self, *, session_id: str, context: CommandContext
     ) -> dict[str, Any]:
-        return await self._service.request_run(
-            session_id=session_id,
-            context=context,
-            agent_auth=agent_auth,
-        )
+        return await self._service.request_run(session_id=session_id, context=context)
 
     async def cancel_task(
         self, *, session_id: str, reason: str, context: CommandContext
@@ -67,17 +40,9 @@ class TaskCommandGateway:
         )
 
     async def resume_task(
-        self,
-        *,
-        session_id: str,
-        context: CommandContext,
-        agent_auth: AgentSessionAuthRequest | None = None,
+        self, *, session_id: str, context: CommandContext
     ) -> dict[str, Any]:
-        return await self._service.resume_task(
-            session_id=session_id,
-            context=context,
-            agent_auth=agent_auth,
-        )
+        return await self._service.resume_task(session_id=session_id, context=context)
 
     async def record_approval_response(
         self,

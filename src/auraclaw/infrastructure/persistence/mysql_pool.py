@@ -33,11 +33,8 @@ _PG_CAST = re.compile(
 )
 _INTERVAL_LITERAL = re.compile(r"interval\s+'([^']+)'", re.IGNORECASE)
 _UPDATE_RETURNING = re.compile(
-    r"^\s*UPDATE\s+(\S+)(?:\s+(?!SET\b)\w+)?\s+SET\s+(.+)\s+WHERE\s+(.+?)\s+RETURNING\s+(.+?)\s*$",
+    r"^\s*UPDATE\s+(\S+)(?:\s+(?!SET\b)\w+)?\s+SET\s+.+\s+WHERE\s+(.+?)\s+RETURNING\s+(.+?)\s*$",
     re.IGNORECASE | re.DOTALL,
-)
-_SET_ASSIGNMENT = re.compile(
-    r"(?:^|,)\s*(?:[A-Za-z_][\w.]*\.)?([A-Za-z_]\w*)\s*=",
 )
 _DELETE_RETURNING = re.compile(
     r"^\s*DELETE\s+FROM\s+(\S+)(?:\s+AS\s+(\w+))?\s+WHERE\s+(.+?)\s+RETURNING\s+(.+?)\s*$",
@@ -60,86 +57,6 @@ _CONCAT_FOUR = re.compile(
 _CONCAT_TWO = re.compile(r"'([^']*)'\s*\|\|\s*([a-zA-Z_][\w.]*)")
 _JSON_TEXT = re.compile(r"(\w+(?:\.\w+)?)\s*->>\s*'([^']+)'")
 _JSON_PATH = re.compile(r"(\w+(?:\.\w+)?)\s*->\s*'([^']+)'")
-
-
-def _split_sql_and(expr: str) -> list[str]:
-    """Split a WHERE clause on AND, ignoring AND inside parentheses or quotes."""
-    parts: list[str] = []
-    depth = 0
-    start = 0
-    index = 0
-    length = len(expr)
-    while index < length:
-        char = expr[index]
-        if char == "'":
-            index += 1
-            while index < length:
-                if expr[index] == "'":
-                    index += 1
-                    if index < length and expr[index] == "'":
-                        index += 1
-                        continue
-                    break
-                index += 1
-            continue
-        if char == "(":
-            depth += 1
-            index += 1
-            continue
-        if char == ")":
-            depth -= 1
-            index += 1
-            continue
-        if depth == 0:
-            matched = re.match(r"\s+AND\s+", expr[index:], flags=re.IGNORECASE)
-            if matched is not None and index > start:
-                parts.append(expr[start:index].strip())
-                index += matched.end()
-                start = index
-                continue
-        index += 1
-    parts.append(expr[start:].strip())
-    return [part for part in parts if part]
-
-
-def _assigned_columns(set_clause: str) -> set[str]:
-    return {match.group(1).lower() for match in _SET_ASSIGNMENT.finditer(set_clause)}
-
-
-def _conjunct_uses_column(conjunct: str, columns: set[str]) -> bool:
-    for column in columns:
-        if re.search(rf"(?<![\w.]){re.escape(column)}(?![\w])", conjunct, re.IGNORECASE):
-            return True
-    return False
-
-
-def _update_returning_followup_sql(query: str) -> str | None:
-    """SELECT the updated row without reusing SET-invalidated WHERE predicates.
-
-    MySQL has no UPDATE ... RETURNING. The naive follow-up SELECT using the
-    original WHERE misses rows whose claim/status columns were just assigned.
-    """
-    matched = _UPDATE_RETURNING.match(query.strip())
-    if matched is None:
-        return None
-    table, set_clause, where, returning = matched.group(1, 2, 3, 4)
-    assigned = _assigned_columns(set_clause)
-    kept = [
-        part
-        for part in _split_sql_and(where)
-        if not _conjunct_uses_column(part, assigned)
-    ]
-    select_where = " AND ".join(kept) if kept else where
-    ret = returning.strip()
-    if ret == "*" or ret.endswith(".*"):
-        select_list = "*"
-    elif "." in ret:
-        select_list = ", ".join(
-            part.strip().split(".")[-1] for part in _split_sql_csv(ret)
-        )
-    else:
-        select_list = ret
-    return f"SELECT {select_list} FROM {table} WHERE {select_where}"
 
 
 def _split_sql_csv(expr: str) -> list[str]:
@@ -463,13 +380,21 @@ class MysqlConnection:
             select_sql, select_args = followup
             return await self.fetch(select_sql, *select_args)
         if "RETURNING" in upper and upper.startswith("UPDATE"):
-            followup = _update_returning_followup_sql(stripped)
-            if followup is not None:
-                result = await self.execute(query, *args)
-                count = int(str(result).rsplit(" ", 1)[-1])
-                if count == 0:
-                    return []
-                return await self.fetch(followup, *args)
+            matched = _UPDATE_RETURNING.match(stripped)
+            if matched is not None:
+                await self.execute(query, *args)
+                table, where, returning = matched.group(1), matched.group(2), matched.group(3)
+                ret = returning.strip()
+                if ret == "*" or ret.endswith(".*"):
+                    select = f"SELECT * FROM {table} WHERE {where}"
+                elif "." in ret:
+                    cols = ", ".join(
+                        part.strip().split(".")[-1] for part in ret.split(",")
+                    )
+                    select = f"SELECT {cols} FROM {table} WHERE {where}"
+                else:
+                    select = f"SELECT {ret} FROM {table} WHERE {where}"
+                return await self.fetch(select, *args)
         if "RETURNING" in upper and upper.startswith("DELETE"):
             matched = _DELETE_RETURNING.match(stripped)
             if matched is not None:

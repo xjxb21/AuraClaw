@@ -52,11 +52,6 @@ M12 以“全场景中心 → 成本 → 价格管理控制塔 → 价格洞察�
 - `skills/procurement-price-data-validation/`：可复用的数据范围和质量子 Skill；
 - `skills/procurement-price-metrics/`：可复用的八项价格指标和证据子 Skill；
 - `composition/business_skills.py`：平台签名、Resource 与 Capability 描述符；
-- `composition/java_price_insight.py`：Java 授权客户端和价格洞察执行器的统一装配；
-- `infrastructure/clients/agent_runtime_auth.py`：共享 workload Token、AgentSession
-  claim/resolve、一次性 Tool Assertion 与 CT-TOOL-REQUEST-V2 请求哈希；
-- `infrastructure/clients/java_price_insight.py`：11 个现有 ToolCapability 到 Java 原子 Tool
-  路由的适配，以及 Java DTO 到现有 Tool 输出契约的字段转换；
 - `runtime/capability_controller.py`：所有 Skill 共用的依赖自动装载。
 - `config/model-skills/procurement-price-insight.json`：可审计的 ct_model 配置发布事实；
 - `scripts/configure_price_insight_model_skill.py`：显式 validate/plan/apply 的配置引导工具。
@@ -74,53 +69,6 @@ Skill 负责“何时使用、调用顺序、解释限制”；Tool 负责可复
 
 旧 `price_insight.*`、`snapshot`、`data_quality` 和 `drilldown` 暂留作兼容接口，不再是
 3.0 Skill 的依赖。
-
-### 3.1 Java 原子 Tool 后端
-
-默认 `AURACLAW_PRICE_INSIGHT_TOOL_BACKEND=java`：生产 `action-hands` 与 development
-combined server 均使用 `JavaPriceInsightToolExecutor` 调用 Java 原子 Tool。
-Skill、ToolCapability、输入 Schema 和 `source_revision` 校验逻辑不变。
-仅离线调试可设 `python`，改回进程内 fixture/MySQL 计算。
-
-#### 3.1.1 Workload Token 初始化
-
-V0 不使用 workload 公钥、私钥或 RS256。首次部署时生成一个至少 32 字符的随机 Token，
-并将同一个 Secret 注入 Python 和 Java：
-
-```powershell
-$bytes = [byte[]]::new(32)
-[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-[Convert]::ToHexString($bytes).ToLower()
-```
-
-Python 配置 `AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN_FILE`，Java 配置
-`chaintower.agent-authorization.workload-token` 和 `workload-subject`。真实 Token 只进入
-Secret Manager、配置中心或 0600 Secret 文件，不得进入代码、事件和日志。Compose 只给
-`task-api` 与 `action-hands` 挂载该 Secret，因为前者绑定 AgentSession，后者申请 Tool
-Assertion。
-
-Python 仅接受 `agentSessionId + handoffCode` 的 claim 证明，或不含 `agentSessionId` 的
-`conversationId + accessToken` resolve 证明；裸 `agentSessionId` 和混合证明直接拒绝。
-业务 Tool 返回 `TOOL_ASSERTION_EXPIRED` 时最多重新签发并重试一次，其他 401/403 或 Java
-业务错误不触发 Assertion 重试。Session 失效、Grant 过期或撤销统一转换为
-`reauthorization_required` Tool 错误，由页面重新建立授权会话。
-
-轮换时生成新 Token，同时更新两端 Secret，在维护窗口内滚动重启 Java、`task-api` 和
-`action-hands`。第一版不实现双 Token 兼容窗口；回滚时恢复旧 Token 并重启相关服务。
-
-授权绑定按以下事实链路传播：
-
-```text
-Task API -> Session Event payload.auth -> RunnableItem.required_capability
-  -> RuntimeAssignment.resource_profile.agent_auth
-  -> MCP _meta.auraclaw.agentAuth -> ToolInvocation.agent_auth
-  -> issueAssertion -> Java Price Insight Tool
-```
-
-事件、Snapshot、Runtime Assignment 和 ToolInvocation 只能保存
-`agent_session_id/conversation_id/resolved_by`，不得保存 handoff code、页面 access token、
-workload Token 或一次性 Assertion。Java 返回的 `effectiveRule/eligibleRecords/tablesRead` 等
-字段在适配器内转换为现有 snake_case Tool 契约，避免后端切换改变 Skill 行为。
 
 ## 4. 数据契约
 
@@ -249,29 +197,6 @@ Canonical Timeline 展示 Capability Search/Load、父子 Skill Activate、数�
 `AURACLAW_DEVELOPMENT_MODEL_MODE=price-insight-scripted`。这个模式只固定模型决策序列；
 Agent Harness、MCP Capability、签名 Skill、Tool Gateway 和 MySQL DWD 都仍走真实实现。
 production 始终使用配置的模型 Provider。
-
-### Java 原子 Tool 真实联调
-
-`scripts/smoke_test_java_price_insight.py` 复用生产组合工厂，顺序调用 profile、quality、
-八项指标和 evidence。它会为每次业务请求生成独立 invocation ID，并通过 Java 授权端点
-签发一次性 Assertion；成功标准是 11 个 Tool 均成功且 `source_revision` 完全一致。
-
-```powershell
-$env:AURACLAW_JAVA_AGENT_RUNTIME_BASE_URL = "http://192.168.0.100:48080"
-$env:AURACLAW_JAVA_AGENT_RUNTIME_WORKLOAD_TOKEN = "<shared-workload-token>"
-$env:PYTHONPATH = "src"
-uv run python scripts/smoke_test_java_price_insight.py `
-  --auth-mode claim `
-  --agent-session-id "<fresh-agent-session-id>" `
-  --conversation-id "<conversation-id>"
-```
-
-`claim` 模式通过安全提示读取一次性 handoff code；`resolve` 模式同样读取 access token；
-`existing` 模式只适用于持有 workload Token 的受信任运维人员诊断已经由同一 workload
-认领且仍 ACTIVE 的 Session。该模式在脚本内直接构造安全绑定，不调用入站 `bind()`，不得
-暴露为页面/API 的绑定方式。自动化环境可临时注入 `AURACLAW_JAVA_PRICE_INSIGHT_HANDOFF_CODE` 或
-`AURACLAW_JAVA_PRICE_INSIGHT_ACCESS_TOKEN`，进程结束后必须立即清除，且不得写入 `.env`、
-日志或 CI 测试报告。
 
 ## 6. 扩展新业务场景
 
