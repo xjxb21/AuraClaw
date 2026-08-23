@@ -80,6 +80,7 @@ from auraclaw.composition.business_skills import (
     price_insight_resources,
     signed_price_insight_dependency_packages,
     signed_price_insight_package,
+    signed_semantic_query_package,
 )
 from auraclaw.composition.worker_wake import WorkerWakeGate
 from auraclaw.config import Settings, get_settings
@@ -1265,6 +1266,10 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
                 ),
             )
             for tenant_id in skill_tenants:
+                await skill_registry.publish(
+                    tenant_id,
+                    signed_semantic_query_package(model_skill_signer),
+                )
                 for package in signed_price_insight_dependency_packages(
                     model_skill_signer
                 ):

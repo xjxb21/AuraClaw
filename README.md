@@ -458,3 +458,12 @@ Metrics Pipeline 和 Alert Receiver 通过同一观测端口接入。
 `http://localhost:3000/price-insight`。外部模型端点不可用时，可仅在 development 设置
 `AURACLAW_DEVELOPMENT_MODEL_MODE=price-insight-scripted`，用固定模型决策序列验证真实的
 Agent Harness、Capability/Skill、Tool Gateway 与 MySQL 数据链路。
+
+## Semantic 语义问数 Skill
+
+`action-hands` 会为已配置 Java MCP Server 的租户发布平台签名
+`semantic.query.answer@1.0.0`。该 Skill 固定依赖 `semantic.meta.context`、
+`semantic.query.compile` 和 `semantic.query.execute`，运行链路为
+`Skill -> Python MCP Client -> Java Runtime MCP -> Semantic`。Python 不直连 Semantic API，
+也不接收 SQL、数据库连接或调用者身份参数；身份由受信 MCP 调用链传递。Java MCP Tool
+同步失败或 Semantic/Cube 下游不可用时，Skill 解析或执行会失败关闭。

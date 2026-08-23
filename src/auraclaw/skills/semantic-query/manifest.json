@@ -1,0 +1,23 @@
+{
+  "name": "semantic.query.answer",
+  "version": "1.0.0",
+  "description": "基于受治理 Semantic Meta 生成 QueryDraft，经 Java MCP 编译并执行语义问数。",
+  "applies_when": ["语义问数", "问数", "指标查询", "维度分析", "趋势分析", "数据查询"],
+  "not_when": ["要求生成或执行 SQL", "要求修改业务数据", "要求绕过语义模型直接访问数据库"],
+  "publisher": "platform",
+  "signature": "hmac-sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "input_schema": {"type": "object"},
+  "output_schema": {"type": "object"},
+  "required_tools": [
+    {"name": "semantic.meta.context", "version": "*"},
+    {"name": "semantic.query.compile", "version": "*"},
+    {"name": "semantic.query.execute", "version": "*"}
+  ],
+  "required_resources": [],
+  "required_skills": [],
+  "allowed_roles": ["root", "coordinator", "worker"],
+  "data_classification": "internal",
+  "risk_level": "low",
+  "max_steps": 8,
+  "timeout_seconds": 120
+}

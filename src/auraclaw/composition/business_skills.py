@@ -28,6 +28,7 @@ PRICE_DATA_VALIDATION_SKILL_DIR = (
 PRICE_METRICS_SKILL_DIR = (
     Path(__file__).parents[1] / "skills" / "procurement-price-metrics"
 )
+SEMANTIC_QUERY_SKILL_DIR = Path(__file__).parents[1] / "skills" / "semantic-query"
 _RESOURCE_FILES = {
     "repo://business-skills/price-insight/metric-definitions/1.0.0": (
         "references/metric-definitions.md",
@@ -63,6 +64,12 @@ def signed_price_insight_dependency_packages(
         _signed_skill_package(PRICE_DATA_VALIDATION_SKILL_DIR, signer),
         _signed_skill_package(PRICE_METRICS_SKILL_DIR, signer),
     )
+
+
+def signed_semantic_query_package(
+    signer: HmacSkillSignatureVerifier,
+) -> SkillPackage:
+    return _signed_skill_package(SEMANTIC_QUERY_SKILL_DIR, signer)
 
 
 def _signed_skill_package(
