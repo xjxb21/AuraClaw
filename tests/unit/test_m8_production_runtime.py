@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -364,6 +365,202 @@ def test_openai_compatible_provider_sends_thinking_disabled() -> None:
         await client.aclose()
         assert response.completed_output == "ok"
         assert captured["body"]["thinking"] == {"type": "disabled"}
+
+    asyncio.run(scenario())
+
+
+def test_openai_compatible_provider_aliases_and_restores_tool_names() -> None:
+    captured: dict[str, Any] = {}
+    canonical_name = "auraclaw.capabilities.search"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        alias = captured["body"]["tools"][0]["function"]["name"]
+        chunk = {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-alias",
+                                "function": {"name": alias, "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        return httpx.Response(
+            200,
+            text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        )
+
+    async def scenario() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            base_url="https://models.example/v1",
+            model="example-model",
+            client=client,
+        )
+        request_tools = (
+            {
+                "type": "function",
+                "function": {
+                    "name": canonical_name,
+                    "description": "Search capabilities",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        )
+        response = await provider.generate(
+            ModelRequest(
+                model_call_id="model-alias",
+                tenant_id="tenant-m8",
+                run_id="run-m8",
+                messages=({"role": "user", "content": "search"},),
+                tools=request_tools,
+            ),
+            credential="secret",
+        )
+        await client.aclose()
+
+        sent_name = captured["body"]["tools"][0]["function"]["name"]
+        assert sent_name == "auraclaw_capabilities_search"
+        assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", sent_name)
+        assert request_tools[0]["function"]["name"] == canonical_name
+        assert response.tool_calls[0].name == canonical_name
+
+    asyncio.run(scenario())
+
+
+def test_openai_compatible_provider_aliases_tool_history() -> None:
+    captured: dict[str, Any] = {}
+    canonical_name = "auraclaw.skills.activate"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        chunk = {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+        return httpx.Response(
+            200,
+            text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        )
+
+    async def scenario() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            base_url="https://models.example/v1",
+            model="example-model",
+            client=client,
+        )
+        messages = (
+            {"role": "user", "content": "activate"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-history",
+                        "type": "function",
+                        "function": {"name": canonical_name, "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-history",
+                "name": canonical_name,
+                "content": "{}",
+            },
+        )
+        await provider.generate(
+            ModelRequest(
+                model_call_id="model-alias-history",
+                tenant_id="tenant-m8",
+                run_id="run-m8",
+                messages=messages,
+                tools=(
+                    {
+                        "type": "function",
+                        "function": {"name": canonical_name, "parameters": {}},
+                    },
+                ),
+            ),
+            credential="secret",
+        )
+        await client.aclose()
+
+        sent_messages = captured["body"]["messages"]
+        sent_alias = captured["body"]["tools"][0]["function"]["name"]
+        assert sent_alias == "auraclaw_skills_activate"
+        assert sent_messages[1]["tool_calls"][0]["function"]["name"] == sent_alias
+        assert sent_messages[2]["name"] == sent_alias
+        assert messages[1]["tool_calls"][0]["function"]["name"] == canonical_name
+        assert messages[2]["name"] == canonical_name
+
+    asyncio.run(scenario())
+
+
+def test_openai_compatible_provider_avoids_alias_collision() -> None:
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        alias = captured["body"]["tools"][0]["function"]["name"]
+        chunk = {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"name": alias, "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        return httpx.Response(
+            200,
+            text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        )
+
+    async def scenario() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            base_url="https://models.example/v1",
+            model="example-model",
+            client=client,
+        )
+        response = await provider.generate(
+            ModelRequest(
+                model_call_id="model-alias-collision",
+                tenant_id="tenant-m8",
+                run_id="run-m8",
+                messages=({"role": "user", "content": "search"},),
+                tools=(
+                    {
+                        "type": "function",
+                        "function": {"name": "catalog.search", "parameters": {}},
+                    },
+                    {
+                        "type": "function",
+                        "function": {"name": "catalog_search", "parameters": {}},
+                    },
+                ),
+            ),
+            credential="secret",
+        )
+        await client.aclose()
+
+        sent_names = [tool["function"]["name"] for tool in captured["body"]["tools"]]
+        assert len(set(sent_names)) == 2
+        assert sent_names[1] == "catalog_search"
+        assert all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) for name in sent_names)
+        assert response.tool_calls[0].name == "catalog.search"
 
     asyncio.run(scenario())
 
