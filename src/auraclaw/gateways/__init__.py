@@ -1,1 +1,0 @@
-"""Transport-neutral service gateways."""

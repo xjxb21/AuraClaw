@@ -1,1 +1,0 @@
-"""Artifact service boundary."""

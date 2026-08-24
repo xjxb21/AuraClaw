@@ -1,1 +1,0 @@
-"""Credential Proxy service boundary."""
