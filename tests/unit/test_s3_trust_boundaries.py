@@ -38,7 +38,7 @@ from auraclaw.contracts.tools import (
 from auraclaw.control.internal_service import ControlInternalService
 from auraclaw.control.ports import RunnableItem, RuntimeAssignment
 from auraclaw.credential_proxy.internal_service import CredentialProxyInternalService
-from auraclaw.infrastructure.artifacts.seaweedfs import SeaweedFSS3Presigner
+from auraclaw.infrastructure.artifacts.s3 import S3CompatiblePresigner
 from auraclaw.infrastructure.clients.artifact import RemoteArtifactWriter
 from auraclaw.infrastructure.clients.credential import RemoteCredentialProxy
 from auraclaw.infrastructure.clients.model import RemoteModelClient
@@ -75,16 +75,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _settings(**values: object) -> Settings:
-    # Clear ambient MYSQL_DB_* so production composition tests stay isolated
-    # when a developer shell has Model Skill DB credentials exported.
-    defaults: dict[str, object] = {
-        "model_skill_mysql_host": None,
-        "model_skill_mysql_user": None,
-        "model_skill_mysql_password": None,
-        "model_skill_mysql_database": None,
-    }
-    defaults.update(values)
-    return Settings(_env_file=None, **defaults)
+    return Settings(_env_file=None, **values)
 
 
 class _DeterministicModel:
@@ -722,7 +713,7 @@ async def test_policy_approval_is_bound_to_action_and_human_response_identity() 
 @pytest.mark.asyncio
 async def test_artifact_service_presigns_seaweedfs_upload_and_hands_has_no_s3_secret() -> None:
     service = ArtifactInternalService(
-        SeaweedFSS3Presigner(
+        S3CompatiblePresigner(
             "http://seaweed.test:8333",
             access_key="seaweed-access",
             secret_key="seaweed-secret",
@@ -764,21 +755,25 @@ async def test_artifact_service_presigns_seaweedfs_upload_and_hands_has_no_s3_se
 
 
 def test_compose_injects_secrets_only_into_their_owner_services() -> None:
-    compose = (ROOT / "compose.services.yml").read_text()
+    compose = (ROOT / "compose.test.yml").read_text()
     assert "env_file:" not in compose
 
     def count_key(key: str) -> int:
         return len(re.findall(rf"^\s+{key}:", compose, re.MULTILINE))
 
-    assert count_key("SEAWEEDFS_SECRET_KEY") == 1
-    assert count_key("SEAWEEDFS_ACCESS_KEY") == 1
-    assert count_key("AURACLAW_MODEL_API_KEY") == 1
-    assert count_key("AURACLAW_LEASE_SIGNING_KEY") == 3
+    # compose.test.yml uses _FILE secret mounts like prod
+    assert count_key("SEAWEEDFS_SECRET_KEY_FILE") == 1
+    assert count_key("OBS_AK_FILE") == 1
+    assert count_key("OBS_SK_FILE") == 1
+    assert count_key("SEAWEEDFS_ACCESS_KEY_FILE") == 1
+    assert count_key("AURACLAW_MODEL_API_KEY_FILE") == 1
+    assert count_key("AURACLAW_LEASE_SIGNING_KEY_FILE") == 3
     runtime = compose.split("  agent-runtime:", 1)[1].split("  model-gateway:", 1)[0]
     assert "DATABASE_URL" not in runtime
     assert "MODEL_API_KEY" not in runtime
     assert "SEAWEEDFS" not in runtime
-    assert "platform" not in runtime
+    assert "OBS_AK" not in runtime
+    # agent-runtime needs platform network for Kafka/Redis egress
     assert "internal: true" in compose
 
 

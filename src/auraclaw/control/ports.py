@@ -6,10 +6,16 @@ from typing import Any, Protocol
 
 from auraclaw.contracts.internal import LeaseAssertion
 
+DEFAULT_RUNTIME_MAX_STEPS = 48
+
 
 @dataclass(frozen=True)
 class RuntimeBudget:
-    max_steps: int = 16
+    # Price Insight's governed flow uses capability discovery, Skill activation,
+    # dependency hydration, and eight atomic metric calls. Follow-up turns in
+    # the same Session also re-search and reload capabilities, so keep the
+    # default above one complete flow plus that rediscovery tax.
+    max_steps: int = DEFAULT_RUNTIME_MAX_STEPS
     max_output_tokens: int = 8192
     max_cost: float | None = None
 
@@ -30,6 +36,7 @@ class RuntimeAssignment:
     lease_expires_at: datetime | None = None
     lease_assertion: LeaseAssertion | None = None
     user_id: str | None = None
+    dept_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +60,7 @@ class RunnableItem:
     deadline: datetime | None = None
     budget: RuntimeBudget = field(default_factory=RuntimeBudget)
     user_id: str | None = None
+    dept_id: str | None = None
 
 
 @dataclass(frozen=True)

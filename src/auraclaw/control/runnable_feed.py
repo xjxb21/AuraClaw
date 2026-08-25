@@ -8,7 +8,12 @@ from datetime import timedelta
 from typing import Protocol
 
 from auraclaw.contracts.events import CanonicalEvent
-from auraclaw.control.ports import ControlStateStore, RunnableItem, RuntimeBudget
+from auraclaw.control.ports import (
+    DEFAULT_RUNTIME_MAX_STEPS,
+    ControlStateStore,
+    RunnableItem,
+    RuntimeBudget,
+)
 from auraclaw.session.ports import ClaimedOutboxRecord
 
 logger = logging.getLogger(__name__)
@@ -76,13 +81,17 @@ class RunnableFeedConsumer:
                     item = self._derive(events, record.event.aggregate_version)
                 if (
                     item is not None
-                    and item.user_id is None
                     and item.root_session_id != item.session_id
+                    and (item.user_id is None or item.dept_id is None)
                 ):
                     root_events = await self._source.load(
                         item.tenant_id, item.root_session_id
                     )
-                    item = replace(item, user_id=self._owner_user_id(root_events))
+                    item = replace(
+                        item,
+                        user_id=item.user_id or self._owner_user_id(root_events),
+                        dept_id=item.dept_id or self._owner_dept_id(root_events),
+                    )
                 if item is not None:
                     enqueued += int(await self._store.enqueue(item))
                 # Ack off the schedule critical path; enqueue is idempotent so
@@ -141,7 +150,7 @@ class RunnableFeedConsumer:
         budget = RuntimeBudget()
         if isinstance(configured, dict):
             budget = RuntimeBudget(
-                max_steps=int(configured.get("max_steps", 16)),
+                max_steps=int(configured.get("max_steps", DEFAULT_RUNTIME_MAX_STEPS)),
                 max_output_tokens=int(configured.get("max_output_tokens", 8192)),
                 max_cost=(
                     float(configured["max_cost"])
@@ -160,6 +169,7 @@ class RunnableFeedConsumer:
             role=role,
             budget=budget,
             user_id=event.actor.id,
+            dept_id=_optional_str(event.payload.get("dept_id")),
         )
 
     @staticmethod
@@ -174,6 +184,7 @@ class RunnableFeedConsumer:
         budget = RuntimeBudget()
         terminal_runs: set[str] = set()
         owner_user_id = RunnableFeedConsumer._owner_user_id(events)
+        owner_dept_id = RunnableFeedConsumer._owner_dept_id(events)
         for event in events:
             if event.type in {"session.created", "child.created"}:
                 role = str(event.payload.get("role", role))
@@ -181,7 +192,7 @@ class RunnableFeedConsumer:
                 configured = event.payload.get("budget")
                 if isinstance(configured, dict):
                     budget = RuntimeBudget(
-                        max_steps=int(configured.get("max_steps", 16)),
+                        max_steps=int(configured.get("max_steps", DEFAULT_RUNTIME_MAX_STEPS)),
                         max_output_tokens=int(configured.get("max_output_tokens", 8192)),
                         max_cost=(
                             float(configured["max_cost"])
@@ -210,6 +221,7 @@ class RunnableFeedConsumer:
             role=role,
             budget=budget,
             user_id=owner_user_id,
+            dept_id=owner_dept_id,
         )
 
     @staticmethod
@@ -219,3 +231,18 @@ class RunnableFeedConsumer:
             if event.type == "session.created" and event.actor.type == "user":
                 return event.actor.id
         return None
+
+    @staticmethod
+    def _owner_dept_id(events: Sequence[CanonicalEvent]) -> str | None:
+        """Resolve the frozen department from the canonical creation fact."""
+        for event in events:
+            if event.type == "session.created":
+                return _optional_str(event.payload.get("dept_id"))
+        return None
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

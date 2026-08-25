@@ -13,8 +13,6 @@ htmlcov/
 venv/
 dist/
 build/
-!frontend/build/
-!frontend/build/sites-vite-plugin.ts
 *.egg-info/
 
 # Runtime data
@@ -35,7 +33,13 @@ logs/
 # Secrets
 .env
 .env.*
-!.env.example
-!.env.debug.example
-!.env.production.example
-debug/java-mcp-servers.json
+!.env.dev.example
+!.env.test.example
+!.env.prod.example
+.host.env
+.chaintower
+.eng.debug
+
+# Tool caches
+.import_linter_cache/
+.claude/

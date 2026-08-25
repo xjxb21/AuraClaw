@@ -30,21 +30,57 @@ SECRET_VARIABLES = {
     "credential_proxy_workload_token": "AURACLAW_CREDENTIAL_PROXY_WORKLOAD_TOKEN",
     "artifact_service_workload_token": "AURACLAW_ARTIFACT_SERVICE_WORKLOAD_TOKEN",
     "delivery_workload_token": "AURACLAW_DELIVERY_WORKLOAD_TOKEN",
+    "streaming_gateway_workload_token": "AURACLAW_STREAMING_GATEWAY_WORKLOAD_TOKEN",
     "lease_signing_key": "AURACLAW_LEASE_SIGNING_KEY",
     "model_api_key": "AURACLAW_MODEL_API_KEY",
     "vault_token": "AURACLAW_CREDENTIAL_VAULT_TOKEN",
     "seaweedfs_access_key": "SEAWEEDFS_ACCESS_KEY",
     "seaweedfs_secret_key": "SEAWEEDFS_SECRET_KEY",
+    "obs_ak": "OBS_AK",
+    "obs_sk": "OBS_SK",
     "chaintower_workload_token": "AURACLAW_CHAINTOWER_WORKLOAD_TOKEN",
     "agent_context_signing_keys_json": "AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON",
 }
+SEAWEEDFS_SECRET_FILES = {"seaweedfs_access_key", "seaweedfs_secret_key"}
+OBS_SECRET_FILES = {"obs_ak", "obs_sk"}
+
+
+def _resolved_artifact_backend(configured: dict[str, str | None]) -> str:
+    backend = configured.get("AURACLAW_ARTIFACT_BACKEND") or "auto"
+    if backend == "local":
+        return "local"
+    if backend == "obs":
+        return "obs"
+    if backend == "seaweedfs":
+        return "seaweedfs"
+    if configured.get("OBS_ENDPOINT"):
+        return "obs"
+    if configured.get("SEAWEEDFS_HOST"):
+        return "seaweedfs"
+    return "seaweedfs"
+
+
+def _materialized_value(
+    filename: str,
+    variable: str,
+    values: dict[str, str],
+    backend: str,
+) -> str:
+    value = values.get(variable, "")
+    if value:
+        return value
+    if backend == "obs" and filename in SEAWEEDFS_SECRET_FILES:
+        return "unused-seaweedfs-credential"
+    if backend == "seaweedfs" and filename in OBS_SECRET_FILES:
+        return "unused-obs-credential"
+    return ""
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="materialize ignored 0600 files for Docker Compose secrets"
     )
-    parser.add_argument("--env-file", default=".env")
+    parser.add_argument("--env-file", default=".env.prod")
     parser.add_argument("--output-dir", default=".runtime/compose-secrets")
     args = parser.parse_args()
     env_file = Path(args.env_file)
@@ -56,7 +92,20 @@ def main() -> int:
         variable: os.environ.get(variable) or configured.get(variable) or ""
         for variable in SECRET_VARIABLES.values()
     }
-    missing = [variable for variable, value in values.items() if not value]
+    backend = _resolved_artifact_backend(
+        {
+            key: os.environ.get(key) or configured.get(key)
+            for key in (
+                "AURACLAW_ARTIFACT_BACKEND",
+                "OBS_ENDPOINT",
+                "SEAWEEDFS_HOST",
+            )
+        }
+    )
+    missing = []
+    for filename, variable in SECRET_VARIABLES.items():
+        if not _materialized_value(filename, variable, values, backend):
+            missing.append(variable)
     if missing:
         print("secret materialization failed")
         for variable in missing:
@@ -75,7 +124,8 @@ def main() -> int:
             0o600,
         )
         try:
-            os.write(descriptor, values[variable].encode())
+            payload = _materialized_value(filename, variable, values, backend)
+            os.write(descriptor, payload.encode())
             os.fsync(descriptor)
         finally:
             os.close(descriptor)

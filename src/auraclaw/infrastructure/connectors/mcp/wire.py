@@ -9,9 +9,14 @@ from auraclaw.contracts.internal import ContractModel, LeaseAssertion
 
 MCP_PROTOCOL_VERSION = "2026-07-28"
 MCP_LEGACY_PROTOCOL_VERSION = "2025-11-25"
+MCP_JAVA_PROTOCOL_VERSION = "2025-06-18"
+MCP_INITIALIZE_PROTOCOL_VERSIONS = (
+    MCP_LEGACY_PROTOCOL_VERSION,
+    MCP_JAVA_PROTOCOL_VERSION,
+)
 MCP_SUPPORTED_PROTOCOL_VERSIONS = (
     MCP_PROTOCOL_VERSION,
-    MCP_LEGACY_PROTOCOL_VERSION,
+    *MCP_INITIALIZE_PROTOCOL_VERSIONS,
 )
 MCP_JSONRPC_VERSION = "2.0"
 MCP_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
@@ -21,6 +26,7 @@ MCP_SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo"
 MCP_AURACLAW_INVOCATION_ID_META_KEY = "io.auraclaw/invocationId"
 MCP_AURACLAW_TENANT_ID_META_KEY = "io.auraclaw/tenantId"
 MCP_AURACLAW_USER_ID_META_KEY = "io.auraclaw/userId"
+MCP_AURACLAW_DEPT_ID_META_KEY = "io.auraclaw/deptId"
 
 
 class McpTrustedContext(ContractModel):
@@ -34,6 +40,7 @@ class McpTrustedContext(ContractModel):
     deadline: datetime | None = None
     lease_assertion: LeaseAssertion | None = None
     user_id: str | None = None
+    dept_id: str | None = None
 
 
 class McpJsonRpcRequest(ContractModel):

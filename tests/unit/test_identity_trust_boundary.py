@@ -125,9 +125,8 @@ def test_verified_envelope_repr_and_dump_omit_raw_assertion() -> None:
 
 def test_explicit_insecure_headers_accept_tenant_actor_headers() -> None:
     get_settings().storage_backend = "memory"
-    get_settings().runtime_enabled = False
     get_settings().allow_insecure_identity_headers = True
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(profile="task-api")) as client:
         created = client.post(
             "/v1/tasks",
             headers={"Idempotency-Key": "id-char-1", "X-Tenant-ID": "tenant-dev"},
@@ -150,9 +149,8 @@ def test_explicit_insecure_headers_accept_tenant_actor_headers() -> None:
 
 def test_tenant_actor_headers_require_explicit_flag() -> None:
     get_settings().storage_backend = "memory"
-    get_settings().runtime_enabled = False
     get_settings().allow_insecure_identity_headers = False
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(profile="task-api")) as client:
         created = client.post(
             "/v1/tasks",
             headers={"Idempotency-Key": "id-char-required", "X-Tenant-ID": "tenant-dev"},
@@ -184,6 +182,27 @@ def test_signed_verifier_covers_failure_matrix() -> None:
         )
         assert allowed.user.tenant_id == "1"
         assert allowed.user.user_id == "101"
+        assert allowed.user.dept_id is None
+
+        with_dept = await verifier.verify(
+            IdentityVerificationRequest(
+                workload_credential=f"Bearer {WORKLOAD}",
+                assertion=_signer().sign(_claims(dept_id="9", jti="jti-dept")),
+                declared_dept_id="9",
+                command_id="cmd-dept",
+                operation="write",
+            )
+        )
+        assert with_dept.user.dept_id == "9"
+        with pytest.raises(IdentityAuthorizationError) as dept_conflict:
+            await verifier.verify(
+                IdentityVerificationRequest(
+                    workload_credential=f"Bearer {WORKLOAD}",
+                    assertion=_signer().sign(_claims(dept_id="9", jti="jti-dept-conflict")),
+                    declared_dept_id="8",
+                )
+            )
+        assert dept_conflict.value.reason is IdentityErrorReason.TENANT_SESSION_MISMATCH
         assert allowed.assertion is not None
         assert assertion_jti_digest(allowed.assertion.jti)
 
@@ -377,8 +396,7 @@ def test_production_task_api_requires_signed_context() -> None:
     from pydantic import SecretStr
 
     get_settings().storage_backend = "memory"
-    get_settings().runtime_enabled = False
-    app = create_app()
+    app = create_app(profile="task-api")
     app.state.identity_verifier = build_identity_verifier(
         Settings(
             _env_file=None,
@@ -430,6 +448,24 @@ def test_production_task_api_requires_signed_context() -> None:
             },
         )
         assert conflict.status_code == 403
+        dept_conflict = client.post(
+            "/v1/tasks",
+            headers={
+                "Idempotency-Key": "prod-signed-dept",
+                "Authorization": f"Bearer {WORKLOAD}",
+                "X-CT-Agent-Context": _signer().sign(
+                    _claims(
+                        tenant_id="tenant-1",
+                        user_id="user-1",
+                        dept_id="9",
+                        jti="api-dept",
+                    )
+                ),
+                "X-Dept-ID": "8",
+            },
+            json={"goal": "trusted"},
+        )
+        assert dept_conflict.status_code == 403
 
 
 def test_mcp_workload_trusted_context_does_not_require_oauth() -> None:
@@ -503,6 +539,7 @@ def test_mcp_transport_rejects_argument_identity_override_and_missing_user() -> 
             lease_id="lease",
             fencing_token=1,
             user_id="101",
+            dept_id="9",
         )
         from auraclaw.infrastructure.connectors.mcp.wire import McpTrustedContext
 
@@ -515,12 +552,29 @@ def test_mcp_transport_rejects_argument_identity_override_and_missing_user() -> 
             lease_id=trusted.lease_id,
             fencing_token=trusted.fencing_token,
             user_id=trusted.user_id,
+            dept_id=trusted.dept_id,
         )
         await transport.send(
             McpJsonRpcRequest(id="1", method="tools/list"),
             trusted_context=mcp_trusted,
         )
         assert calls[0]["request"]["_auraclaw_identity"]["user_id"] == "101"  # type: ignore[index]
+        assert calls[0]["request"]["_auraclaw_identity"]["dept_id"] == "9"  # type: ignore[index]
+        with pytest.raises(PolicyDeniedError, match="dept_id"):
+            await transport.send(
+                McpJsonRpcRequest(
+                    id="1b",
+                    method="tools/call",
+                    params={"name": "order.get", "arguments": {"dept_id": "8"}},
+                ),
+                trusted_context=mcp_trusted,
+            )
+        missing_dept = mcp_trusted.model_copy(update={"dept_id": None})
+        await transport.send(
+            McpJsonRpcRequest(id="1c", method="tools/list"),
+            trusted_context=missing_dept,
+        )
+        assert calls[-1]["request"]["_auraclaw_identity"]["dept_id"] is None  # type: ignore[index]
         with pytest.raises(PolicyDeniedError, match="tenant_id"):
             await transport.send(
                 McpJsonRpcRequest(

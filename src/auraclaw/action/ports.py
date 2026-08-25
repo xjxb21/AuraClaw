@@ -13,8 +13,6 @@ from auraclaw.contracts.hands import (
     HandsToolResult,
     HandsTrustedContext,
 )
-from auraclaw.contracts.model_skills import ModelSkillSnapshot
-from auraclaw.contracts.price_insight import PriceInsightDataset, PriceInsightFilter
 from auraclaw.contracts.tools import (
     ApprovalRecord,
     ArtifactRef,
@@ -137,6 +135,10 @@ class CapabilityCatalogStore(Protocol):
         self, tenant_id: str
     ) -> tuple[CapabilityDescriptor, ...]: ...
 
+    async def list_server_capabilities(
+        self, tenant_id: str, server_id: str
+    ) -> tuple[CapabilityDescriptor, ...]: ...
+
     async def get_capability(
         self, tenant_id: str, capability_id: str
     ) -> CapabilityDescriptor | None: ...
@@ -198,16 +200,3 @@ class ResourcePolicyEvaluator(Protocol):
         correlation_id: str,
         attributes: dict[str, object],
     ) -> PolicyEvaluation: ...
-
-
-class ModelSkillSource(Protocol):
-    async def load_snapshots(self) -> tuple[ModelSkillSnapshot, ...]: ...
-
-
-class PriceInsightSource(Protocol):
-    async def load_dataset(
-        self,
-        *,
-        tenant_id: str,
-        filters: PriceInsightFilter,
-    ) -> PriceInsightDataset: ...

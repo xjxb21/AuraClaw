@@ -9,6 +9,7 @@ from typing import Any
 
 from auraclaw.contracts.events import NewEvent
 from auraclaw.control.ports import (
+    DEFAULT_RUNTIME_MAX_STEPS,
     ControlStateStore,
     RunnableItem,
     RuntimeAssignment,
@@ -78,9 +79,11 @@ class ManagedOrchestrator:
                 role=str(task.get("role", "root")),
                 required_capability=dict(task.get("required_capability", {})),
                 budget=RuntimeBudget(
-                    max_steps=int(task.get("max_steps", 16)),
+                    max_steps=int(task.get("max_steps", DEFAULT_RUNTIME_MAX_STEPS)),
                     max_output_tokens=int(task.get("max_output_tokens", 8192)),
                 ),
+                user_id=None if task.get("user_id") is None else str(task.get("user_id")),
+                dept_id=None if task.get("dept_id") is None else str(task.get("dept_id")),
             )
             enqueued += int(await self._control.enqueue(item))
         return enqueued
@@ -122,6 +125,7 @@ class ManagedOrchestrator:
                 budget=item.budget,
                 lease_expires_at=lease.expires_at,
                 user_id=item.user_id,
+                dept_id=item.dept_id,
             )
             if not await self._control.assign(
                 item.task_id, assignment, claim_token=claim.claim_token

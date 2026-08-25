@@ -4,16 +4,17 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from auraclaw.composition.api import create_app
-from auraclaw.composition.cli import build_parser, main
+from auraclaw.composition.cli import _serve_topology, build_parser, main
 from auraclaw.composition.services import (
     SERVICE_BY_COMMAND,
     create_service_app,
     service_spec,
 )
-from auraclaw.config import Settings
+from auraclaw.config import Settings, get_settings
 from auraclaw.contracts.hands import HANDS_TOOLS_LIST
 from auraclaw.contracts.internal import LeaseAssertion
 from auraclaw.internal.security import LeaseAssertionSigner
@@ -22,16 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _settings(**values: object) -> Settings:
-    # Clear ambient MYSQL_DB_* so production composition tests stay isolated
-    # when a developer shell has Model Skill DB credentials exported.
-    defaults: dict[str, object] = {
-        "model_skill_mysql_host": None,
-        "model_skill_mysql_user": None,
-        "model_skill_mysql_password": None,
-        "model_skill_mysql_database": None,
-    }
-    defaults.update(values)
-    return Settings(_env_file=None, **defaults)
+    return Settings(_env_file=None, **values)
 
 
 def test_cli_defines_all_twelve_production_entrypoints() -> None:
@@ -53,15 +45,13 @@ def test_cli_defines_all_twelve_production_entrypoints() -> None:
     assert SERVICE_BY_COMMAND == expected
     settings = _settings()
     assert len({service_spec(command, settings).port for command in expected}) == 12
+    assert settings.ingress_port == 8080
+    assert settings.ingress_enabled is True
 
-    for command in expected:
-        argv = (
-            ["projection", "relay", "--watch"]
-            if command == "projection"
-            else [command, "run"]
-        )
-        parsed = parser.parse_args(argv)
-        assert parsed.command == command
+    assert parser.parse_args(["serve"]).command == "serve"
+    assert parser.parse_args(["projection", "relay"]).command == "projection"
+    assert parser.parse_args(["operations", "status"]).command == "operations"
+    assert parser.parse_args(["migrate", "status"]).command == "migrate"
 
 
 def test_serve_starts_all_twelve_production_entrypoints() -> None:
@@ -82,6 +72,39 @@ def test_serve_starts_all_twelve_production_entrypoints() -> None:
     assert uvicorn_calls == []
 
 
+def test_single_service_run_rejected_in_development_profile() -> None:
+    with pytest.raises(SystemExit, match="auraclaw serve"):
+        main(["runtime", "run"], uvicorn_runner=lambda *_a, **_k: None)
+
+
+def test_single_service_run_allowed_in_production_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AURACLAW_DEPLOYMENT_PROFILE", "production")
+    get_settings.cache_clear()
+    calls: list[tuple[object, ...]] = []
+
+    def fake_uvicorn(*args: object, **kwargs: object) -> None:
+        calls.append((args, kwargs))
+
+    try:
+        main(["runtime", "run"], uvicorn_runner=fake_uvicorn)
+    finally:
+        get_settings.cache_clear()
+
+    assert len(calls) == 1
+
+
+def test_serve_rejects_process_local_runtime_event_bus() -> None:
+    settings = _settings(
+        storage_backend="memory",
+        runtime_event_backend="memory",
+    )
+
+    with pytest.raises(ValueError, match="shared SQL storage or Kafka"):
+        _serve_topology(settings, host="127.0.0.1")
+
+
 def test_projection_watch_interval_reaches_worker_lifecycle() -> None:
     app = create_service_app(
         "projection",
@@ -95,6 +118,7 @@ def test_task_api_and_streaming_gateway_have_disjoint_public_routes() -> None:
     task_paths = set(create_app(profile="task-api").openapi()["paths"])
     stream_paths = set(create_app(profile="streaming-gateway").openapi()["paths"])
     assert "/v1/tasks" in task_paths
+    assert "/v1/tasks/sync" in task_paths
     assert not any(path.startswith("/v1/streams") for path in task_paths)
     assert any(path.startswith("/v1/streams") for path in stream_paths)
     assert "/v1/tasks" not in stream_paths
@@ -180,8 +204,8 @@ def test_hands_exposes_authenticated_internal_contract() -> None:
 
 
 def test_compose_uses_one_image_twelve_commands_and_ingress_split() -> None:
-    compose = (ROOT / "compose.services.yml").read_text()
-    assert compose.count("<<: *auraclaw-service") == 12
+    compose = (ROOT / "compose.test.yml").read_text()
+    assert compose.count("<<: *auraclaw-service") == 13  # 12 app + migrate
     for command in (
         '["api", "run"',
         '["session", "run"',

@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs
 
 import pytest
 
 from auraclaw.action.ports import PolicyEvaluation
-from auraclaw.config import Settings
 from auraclaw.contracts.capabilities import (
     CapabilityStatus,
     CapabilityTrustLevel,
+    McpAuthStrategy,
     McpOAuthConfiguration,
     McpServerDefinition,
 )
@@ -47,6 +46,7 @@ class _Sender:
         self.calls: list[dict[str, object]] = []
         self.redirect = False
         self.sse = False
+        self.require_oauth_bearer = True
 
     async def send(self, **request: object) -> McpEgressResponse:
         self.calls.append(request)
@@ -86,7 +86,8 @@ class _Sender:
                 ),
             )
         authorization = str(request["headers"])  # type: ignore[index]
-        assert "Bearer remote-access-token" in authorization
+        if self.require_oauth_bearer:
+            assert "Bearer remote-access-token" in authorization
         if self.sse:
             return McpEgressResponse(
                 status_code=200,
@@ -376,6 +377,92 @@ def test_mcp_egress_rejects_private_dns_and_redirects() -> None:
     asyncio.run(scenario())
 
 
+def test_mcp_egress_allows_loopback_http_when_private_host_allowlisted() -> None:
+    async def scenario() -> None:
+        class LoopbackSender:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def send(self, **request: object) -> McpEgressResponse:
+                self.calls.append(request)
+                return McpEgressResponse(
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    content=b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}',
+                )
+
+        sender = LoopbackSender()
+        adapter = ManagedMcpEgressAdapter(
+            McpServerDefinition(
+                server_id="java-mcp",
+                tenant_id="development",
+                title="Java Agent Runtime MCP Gateway",
+                endpoint="http://127.0.0.1:48080/rpc-api/agent-runtime/mcp",
+                credential_ref="vault/java-mcp#client_secret",
+                trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
+                allowed_tool_prefixes=("",),
+                allowed_private_hosts=("127.0.0.1",),
+                status=CapabilityStatus.ACTIVE,
+                enabled=True,
+            ),
+            resolver=_Resolver(("127.0.0.1",)),
+            sender=sender,
+        )
+        await adapter(
+            {
+                "server_id": "java-mcp",
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent.runtime.ping",
+                    "arguments": {},
+                    "_meta": {
+                        MCP_PROTOCOL_VERSION_META_KEY: MCP_PROTOCOL_VERSION,
+                        MCP_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                },
+            },
+            "local-java-mcp-debug",
+        )
+        assert sender.calls
+        assert (
+            sender.calls[0]["url"]
+            == "http://127.0.0.1:48080/rpc-api/agent-runtime/mcp"
+        )
+        assert sender.calls[0]["approved_ip"] == "127.0.0.1"
+
+    asyncio.run(scenario())
+
+
+def test_mcp_egress_rejects_public_http_even_when_host_allowlisted() -> None:
+    async def scenario() -> None:
+        sender = _Sender()
+        server = McpServerDefinition(
+            server_id="github-mcp",
+            tenant_id="tenant-a",
+            title="Public HTTP MCP",
+            endpoint="http://mcp.example.com/mcp",
+            credential_ref="vault/github-mcp#client_secret",
+            auth_strategy=McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT,
+            allowed_tool_prefixes=("github.",),
+            allowed_private_hosts=("mcp.example.com",),
+            status=CapabilityStatus.ACTIVE,
+            enabled=True,
+        )
+        adapter = ManagedMcpEgressAdapter(
+            server,
+            resolver=_Resolver(("93.184.216.34",)),
+            sender=sender,
+        )
+
+        with pytest.raises(CredentialAccessError, match="requires HTTPS"):
+            await adapter(_request(), "client-secret")
+        assert sender.calls == []
+
+    asyncio.run(scenario())
+
+
 def test_hands_remote_transport_passes_only_reference_and_policy_evidence() -> None:
     async def scenario() -> None:
         credentials = _Credentials()
@@ -441,14 +528,69 @@ def test_hands_remote_transport_rejects_mismatched_response_id() -> None:
     asyncio.run(scenario())
 
 
-def test_mcp_egress_server_configuration_is_typed_and_secret_free() -> None:
-    server = _server()
-    settings = Settings(
-        mcp_egress_servers_json=json.dumps(
-            [server.model_dump(mode="json")]
+def test_mcp_egress_sends_department_snapshot_headers() -> None:
+    async def scenario() -> None:
+        sender = _Sender()
+        sender.require_oauth_bearer = False
+        server = McpServerDefinition(
+            server_id="github-mcp",
+            tenant_id="tenant-a",
+            title="ChainTower MCP",
+            endpoint="https://mcp.example/v1/mcp",
+            credential_ref="vault/chaintower-mcp#workload",
+            auth_strategy=McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT,
+            trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
+            allowed_tool_prefixes=("github.",),
+            status=CapabilityStatus.ACTIVE,
+            enabled=True,
         )
-    )
-    assert settings.mcp_egress_servers == (server,)
-    serialized = settings.mcp_egress_servers_json
+        adapter = ManagedMcpEgressAdapter(
+            server,
+            resolver=_Resolver(),
+            sender=sender,
+        )
+        await adapter(
+            {
+                **_request(),
+                "_auraclaw_identity": {
+                    "tenant_id": "1",
+                    "user_id": "101",
+                    "dept_id": "9",
+                    "session_id": "ses-1",
+                },
+            },
+            "w" * 48,
+        )
+        headers = sender.calls[-1]["headers"]
+        assert isinstance(headers, dict)
+        assert headers["X-CT-Tenant-ID"] == "1"
+        assert headers["X-CT-User-ID"] == "101"
+        assert headers["X-CT-Dept-ID"] == "9"
+        assert headers["X-CT-Session-ID"] == "ses-1"
+
+        await adapter(
+            {
+                **_request(),
+                "id": 2,
+                "_auraclaw_identity": {
+                    "tenant_id": "1",
+                    "user_id": "101",
+                    "dept_id": None,
+                    "session_id": "ses-1",
+                },
+            },
+            "w" * 48,
+        )
+        missing = sender.calls[-1]["headers"]
+        assert isinstance(missing, dict)
+        assert "X-CT-Dept-ID" not in missing
+        assert missing["X-CT-User-ID"] == "101"
+
+    asyncio.run(scenario())
+
+
+def test_mcp_server_configuration_is_typed_and_secret_free() -> None:
+    server = _server()
+    serialized = server.model_dump_json()
     assert "oauth-client-secret" not in serialized
     assert "vault/github-mcp#client_secret" in serialized

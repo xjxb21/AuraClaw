@@ -37,17 +37,12 @@ from auraclaw.action.hands_http import (
     SignedLeaseHandsAuthenticator,
     create_hands_http_app,
 )
+from auraclaw.action.mcp_connection_manager import McpConnectionManager
+from auraclaw.action.mcp_internal_service import McpRegistryInternalService
 from auraclaw.action.mcp_primitives import HandsResourceRegistry
-from auraclaw.action.model_skill_compiler import (
-    ModelSkillCompiler,
-    ModelSkillPublisher,
-)
-from auraclaw.action.ports import PriceInsightSource
-from auraclaw.action.price_insight import (
-    PriceInsightService,
-    PriceInsightToolExecutor,
-    price_insight_tool_descriptors,
-    price_insight_tools,
+from auraclaw.action.mcp_registry import (
+    InMemoryMcpServerRegistryStore,
+    McpServerRegistryService,
 )
 from auraclaw.action.resource_gateway import ManagedResourceGateway
 from auraclaw.action.skill_packages import (
@@ -55,37 +50,37 @@ from auraclaw.action.skill_packages import (
     SkillPackageRegistry,
     SkillResolver,
 )
+from auraclaw.action.skill_reconciler import SkillPackageReconciler
 from auraclaw.action.tool_gateway import ToolGateway, ToolRegistry
 from auraclaw.admin.internal_service import OwnerAdminService
 from auraclaw.api.dependencies import (
     get_collaboration_projection,
     get_observability_service,
+    get_streaming_gateway,
+    get_sync_invocation_gateway,
     get_task_command_gateway,
     get_task_projection,
     get_task_query_service,
+    get_task_result_waiter,
 )
-from auraclaw.artifact.internal_service import (
-    ArtifactInternalService,
-    SeaweedFSObjectVerifier,
-)
+from auraclaw.api.routes.admin_mcp import create_mcp_admin_router
+from auraclaw.api.routes.admin_skills import create_skill_admin_router
+from auraclaw.artifact.internal_service import ArtifactInternalService
 from auraclaw.composition import providers
 from auraclaw.composition.api import create_app
-from auraclaw.composition.business_skills import (
-    PRICE_INSIGHT_SERVER_ID,
-    PRICE_INSIGHT_SKILL_DIR,
-    price_insight_resource_descriptors,
-    price_insight_resources,
-    signed_price_insight_dependency_packages,
-    signed_price_insight_package,
+from auraclaw.composition.object_storage import (
+    build_object_storage,
+    object_storage_closeables,
 )
 from auraclaw.composition.worker_wake import WorkerWakeGate
 from auraclaw.config import Settings, get_settings
-from auraclaw.contracts.capabilities import (
-    CapabilityStatus,
-    CapabilityTrustLevel,
-    McpServerDefinition,
+from auraclaw.contracts.internal import (
+    InternalRequestContext,
+    McpRegistrySnapshotRequest,
+    McpRegistrySnapshotResponse,
+    ServiceIdentity,
 )
-from auraclaw.contracts.internal import ServiceIdentity
+from auraclaw.contracts.mcp_registry import McpActiveSnapshotEntry
 from auraclaw.contracts.tools import CredentialReference
 from auraclaw.control.internal_service import ControlInternalService
 from auraclaw.control.orchestrator import (
@@ -97,13 +92,15 @@ from auraclaw.control.runnable_feed import RunnableFeedConsumer
 from auraclaw.credential_proxy.internal_service import CredentialProxyInternalService
 from auraclaw.delivery.worker import ResultDeliveryWorker
 from auraclaw.gateways.query.reader import TaskQueryService
+from auraclaw.gateways.query.waiter import TaskResultWaiter
+from auraclaw.gateways.streaming.gateway import StreamingGateway
 from auraclaw.gateways.task.commands import TaskCommandGateway
-from auraclaw.infrastructure.artifacts.seaweedfs import (
-    SeaweedFSMultipartClient,
-    SeaweedFSS3Presigner,
-)
+from auraclaw.gateways.task.invocations import SyncInvocationGateway
+from auraclaw.infrastructure.artifacts.store import ArtifactStore, InMemoryObjectStorage
 from auraclaw.infrastructure.clients.artifact import RemoteArtifactWriter
 from auraclaw.infrastructure.clients.credential import RemoteCredentialProxy
+from auraclaw.infrastructure.clients.mcp_egress import RemoteMcpEgressClient
+from auraclaw.infrastructure.clients.mcp_registry import RemoteMcpRegistryClient
 from auraclaw.infrastructure.clients.model import RemoteModelClient
 from auraclaw.infrastructure.clients.policy import (
     RemotePolicyClient,
@@ -119,6 +116,7 @@ from auraclaw.infrastructure.clients.session import (
     RemoteSessionDeliveryOutboxSource,
     RemoteSessionEventStore,
     RemoteSessionOutboxSource,
+    RemoteTaskProjection,
 )
 from auraclaw.infrastructure.clients.worker_wake import (
     HttpWorkerWakeClient,
@@ -130,7 +128,7 @@ from auraclaw.infrastructure.connectors.http.connector import (
 )
 from auraclaw.infrastructure.connectors.http.egress import ManagedJavaApiEgressAdapter
 from auraclaw.infrastructure.connectors.mcp.connector import ManagedMcpConnector
-from auraclaw.infrastructure.credentials.mcp_egress import ManagedMcpEgressAdapter
+from auraclaw.infrastructure.credentials.mcp_egress_manager import McpEgressManager
 from auraclaw.infrastructure.credentials.proxy import CredentialProxy, InMemoryVault
 from auraclaw.infrastructure.credentials.vault import HashiCorpVault
 from auraclaw.infrastructure.credentials.webhook import ManagedWebhookCredentialAdapter
@@ -141,7 +139,6 @@ from auraclaw.infrastructure.delivery import (
 from auraclaw.infrastructure.delivery.remote_sinks import CredentialProxyWebhookSink
 from auraclaw.infrastructure.delivery.sinks import ParentSessionResultSink
 from auraclaw.infrastructure.hands.local import LocalHandsService
-from auraclaw.infrastructure.model_sources.mysql import MySqlModelSkillSource
 from auraclaw.infrastructure.observability.stores import InMemoryObservabilityStore
 from auraclaw.infrastructure.persistence.memory_control_store import (
     InMemoryControlStateStore,
@@ -164,6 +161,9 @@ from auraclaw.infrastructure.persistence.postgres_credential_registry import (
 from auraclaw.infrastructure.persistence.postgres_invocation_store import (
     PostgresInvocationStore,
 )
+from auraclaw.infrastructure.persistence.postgres_mcp_registry import (
+    PostgresMcpServerRegistryStore,
+)
 from auraclaw.infrastructure.persistence.postgres_model_store import (
     PostgresModelStateStore,
 )
@@ -172,10 +172,6 @@ from auraclaw.infrastructure.persistence.postgres_policy_store import (
 )
 from auraclaw.infrastructure.persistence.postgres_tool_registry import (
     PostgresToolRegistryStore,
-)
-from auraclaw.infrastructure.price_insight import (
-    JsonPriceInsightSource,
-    MySqlPriceInsightSource,
 )
 from auraclaw.infrastructure.projection.postgres_approval_store import (
     PostgresApprovalProjection,
@@ -186,12 +182,13 @@ from auraclaw.infrastructure.projection.postgres_collaboration_store import (
 from auraclaw.infrastructure.projection.postgres_task_store import (
     PostgresTaskProjection,
 )
-from auraclaw.internal.http import create_contract_app
+from auraclaw.internal.http import HttpContractClient, create_contract_app
 from auraclaw.internal.routes import (
     admin_routes,
     artifact_routes,
     control_routes,
     credential_routes,
+    mcp_registry_routes,
     model_routes,
     model_stream_routes,
     policy_routes,
@@ -213,7 +210,6 @@ from auraclaw.projection.ports import (
     TaskReader,
 )
 from auraclaw.projection.relay import OutboxRelay
-from auraclaw.projection.task.projector import InMemoryTaskProjection
 from auraclaw.runtime.capability_controller import RuntimeCapabilityController
 from auraclaw.runtime.hands_adapter import HandsRuntimeAdapter
 from auraclaw.runtime.hands_client import HttpHandsClient
@@ -222,6 +218,96 @@ from auraclaw.session.internal_service import SessionInternalService
 from auraclaw.session.task_service import TaskService
 
 logger = logging.getLogger(__name__)
+_SKILL_PACKAGE_REGISTRY: SkillPackageRegistry | None = None
+
+
+def _mcp_registry_service(settings: Settings) -> tuple[
+    McpServerRegistryService,
+    InMemoryMcpServerRegistryStore | PostgresMcpServerRegistryStore,
+]:
+    store: InMemoryMcpServerRegistryStore | PostgresMcpServerRegistryStore
+    if settings.sql_storage_enabled:
+        store = PostgresMcpServerRegistryStore(settings.resolved_database_url)
+    else:
+        store = InMemoryMcpServerRegistryStore()
+    allow_private_none = (
+        settings.mcp_allow_private_auth_none
+        if settings.mcp_allow_private_auth_none is not None
+        else settings.deployment_profile == "development"
+    )
+    return (
+        McpServerRegistryService(
+            store, allow_private_auth_none=allow_private_none
+        ),
+        store,
+    )
+
+
+def _capability_catalog_store(
+    settings: Settings,
+) -> InMemoryCapabilityCatalogStore | PostgresCapabilityCatalogStore:
+    if settings.sql_storage_enabled:
+        return PostgresCapabilityCatalogStore(settings.resolved_database_url)
+    return InMemoryCapabilityCatalogStore()
+
+
+def _skill_registry_service(settings: Settings) -> SkillPackageRegistry:
+    global _SKILL_PACKAGE_REGISTRY
+    if _SKILL_PACKAGE_REGISTRY is not None:
+        return _SKILL_PACKAGE_REGISTRY
+    configured_signing_key = (
+        settings.skill_signing_key.get_secret_value().encode()
+        if settings.skill_signing_key is not None
+        else None
+    )
+    signing_key = (
+        configured_signing_key or b"auraclaw-development-platform-skill-key"
+    )
+    _SKILL_PACKAGE_REGISTRY = SkillPackageRegistry(
+        artifacts=ArtifactStore(InMemoryObjectStorage(), signing_key=signing_key),
+        signature_verifier=HmacSkillSignatureVerifier(
+            {
+                "ct-model": (
+                    configured_signing_key or b"auraclaw-development-model-skill-key"
+                ),
+                "platform": signing_key,
+            }
+        ),
+        resources=HandsResourceRegistry(),
+    )
+    return _SKILL_PACKAGE_REGISTRY
+
+
+async def _hands_mcp_snapshot(
+    settings: Settings,
+) -> tuple[McpActiveSnapshotEntry, ...] | None:
+    token = settings.workload_token_value(ServiceIdentity.CREDENTIAL_PROXY.value)
+    if not token:
+        return None
+    client = httpx.AsyncClient(base_url=settings.hands_url)
+    contract = HttpContractClient(client, bearer_token=token)
+    try:
+        response = await contract.call(
+            "/internal/v1/mcp-registry/snapshot",
+            McpRegistrySnapshotRequest(
+                context=InternalRequestContext(
+                    tenant_id="platform",
+                    service_identity=ServiceIdentity.CREDENTIAL_PROXY,
+                    request_id=secrets.token_hex(12),
+                    correlation_id="mcp-egress-restore",
+                    causation_id="mcp-egress-restore",
+                )
+            ),
+            McpRegistrySnapshotResponse,
+        )
+    except Exception:
+        logger.warning("MCP registry snapshot is unavailable; retrying on the next tick")
+        return None
+    finally:
+        await client.aclose()
+    return tuple(
+        McpActiveSnapshotEntry.model_validate(item) for item in response.servers
+    )
 
 
 def _worker_idle_interval(settings: Settings, configured: float) -> float:
@@ -411,6 +497,10 @@ def _configured_identities(
     return configured
 
 
+def _agent_runtime_token(settings: Settings) -> str | None:
+    return settings.workload_token_value(ServiceIdentity.AGENT_RUNTIME.value)
+
+
 def _service_bearer_token(settings: Settings, identity: ServiceIdentity) -> str:
     return settings.workload_token_value(identity.value) or secrets.token_urlsafe(32)
 
@@ -441,37 +531,24 @@ def _seed_managed_connector_credentials(
     settings: Settings,
 ) -> None:
     expires_at = datetime.now(UTC) + timedelta(days=365)
-    for mcp_server in settings.mcp_egress_servers:
-        if mcp_server.credential_ref is None:
-            continue
-        account_scope = (
-            mcp_server.oauth.resource
-            if mcp_server.oauth is not None
-            else mcp_server.endpoint
-        )
-        proxy.register_reference(
-            mcp_server.tenant_id or "platform",
-            CredentialReference(
-                credential_ref=mcp_server.credential_ref,
-                provider=mcp_server.server_id,
-                account_scope=account_scope,
-                allowed_operations=("mcp.invoke",),
-                expires_at=expires_at,
-            ),
-        )
+    debug_tenants = (
+        ("local", "development", "1")
+        if settings.deployment_profile == "development"
+        else ()
+    )
     for java_server in settings.java_api_servers:
         if java_server.credential_ref is None:
             continue
-        proxy.register_reference(
-            java_server.tenant_id or "platform",
-            CredentialReference(
-                credential_ref=java_server.credential_ref,
-                provider=java_server.server_id,
-                account_scope=java_server.base_url,
-                allowed_operations=("http.invoke",),
-                expires_at=expires_at,
-            ),
+        reference = CredentialReference(
+            credential_ref=java_server.credential_ref,
+            provider=java_server.server_id,
+            account_scope=java_server.base_url,
+            allowed_operations=("http.invoke",),
+            expires_at=expires_at,
         )
+        tenants = {java_server.tenant_id or "platform", *debug_tenants}
+        for tenant_id in tenants:
+            proxy.register_reference(tenant_id, reference)
 
 
 def _task_api_app(settings: Settings) -> FastAPI:
@@ -505,7 +582,8 @@ def _task_api_app(settings: Settings) -> FastAPI:
             settings.resolved_database_url
         )
     else:
-        task_projection = InMemoryTaskProjection()
+        # Session owns the memory store in the multi-process debug topology.
+        task_projection = RemoteTaskProjection(remote_session)
         approval_projection = InMemoryApprovalProjection()
         collaboration_projection = InMemoryCollaborationProjection()
     task_service = TaskService(
@@ -518,10 +596,20 @@ def _task_api_app(settings: Settings) -> FastAPI:
     )
     gateway = TaskCommandGateway(task_service)
     query = TaskQueryService(task_projection, collaboration_projection, remote_session)
+    waiter = TaskResultWaiter(
+        query,
+        poll_interval=settings.sync_invoke_poll_interval_seconds,
+        max_concurrent=settings.sync_invoke_max_concurrent,
+        default_timeout_seconds=settings.sync_invoke_default_timeout_seconds,
+        max_timeout_seconds=settings.sync_invoke_max_timeout_seconds,
+    )
+    invocations = SyncInvocationGateway(gateway, waiter)
     observability = ObservabilityService(InMemoryObservabilityStore(), remote_session)
     app.dependency_overrides[get_task_command_gateway] = lambda: gateway
     app.dependency_overrides[get_task_projection] = lambda: task_projection
     app.dependency_overrides[get_task_query_service] = lambda: query
+    app.dependency_overrides[get_task_result_waiter] = lambda: waiter
+    app.dependency_overrides[get_sync_invocation_gateway] = lambda: invocations
     app.dependency_overrides[get_collaboration_projection] = lambda: (
         collaboration_projection
     )
@@ -542,9 +630,58 @@ def _task_api_app(settings: Settings) -> FastAPI:
             else ()
         ),
     )
+    mcp_registry, mcp_store = _mcp_registry_service(settings)
+    mcp_lifecycle = RemoteMcpRegistryClient(
+        settings.hands_url,
+        bearer_token=_service_bearer_token(settings, ServiceIdentity.TASK_API),
+    )
+    capability_catalog_store = _capability_catalog_store(settings)
+    app.include_router(
+        create_mcp_admin_router(
+            mcp_registry,
+            lifecycle=mcp_lifecycle,
+            catalog=CapabilityCatalog(capability_catalog_store),
+        )
+    )
+    app.include_router(create_skill_admin_router(_skill_registry_service(settings)))
+    extra_closeables: list[Any] = [mcp_lifecycle]
+    if isinstance(mcp_store, PostgresMcpServerRegistryStore):
+        extra_closeables.append(mcp_store)
+    if isinstance(capability_catalog_store, PostgresCapabilityCatalogStore):
+        extra_closeables.append(capability_catalog_store)
+    app.state.closeables = (*app.state.closeables, *extra_closeables)
     app.state.config_ready = config_ready
     app.state.storage_label = "projection-read-only"
     app.state.session_access = "http"
+    return app
+
+
+def _streaming_app(settings: Settings) -> FastAPI:
+    app = create_app(profile="streaming-gateway")
+    token = settings.workload_token_value(ServiceIdentity.STREAMING_GATEWAY.value)
+    remote_session: RemoteSessionEventStore | None = None
+    projection: TaskReader
+    if settings.sql_storage_enabled:
+        projection = PostgresTaskProjection(settings.resolved_database_url)
+    else:
+        # Session owns the memory store in the multi-process debug topology.
+        remote_session = RemoteSessionEventStore(
+            settings.session_base_url,
+            service_identity=ServiceIdentity.STREAMING_GATEWAY,
+            bearer_token=token or secrets.token_urlsafe(32),
+        )
+        projection = RemoteTaskProjection(remote_session)
+    gateway = StreamingGateway(
+        reader=projection,
+        bus=providers.get_runtime_replay_bus(),
+    )
+    app.dependency_overrides[get_streaming_gateway] = lambda: gateway
+    app.state.closeables = (
+        *((projection,) if settings.sql_storage_enabled else ()),
+        *((remote_session,) if remote_session is not None else ()),
+    )
+    app.state.storage_label = "projection-read-only"
+    app.state.session_access = "http" if remote_session is not None else "database"
     return app
 
 
@@ -613,6 +750,7 @@ def _readiness(name: str, settings: Settings) -> tuple[bool, dict[str, str]]:
             ServiceIdentity.AGENT_RUNTIME,
             ServiceIdentity.POLICY,
             ServiceIdentity.DELIVERY_WORKER,
+            ServiceIdentity.STREAMING_GATEWAY,
         )
         identity_ready = _has_workload_tokens(settings, required_identities)
         dependencies["workload_identities"] = "ready" if identity_ready else "missing"
@@ -630,13 +768,14 @@ def _readiness(name: str, settings: Settings) -> tuple[bool, dict[str, str]]:
         ready = ready and lease_ready and identity_ready
     if name == "artifact-service":
         storage_ready = (
-            settings.seaweedfs_enabled or settings.artifact_backend == "local"
+            settings.object_storage_enabled
+            or settings.resolved_artifact_backend == "local"
         )
         dependencies["object_storage"] = (
-            "seaweedfs"
-            if settings.seaweedfs_enabled
+            settings.resolved_artifact_backend
+            if settings.object_storage_enabled
             else "local"
-            if settings.artifact_backend == "local"
+            if settings.resolved_artifact_backend == "local"
             else "missing"
         )
         policy_identity_ready = bool(
@@ -916,6 +1055,7 @@ def _session_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
             ServiceIdentity.AGENT_RUNTIME,
             ServiceIdentity.POLICY,
             ServiceIdentity.DELIVERY_WORKER,
+            ServiceIdentity.STREAMING_GATEWAY,
         ),
     )
     contract_app = create_contract_app(
@@ -1028,16 +1168,18 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
     artifacts: RemoteArtifactWriter
     invocation_store: PostgresInvocationStore | None = None
     tool_registry_store: PostgresToolRegistryStore | None = None
-    capability_catalog_store: (
-        InMemoryCapabilityCatalogStore | PostgresCapabilityCatalogStore
-    ) = InMemoryCapabilityCatalogStore()
+    capability_catalog_store = _capability_catalog_store(settings)
+    mcp_registry, mcp_registry_store = _mcp_registry_service(settings)
     remote_clients: list[Any] = []
     hands_token = _service_bearer_token(settings, ServiceIdentity.ACTION_HANDS)
     policy = RemotePolicyClient(settings.policy_base_url, bearer_token=hands_token)
     credential_proxy = RemoteCredentialProxy(
         settings.credential_proxy_base_url, bearer_token=hands_token
     )
-    remote_clients.extend((policy, credential_proxy))
+    mcp_egress_client = RemoteMcpEgressClient(
+        settings.credential_proxy_base_url, bearer_token=hands_token
+    )
+    remote_clients.extend((policy, credential_proxy, mcp_egress_client))
     artifacts = RemoteArtifactWriter(
         settings.artifact_base_url,
         bearer_token=_service_bearer_token(settings, ServiceIdentity.ACTION_HANDS),
@@ -1045,9 +1187,6 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
     if settings.sql_storage_enabled:
         invocation_store = PostgresInvocationStore(settings.resolved_database_url)
         tool_registry_store = PostgresToolRegistryStore(settings.resolved_database_url)
-        capability_catalog_store = PostgresCapabilityCatalogStore(
-            settings.resolved_database_url
-        )
     closeables = (
         *remote_clients,
         artifacts,
@@ -1058,6 +1197,11 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
             if isinstance(capability_catalog_store, PostgresCapabilityCatalogStore)
             else ()
         ),
+        *(
+            (mcp_registry_store,)
+            if isinstance(mcp_registry_store, PostgresMcpServerRegistryStore)
+            else ()
+        ),
     )
     app = _base_service_app(
         spec,
@@ -1065,112 +1209,51 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
         closeables=closeables,
     )
     capability_catalog = CapabilityCatalog(capability_catalog_store)
-    resources = HandsResourceRegistry()
+    skill_registry = _skill_registry_service(settings)
+    resources = skill_registry.resources or HandsResourceRegistry()
     resource_gateway = ManagedResourceGateway(
         resources,
         artifacts=artifacts,
         policy=policy if isinstance(policy, RemotePolicyClient) else None,
     )
-    configured_signing_key = (
-        settings.model_skill_signing_key.get_secret_value().encode()
-        if settings.model_skill_signing_key is not None
-        else None
-    )
-    model_skill_signer = HmacSkillSignatureVerifier(
-        {
-            "ct-model": (
-                configured_signing_key or b"auraclaw-development-model-skill-key"
-            ),
-            "platform": (
-                configured_signing_key or b"auraclaw-development-platform-skill-key"
-            ),
-        }
-    )
-    skill_registry = SkillPackageRegistry(
-        artifacts=artifacts,
-        signature_verifier=model_skill_signer,
-        resources=resources,
-    )
-    model_skill_publisher: ModelSkillPublisher | None = None
-    if settings.model_skill_source_configured:
-        mysql_password = settings.model_skill_mysql_password
-        if (
-            settings.model_skill_mysql_host is None
-            or settings.model_skill_mysql_user is None
-            or mysql_password is None
-            or settings.model_skill_mysql_database is None
-        ):
-            raise ValueError("Model Skill MySQL source configuration is incomplete")
-        model_skill_publisher = ModelSkillPublisher(
-            MySqlModelSkillSource(
-                host=settings.model_skill_mysql_host,
-                port=settings.model_skill_mysql_port,
-                user=settings.model_skill_mysql_user,
-                password=mysql_password.get_secret_value(),
-                database=settings.model_skill_mysql_database,
-                tenant_id=settings.model_skill_source_tenant_id,
-                include_drafts=settings.model_skill_include_drafts,
-            ),
-            ModelSkillCompiler(model_skill_signer),
-            skill_registry,
-            target_tenant_id=settings.model_skill_target_tenant_id,
-        )
     skill_resolver = SkillResolver(
         skill_registry,
         capability_catalog_store,
         policy if isinstance(policy, RemotePolicyClient) else None,
     )
-    price_insight_source: PriceInsightSource | None = None
-    resolved_price_source = settings.resolved_price_insight_source
-    if resolved_price_source == "fixture":
-        price_insight_source = JsonPriceInsightSource(
-            PRICE_INSIGHT_SKILL_DIR / "tests" / "golden-data.json"
-        )
-    elif resolved_price_source == "mysql":
-        mysql_password = settings.price_insight_mysql_password
-        if (
-            not settings.price_insight_mysql_configured
-            or settings.price_insight_mysql_host is None
-            or settings.price_insight_mysql_user is None
-            or mysql_password is None
-            or settings.price_insight_mysql_database is None
-        ):
-            raise ValueError("Price Insight MySQL source configuration is incomplete")
-        price_insight_source = MySqlPriceInsightSource(
-            host=settings.price_insight_mysql_host,
-            port=settings.price_insight_mysql_port,
-            user=settings.price_insight_mysql_user,
-            password=mysql_password.get_secret_value(),
-            database=settings.price_insight_mysql_database,
-        )
-    if price_insight_source is not None:
-        for resource in price_insight_resources(
-            settings.price_insight_target_tenant_id
-        ):
-            resources.register_resource(resource)
-    price_tools = price_insight_tools() if price_insight_source is not None else ()
     registry = ToolRegistry(
         (
             capability_search_tool(),
             capability_load_tool(),
             skill_resolve_tool(),
-            *price_tools,
         )
     )
 
     async def initialize_registry() -> None:
         if tool_registry_store is not None:
             await tool_registry_store.load_into(registry)
-        for server in settings.mcp_egress_servers:
-            await capability_catalog.register_server(server)
-            if credential_proxy is not None and isinstance(policy, RemotePolicyClient):
-                app.state.capability_connectors[server.server_id] = (
-                    ManagedMcpConnector(
-                        server,
-                        credentials=credential_proxy,
-                        policy=policy,
-                    )
+        if credential_proxy is not None and isinstance(policy, RemotePolicyClient):
+            def _mcp_connector(server: object) -> ManagedMcpConnector:
+                from auraclaw.contracts.capabilities import McpServerDefinition
+
+                assert isinstance(server, McpServerDefinition)
+                return ManagedMcpConnector(
+                    server,
+                    credentials=credential_proxy,
+                    policy=policy,
                 )
+
+            manager = McpConnectionManager(
+                registry=mcp_registry,
+                connectors=app.state.capability_connectors,
+                factory=_mcp_connector,  # type: ignore[arg-type]
+                catalog=capability_catalog,
+                reconciler=app.state.catalog_reconciler,
+                egress=mcp_egress_client,
+            )
+            mcp_registry.bind_runtime(manager)
+            app.state.mcp_connection_manager = manager
+            await manager.restore()
         for java_server in settings.java_api_servers:
             catalog_server = catalog_server_definition(java_server)
             await capability_catalog.register_server(catalog_server)
@@ -1182,54 +1265,10 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
                         policy=policy,
                     )
                 )
-        if price_insight_source is not None:
-            tenant_id = settings.price_insight_target_tenant_id
-            await capability_catalog.register_server(
-                McpServerDefinition(
-                    server_id=PRICE_INSIGHT_SERVER_ID,
-                    tenant_id=tenant_id,
-                    title="AuraClaw Procurement Price Insight",
-                    endpoint="https://price-insight.internal/mcp",
-                    trust_level=CapabilityTrustLevel.PLATFORM,
-                    allowed_tool_prefixes=(
-                        "procurement.price.",
-                        "procurement.price_insight.",
-                    ),
-                    allowed_resource_schemes=("repo",),
-                    status=CapabilityStatus.ACTIVE,
-                    enabled=True,
-                )
-            )
-            await capability_catalog.replace_server_capabilities(
-                PRICE_INSIGHT_SERVER_ID,
-                (
-                    *price_insight_tool_descriptors(
-                        server_id=PRICE_INSIGHT_SERVER_ID,
-                        tenant_id=tenant_id,
-                    ),
-                    *price_insight_resource_descriptors(tenant_id),
-                ),
-            )
-            for package in signed_price_insight_dependency_packages(
-                model_skill_signer
-            ):
-                await skill_registry.publish(tenant_id, package)
-            if model_skill_publisher is None:
-                await skill_registry.publish(
-                    tenant_id,
-                    signed_price_insight_package(model_skill_signer),
-                )
-        if model_skill_publisher is not None:
-            await model_skill_publisher.reconcile()
 
     app.state.capability_connectors = {}
     app.state.catalog_reconciler = None
     app.state.initialize = initialize_registry
-    price_executor = (
-        PriceInsightToolExecutor(PriceInsightService(price_insight_source))
-        if price_insight_source is not None
-        else None
-    )
     routed_hands = RoutedHandsExecutor(
         LocalHandsService(workspace_root=Path.cwd()),
         {
@@ -1242,11 +1281,6 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
                 skills=skill_registry,
             ),
             SKILL_RESOLVE_TOOL_NAME: SkillResolveExecutor(skill_resolver),
-            **(
-                {tool.name: price_executor for tool in price_tools}
-                if price_executor is not None
-                else {}
-            ),
         },
     )
     gateway = ToolGateway(
@@ -1260,13 +1294,11 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
         approval_controller=policy if isinstance(policy, RemotePolicyClient) else None,
     )
     token = (
-        settings.runtime_workload_token.get_secret_value()
-        if settings.runtime_workload_token is not None
-        else secrets.token_urlsafe(32)
+        _agent_runtime_token(settings) or ""
     )
     key = _lease_signing_key(settings)
     authenticator: HandsWorkloadAuthenticator = SignedLeaseHandsAuthenticator(
-        {token: "*"},
+        {token: "*"} if token else {},
         verifier=LeaseAssertionVerifier(
             {"development": key},
             ledger=InMemoryFencingTokenLedger(),
@@ -1286,20 +1318,7 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
     app.state.capability_catalog = capability_catalog
     app.state.resource_gateway = resource_gateway
     app.state.skill_registry = skill_registry
-    app.state.model_skill_publisher = model_skill_publisher
     periodic_jobs: list[tuple[str, float, Callable[[], Awaitable[int | None]]]] = []
-    if model_skill_publisher is not None:
-
-        async def reconcile_model_skills() -> int:
-            return len(await model_skill_publisher.reconcile())
-
-        periodic_jobs.append(
-            (
-                "model-skills",
-                settings.model_skill_reconcile_interval_seconds,
-                reconcile_model_skills,
-            )
-        )
     if credential_proxy is not None and isinstance(policy, RemotePolicyClient):
         reconciler = CapabilityCatalogReconciler(
             catalog=capability_catalog,
@@ -1308,8 +1327,15 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
             resource_cache=resource_gateway,
             tool_registry=registry,
             hands_router=routed_hands,
+            trust_remote_tool_annotations=settings.mcp_trust_remote_tool_annotations,
+        )
+        skill_reconciler = SkillPackageReconciler(
+            store=capability_catalog_store,
+            connectors=app.state.capability_connectors,
+            registry=skill_registry,
         )
         app.state.catalog_reconciler = reconciler
+        app.state.skill_reconciler = skill_reconciler
 
         async def initialize_remote_catalog() -> None:
             await initialize_registry()
@@ -1317,14 +1343,39 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
                 setter = getattr(connector, "set_notification_handler", None)
                 if setter is not None:
                     setter(reconciler.handle_notification)
-            await reconciler.reconcile_all()
+            expected = len(app.state.capability_connectors)
+            for attempt in range(20):
+                active = await reconciler.reconcile_all()
+                await skill_reconciler.reconcile_all()
+                if expected == 0 or active >= expected:
+                    break
+                if attempt < 19:
+                    await asyncio.sleep(0.5)
+
+        async def reconcile_catalog_and_skills() -> int:
+            active = await reconciler.reconcile_all()
+            await skill_reconciler.reconcile_all()
+            return active
+
+        async def reconcile_mcp_revisions() -> int:
+            manager = getattr(app.state, "mcp_connection_manager", None)
+            if manager is None:
+                return 0
+            return int(await manager.reconcile_loaded())
 
         app.state.initialize = initialize_remote_catalog
         periodic_jobs.append(
             (
                 "capability-catalog",
                 settings.mcp_reconcile_interval_seconds,
-                reconciler.reconcile_all,
+                reconcile_catalog_and_skills,
+            )
+        )
+        periodic_jobs.append(
+            (
+                "mcp-revision",
+                settings.mcp_revision_reconcile_interval_seconds,
+                reconcile_mcp_revisions,
             )
         )
     if periodic_jobs:
@@ -1373,6 +1424,22 @@ def _hands_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
         app.state.worker_interval = min(
             interval for _name, interval, _run in periodic_jobs
         )
+    mcp_identities = _configured_identities(
+        settings,
+        (
+            ServiceIdentity.TASK_API,
+            ServiceIdentity.CREDENTIAL_PROXY,
+            ServiceIdentity.ACTION_HANDS,
+        ),
+    )
+    app.mount(
+        "/internal/v1/mcp-registry",
+        create_contract_app(
+            "action-hands-mcp-registry",
+            mcp_registry_routes(McpRegistryInternalService(mcp_registry)),
+            workload_identities=mcp_identities or None,
+        ),
+    )
     app.mount("/", hands_http_app)
     return app
 
@@ -1431,10 +1498,6 @@ def _credential_proxy_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
             bearer_token=token,
             service_identity=ServiceIdentity.CREDENTIAL_PROXY,
         )
-    mcp_adapters = {
-        f"mcp:{server.server_id}": ManagedMcpEgressAdapter(server)
-        for server in settings.mcp_egress_servers
-    }
     java_api_adapters = {
         f"java-api:{server.server_id}": ManagedJavaApiEgressAdapter(server)
         for server in settings.java_api_servers
@@ -1443,7 +1506,6 @@ def _credential_proxy_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
         *((registry,) if registry is not None else ()),
         *((vault,) if isinstance(vault, HashiCorpVault) else ()),
         *((policy,) if policy is not None else ()),
-        *mcp_adapters.values(),
         *java_api_adapters.values(),
     )
     app = _base_service_app(
@@ -1455,18 +1517,37 @@ def _credential_proxy_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
         ),
     )
     proxy = CredentialProxy(vault, registry=registry)
-    _seed_managed_connector_credentials(proxy, settings)
+    adapters: dict[str, Any] = {
+        "webhook": ManagedWebhookCredentialAdapter(
+            allowed_hosts=settings.allowed_credential_egress_hosts
+        ),
+        **java_api_adapters,
+    }
+    mcp_egress = McpEgressManager(adapters=adapters, proxy=proxy)
     service = CredentialProxyInternalService(
         proxy,
-        adapters={
-            "webhook": ManagedWebhookCredentialAdapter(
-                allowed_hosts=settings.allowed_credential_egress_hosts
-            ),
-            **mcp_adapters,
-            **java_api_adapters,
-        },
+        adapters=adapters,
         policy=policy,
+        mcp_egress=mcp_egress,
     )
+    _seed_managed_connector_credentials(proxy, settings)
+
+    async def restore_mcp_egress() -> None:
+        snapshot = await _hands_mcp_snapshot(settings)
+        if snapshot is None:
+            return
+        await mcp_egress.restore(snapshot)
+
+    async def reconcile_mcp_egress() -> int:
+        snapshot = await _hands_mcp_snapshot(settings)
+        if snapshot is None:
+            return 0
+        return await mcp_egress.reconcile(snapshot)
+
+    app.state.initialize = restore_mcp_egress
+    app.state.tick = reconcile_mcp_egress
+    app.state.worker = True
+    app.state.worker_interval = settings.mcp_revision_reconcile_interval_seconds
     contract_app = create_contract_app(
         "credential-proxy",
         credential_routes(service),
@@ -1484,24 +1565,7 @@ def _credential_proxy_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
 
 
 def _artifact_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
-    access_key = (
-        settings.seaweedfs_access_key.get_secret_value()
-        if settings.seaweedfs_access_key is not None
-        else "development-access-key"
-    )
-    secret_key = (
-        settings.seaweedfs_secret_key.get_secret_value()
-        if settings.seaweedfs_secret_key is not None
-        else "development-secret-key"
-    )
-    presigner = SeaweedFSS3Presigner(
-        settings.seaweedfs_s3_endpoint,
-        access_key=access_key,
-        secret_key=secret_key,
-        bucket=settings.seaweedfs_bucket,
-        region=settings.seaweedfs_region,
-        path_style=settings.seaweedfs_path_style,
-    )
+    storage = build_object_storage(settings)
     repository = (
         PostgresArtifactRepository(settings.resolved_database_url)
         if settings.sql_storage_enabled
@@ -1512,8 +1576,6 @@ def _artifact_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
         if settings.sql_storage_enabled
         else None
     )
-    verifier = SeaweedFSObjectVerifier(presigner) if settings.seaweedfs_enabled else None
-    multipart = SeaweedFSMultipartClient(presigner) if settings.seaweedfs_enabled else None
     policy: RemotePolicyClient | None = None
     token = settings.workload_token_value(ServiceIdentity.ARTIFACT_SERVICE.value)
     if token:
@@ -1525,29 +1587,30 @@ def _artifact_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
     closeables: tuple[Any, ...] = (
         *((repository,) if repository is not None else ()),
         *((admin_store,) if admin_store is not None else ()),
-        *((verifier,) if verifier is not None else ()),
-        *((multipart,) if multipart is not None else ()),
+        *object_storage_closeables(storage),
         *((policy,) if policy is not None else ()),
     )
     app = _base_service_app(
         spec,
         settings,
         closeables=closeables,
-        readiness_probe=verifier.readiness if verifier is not None else None,
+        readiness_probe=(
+            storage.verifier.readiness if storage.verifier is not None else None
+        ),
     )
     service = ArtifactInternalService(
-        presigner,
+        storage.presigner,
         repository=repository,
-        object_verifier=verifier,
+        object_verifier=storage.verifier,
         policy=policy,
-        multipart=multipart,
+        multipart=storage.multipart,
         multipart_threshold=settings.artifact_multipart_threshold,
         multipart_part_size=settings.artifact_multipart_part_size,
     )
 
     async def artifact_status(parameters: dict[str, Any]) -> dict[str, Any]:
         del parameters
-        return {"storage": "seaweedfs", "metadata_owner": "artifact-service"}
+        return {"storage": storage.backend, "metadata_owner": "artifact-service"}
 
     async def artifact_retention(parameters: dict[str, Any]) -> dict[str, Any]:
         del parameters
@@ -1805,8 +1868,8 @@ def _model_gateway_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
 
 
 def _runtime_app(spec: ServiceSpec, settings: Settings) -> FastAPI:
-    token = settings.workload_token_value(ServiceIdentity.AGENT_RUNTIME.value)
-    bearer_token = token or secrets.token_urlsafe(32)
+    token = _agent_runtime_token(settings) or ""
+    bearer_token = token
     runtime_id, node_id = _runtime_instance_identity(settings)
     control = RemoteRuntimeControlClient(
         settings.control_base_url,
@@ -1874,7 +1937,7 @@ def create_service_app(
     if spec.name == "task-api":
         return _task_api_app(selected)
     if spec.name == "streaming-gateway":
-        return create_app(profile="streaming-gateway")
+        return _streaming_app(selected)
     if spec.name == "session":
         return _session_app(spec, selected)
     if spec.name == "action-hands":

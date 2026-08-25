@@ -30,17 +30,21 @@ class ManagedRemoteMcpTransport:
             not server.enabled
             or server.status
             not in {CapabilityStatus.ACTIVE, CapabilityStatus.DEGRADED}
-            or server.credential_ref is None
         ):
             raise ValueError("remote MCP server is not callable")
+        if server.resolved_auth_strategy is McpAuthStrategy.NONE:
+            credential_ref = server.credential_ref or f"mcp:none:{server.server_id}"
+        else:
+            if server.credential_ref is None:
+                raise ValueError("remote MCP server is not callable")
+            credential_ref = server.credential_ref
         if (
             server.resolved_auth_strategy is McpAuthStrategy.OAUTH_CLIENT_CREDENTIALS
             and server.oauth is None
         ):
             raise ValueError("remote MCP server is not callable")
         self._server = server
-        self._credential_ref = server.credential_ref
-        assert self._credential_ref is not None
+        self._credential_ref = credential_ref
         self._credentials = credentials
         self._policy = policy
         self._notification_handler: (
@@ -71,6 +75,7 @@ class ManagedRemoteMcpTransport:
         if isinstance(arguments, dict):
             declared_tenant = arguments.get("tenant_id")
             declared_user = arguments.get("user_id")
+            declared_dept = arguments.get("dept_id")
             if (
                 declared_tenant is not None
                 and str(declared_tenant) != trusted_context.tenant_id
@@ -82,10 +87,17 @@ class ManagedRemoteMcpTransport:
                 and str(declared_user) != trusted_context.user_id
             ):
                 raise PolicyDeniedError("tool argument user_id is not an authorization source")
+            if (
+                declared_dept is not None
+                and trusted_context.dept_id is not None
+                and str(declared_dept) != trusted_context.dept_id
+            ):
+                raise PolicyDeniedError("tool argument dept_id is not an authorization source")
         request_payload = request.model_dump(mode="json")
         identity = {
             "tenant_id": trusted_context.tenant_id,
             "user_id": trusted_context.user_id,
+            "dept_id": trusted_context.dept_id,
             "session_id": trusted_context.session_id,
             "run_id": trusted_context.run_id,
         }
@@ -130,6 +142,7 @@ class ManagedRemoteMcpTransport:
             request={
                 **request_payload,
                 "server_id": self._server.server_id,
+                "config_revision": self._server.config_revision,
                 "_auraclaw_identity": identity,
             },
             policy_decision_id=evaluation.decision_id,

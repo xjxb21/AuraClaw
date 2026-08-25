@@ -7,6 +7,10 @@ from typing import Any
 
 import uvicorn
 
+from auraclaw.composition.local_ingress import (
+    create_local_ingress_app,
+    loopback_connect_host,
+)
 from auraclaw.composition.services import SERVICE_BY_COMMAND, create_service_app, service_spec
 from auraclaw.config import Settings, get_settings
 from auraclaw.contracts.internal import ServiceIdentity
@@ -159,7 +163,10 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
     serve = subcommands.add_parser(
         "serve",
-        help="run all 12 production service entrypoints on their configured ports",
+        help=(
+            "run the production-isomorphic 12-process topology plus a local ingress "
+            "that splits /v1/streams/ to Streaming Gateway"
+        ),
     )
     serve.add_argument("--host")
     projection = subcommands.add_parser("projection")
@@ -186,7 +193,10 @@ def build_parser() -> argparse.ArgumentParser:
     for command in SERVICE_BY_COMMAND:
         if command == "projection":
             continue
-        service = subcommands.add_parser(command)
+        service = subcommands.add_parser(
+            command,
+            help="production process entrypoint (compose / auraclaw serve)",
+        )
         service.add_argument("action", choices=("run",))
         service.add_argument("--host")
         service.add_argument("--port", type=int)
@@ -209,7 +219,26 @@ def _run_service_process(
     uvicorn.run(app, host=host, port=port, log_level=log_level)
 
 
+def _run_ingress_process(
+    host: str,
+    port: int,
+    task_api_base_url: str,
+    streaming_base_url: str,
+    log_level: str,
+) -> None:
+    app = create_local_ingress_app(
+        task_api_base_url=task_api_base_url,
+        streaming_base_url=streaming_base_url,
+    )
+    uvicorn.run(app, host=host, port=port, log_level=log_level)
+
+
 def _serve_topology(settings: Settings, *, host: str) -> None:
+    if not settings.sql_storage_enabled and not settings.kafka_enabled:
+        raise ValueError(
+            "auraclaw serve requires shared SQL storage or Kafka for cross-process "
+            "runtime event streaming"
+        )
     processes: list[multiprocessing.Process] = []
     for command in SERVICE_BY_COMMAND:
         spec = service_spec(command, settings)
@@ -233,6 +262,21 @@ def _serve_topology(settings: Settings, *, host: str) -> None:
         )
         process.start()
         processes.append(process)
+    if settings.ingress_enabled:
+        connect_host = loopback_connect_host(host)
+        ingress = multiprocessing.Process(
+            target=_run_ingress_process,
+            args=(
+                host,
+                settings.ingress_port,
+                f"http://{connect_host}:{settings.task_api_port}",
+                f"http://{connect_host}:{settings.streaming_port}",
+                settings.log_level.lower(),
+            ),
+            name="local-ingress",
+        )
+        ingress.start()
+        processes.append(ingress)
     try:
         for process in processes:
             process.join()
@@ -264,6 +308,11 @@ def main(
     if args.command == "projection":
         if args.action == "relay" and args.watch:
             settings = get_settings()
+            if settings.deployment_profile != "production":
+                raise SystemExit(
+                    "Projection worker watch mode is reserved for production "
+                    "compose. Use `auraclaw serve` for local development."
+                )
             spec = service_spec("projection", settings)
             interval = (
                 args.interval
@@ -321,6 +370,11 @@ def main(
         return
     if args.command in SERVICE_BY_COMMAND and args.command != "projection":
         settings = get_settings()
+        if settings.deployment_profile != "production":
+            raise SystemExit(
+                "Single-process service entrypoints are reserved for production "
+                "compose. Use `auraclaw serve` for local development."
+            )
         spec = service_spec(args.command, settings)
         uvicorn_runner(
             create_service_app(args.command, settings),
