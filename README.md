@@ -87,8 +87,7 @@ api → application → domain → contracts
 深入设计见 [Managed Agent 系统架构总览](docs/Managed%20Agent%20系统架构/00%20Managed%20Agent%20系统架构总览.md)、
 [开发方案与实施计划](docs/Managed%20Agent%20开发方案与实施计划.md) 与
 [架构代码梳理](docs/Managed%20Agent%20架构代码梳理.md)。MCP 数据、工具和 Skill 接入见
-[M9 MCP Runtime 实施与运维](docs/M9%20MCP%20Runtime%20实施与运维.md)。扩展能力登记 AuraMCP 见
-[AuraMCP 接入](docs/AuraMCP%20接入.md)。
+[M9 MCP Runtime 实施与运维](docs/M9%20MCP%20Runtime%20实施与运维.md)。
 
 ## 架构概览
 
@@ -112,7 +111,7 @@ Canonical terminal event -> Transactional Outbox -> Durable Delivery Job
                          -> Webhook/Parent Session -> Retry/Circuit/DLQ -> Query View
 All components -> Trace/Metrics/Structured Logs/Audit -> Session Timeline + Alerts
 Operations -> Retention/Artifact GC/Poison + Delivery DLQ Redrive -> Release Gate
-External clients -> Streaming Chat / Query API / Authorized SSE / Timeline / Metrics
+Browser SPA -> Streaming Chat + Query/Result Lab + Authorized SSE + Timeline + Metrics
 ```
 
 Agent Runtime 不读取模型 Provider Secret，也不直接修改 Session 状态。完整模型输出进入
@@ -132,88 +131,78 @@ Session 只接收 `artifact_ref`。
 发布带证据的三态决策，不能覆盖 Worker Artifact。Join 生成的 Root Result 保存 Child Result、
 Review Evidence 和 Artifact lineage。
 
-## 部署模式
-
-AuraClaw 只有两种运行拓扑，本地与生产使用同一套 12 服务边界：
-
-| 模式 | 启动方式 | 适用场景 |
-|------|----------|----------|
-| **本地开发** | `uv run auraclaw serve` | 本机 12 进程 + Ingress `:8080` |
-| **预生产 / 生产** | `docker compose`（各容器 `auraclaw <service> run`） | 服务器测试与生产 |
-
-已移除 **Combined 单进程**（`uvicorn auraclaw.main:app` 内嵌 Task API + Runtime）和
-**本地单入口调试**（VS Code 单独 attach 某一个服务）。`auraclaw api run` 等命令仅作为
-Compose 容器入口保留；在 `deployment_profile=development` 下 CLI 会拒绝单独 `run`，请始终用
-`auraclaw serve` 做本地联调。
-
 ## 配置文件
 
-仓库提交三份环境模板，真实密钥文件被 gitignore：
+仓库只提交三份环境模板，真实密钥文件被 gitignore：
 
 | 模板 | 复制为 | 用途 |
 |------|--------|------|
-| `.env.dev.example` | `.env.dev` | 本地开发：`uv run auraclaw serve` / VS Code，非 Docker。 |
-| `.env.test.example` | `.env.test` | 服务器测试：`docker compose` 部署（如 DEV_SERVICE `10.244.16.131`）。 |
-| `.env.prod.example` | `.env.prod` | 服务器生产：Compose 发布（当前与 test 一致）。 |
-
-`.env.dev` 与 `.env.test` 除大模型 `AURACLAW_MODEL_API_KEY` / `AURACLAW_MODEL_BASE_URL` 及本地运行拓扑（`HOST`、12 入口 URL、`NO_PROXY` 等）外保持一致。开发机共用 Vault `http://10.244.16.132:8200`（KV v2 mount `secret`），`credential_ref` 只填引用。`AURACLAW_HOST=0.0.0.0` 让局域网 AuraX 访问 Ingress `:8080`；12 个内部入口 URL 仍指向 `127.0.0.1`。`NO_PROXY` 仅用于本机开发绕过 HTTP 代理，测试 / 生产 Compose 不要配置。
-
-### 服务身份（Workload Token）
-
-各内部服务通过 Bearer Token 互相识别。本地 `auraclaw serve` 与 Compose 应配置**同一组**
-固定随机串（不要用运行时随机值），至少包括：
-
-```text
-AURACLAW_TASK_API_WORKLOAD_TOKEN
-AURACLAW_PROJECTION_WORKLOAD_TOKEN
-AURACLAW_ORCHESTRATOR_WORKLOAD_TOKEN
-AURACLAW_RUNTIME_WORKLOAD_TOKEN      # agent-runtime ↔ action-hands 必须相同
-AURACLAW_MODEL_GATEWAY_WORKLOAD_TOKEN
-AURACLAW_ACTION_HANDS_WORKLOAD_TOKEN
-AURACLAW_POLICY_WORKLOAD_TOKEN
-AURACLAW_CREDENTIAL_PROXY_WORKLOAD_TOKEN
-AURACLAW_ARTIFACT_SERVICE_WORKLOAD_TOKEN
-AURACLAW_DELIVERY_WORKLOAD_TOKEN
-AURACLAW_STREAMING_GATEWAY_WORKLOAD_TOKEN
-AURACLAW_LEASE_SIGNING_KEY             # ≥32 字节；Session/Orchestrator/Hands 租约签名
-AURACLAW_CHAINTOWER_WORKLOAD_TOKEN     # Task API 对外身份（智问等客户端）
-```
-
-生产 Compose 可通过 `scripts/materialize_compose_secrets.py` 从 `.env.prod` 生成
-`.runtime/compose-secrets/` 下的 secret 文件。`agent-runtime` 调用 `action-hands` 时携带
-`AURACLAW_RUNTIME_WORKLOAD_TOKEN`；Hands 用同值校验并在 Lease Assertion 通过后才执行 Tool。
+| `.env.example` | — | 变量目录。不要直接当运行配置。 |
+| `.env.debug.example` | `.env.debug` | 本地 12 入口 debug，内存存储，开箱即用。 |
+| `.env.production.example` | `.env.production` | Compose 生产发布。填镜像 digest、库密码、模型、Vault、SeaweedFS。 |
 
 ## 本地启动
 
-本地开发只走与生产同构的 12 进程拓扑：`auraclaw serve` 拉起全部独立入口（端口 8000–8011），
-并在 `:8080` 提供 Ingress（`/v1/streams/*` → Streaming Gateway `:8010`，其余 → Task API `:8000`）。
-Java 智问代理应指向 `http://127.0.0.1:8080`。
-
-不要使用单进程 Combined 应用或单独 `auraclaw <service> run` 做本地调试。后者仅作为 Compose
-容器的进程入口。VS Code 使用 **AuraClaw serve** 调试配置（读取 `.env.dev`）。
-
-多进程 SSE 必须使用共享 SQL 或 Kafka；纯内存事件后端会在启动前明确拒绝：
+`auraclaw serve` 会按生产拓扑拉起全部 12 个独立入口（端口 8000–8011），并额外在
+`:8080` 提供本地 Ingress：`/v1/streams/*` 去 Streaming Gateway `:8010`，其余去
+Task API `:8000`。Java 智问代理应指向 `http://127.0.0.1:8080`，不要直连 8000。
+装配与生产相同，差异只来自环境配置：
 
 ```bash
 uv sync --extra dev
-cp .env.dev.example .env.dev
+cp .env.debug.example .env.debug
 uv run auraclaw serve
 ```
 
-每个入口都有 `/health/live` 和 `/health/ready`。Task API 不暴露 `/v1/streams/*`，Streaming
-Gateway 不暴露 Task Command。
+也可单独启动某一个入口：
 
-服务器测试 / 生产使用 Compose 拉起同一组 12 服务，但现在拆成各自独立模板：
-
-```bash
-# 服务器测试
-docker compose --env-file .env.test -f compose.test.yml up -d --wait
-
-# 生产
-docker compose --env-file .env.prod -f compose.prod.yml up -d --wait
+```text
+auraclaw api run                  auraclaw session run
+auraclaw projection relay --watch
+auraclaw orchestrator run         auraclaw runtime run
+auraclaw model-gateway run        auraclaw hands run
+auraclaw policy run               auraclaw credential-proxy run
+auraclaw artifact run             auraclaw streaming run
+auraclaw delivery run
 ```
 
-Compose 不启动 SeaweedFS，而是使用 `.env.test` / `.env.prod` 中已部署的外部 S3 endpoint。若 SeaweedFS、
+每个入口都有 `/health/live` 和 `/health/ready`；Worker 在 Uvicorn 收到 SIGTERM 后停止接收新循环、
+等待当前循环退出。Task API 不暴露 `/v1/streams/*`，Streaming Gateway 不暴露 Task Command。
+
+### Model Skill 预览闭环
+
+`action-hands` 使用环境里的 `MYSQL_DB_*` 在一致性只读快照中加载 `ct_model_*`，把每个模型版本
+编译成签名 Skill Package，并通过 `skill://ct-model/...` MCP Resource 提供给 Runtime。启动时先
+完成一次全量对账，此后按配置间隔继续扫描；不再符合读取条件的版本会从 MCP Resource 撤销。
+当前草稿会映射为 `1.0.0-draft.<version_id>`，只用于配置解释，不执行权威计算或业务回写。
+
+通过以下开关控制：
+
+```text
+AURACLAW_MODEL_SKILL_SOURCE_ENABLED
+AURACLAW_MODEL_SKILL_SOURCE_TENANT_ID
+AURACLAW_MODEL_SKILL_TARGET_TENANT_ID
+AURACLAW_MODEL_SKILL_INCLUDE_DRAFTS
+AURACLAW_MODEL_SKILL_RECONCILE_INTERVAL_SECONDS
+AURACLAW_MODEL_SKILL_SIGNING_KEY
+```
+
+当前同步机制是周期全量对账，不依赖 CDC；相同 source/package digest 幂等复用，版本内容冲突
+不会原地覆盖。后续 Outbox 仅作为低延迟提示，完整扫描仍作为正确性兜底。
+
+完整配置位于 Skill 的 `references/config.json`。生产环境应关闭 Draft 读取，并在完成快照发布、
+持久 Registry、确定性模型 Tool 和凭证治理后再启用。设计与后续边界见
+[Model Skill 转换服务](docs/Managed%20Agent%20系统架构/24%20Model%20Skill%20转换服务.md)。
+
+本地启动 12 服务拓扑：
+
+```bash
+docker compose -f compose.services.yml up --build
+# 同时启动可选 Ingress（监听 8080）
+docker compose -f compose.services.yml --profile ingress up --build
+```
+
+Compose 不启动 SeaweedFS，而是使用 `.env` 中已部署的外部 S3 endpoint。若 SeaweedFS、
 PostgreSQL 或 Kafka 运行在 Docker Host，请把相应 host 配置为 `host.docker.internal`；生产环境
 使用服务 DNS、Secret/Workload 注入，不在 Compose 文件中写入密钥。Ingress 将
 `/v1/streams/*` 路由到 `streaming-gateway:8010`，其余路径路由到 `task-api:8000`。
@@ -223,12 +212,12 @@ PostgreSQL 或 Kafka 运行在 Docker Host，请把相应 host 配置为 `host.d
 ```bash
 docker network create auraclaw-platform # 已存在时跳过
 uv run python scripts/materialize_compose_secrets.py \
-  --env-file .env.prod --output-dir .runtime/compose-secrets
-uv run python scripts/compose_preflight.py --env-file .env.prod
-docker compose --env-file .env.prod -f compose.prod.yml \
+  --env-file .env.production --output-dir .runtime/compose-secrets
+uv run python scripts/compose_preflight.py --env-file .env.production
+docker compose --env-file .env.production -f compose.production.yml \
   --profile migrate run --rm migrate migrate up \
   --target 0016 --directory /app/migrations
-docker compose --env-file .env.prod -f compose.prod.yml up -d --wait
+docker compose --env-file .env.production -f compose.production.yml up -d --wait
 ```
 
 副本、资源、Secret 文件挂载、蓝绿发布、回滚、扩缩容与 kill test 见
@@ -239,33 +228,43 @@ Artifact 和 Admin 写路径不再共享跨域 Store。Action Hands 以 MCP Serv
 Invocation Store、Policy、Credential Proxy 和 Artifact Service 执行；Runtime 只持有 MCP Client。
 SeaweedFS 管理密钥只注入 Artifact Service，Vault Token 只注入 Credential Proxy，Runtime 位于
 无 platform egress 的内部 Docker network。本地 `auraclaw serve` 与生产 Compose 使用同一组
-12 个入口；环境差异只来自 `.env.dev` / `.env.test` / `.env.prod` 提供的存储、事件总线、模型端点和 CORS
-等资源。CLI 与 VS Code debug 都读取 `.env.dev`（可用 `AURACLAW_ENV_FILE` 覆盖）。服务器测试 / 生产通过
-Docker Compose 读取 `.env.test` / `.env.prod`。
+12 个入口；环境差异只来自 `.env.debug` / `.env.production` 提供的存储、事件总线、模型端点和 CORS
+等资源。CLI 与 VS Code debug 都读取 `.env.debug`（可用 `AURACLAW_ENV_FILE` 覆盖）。
 
-生产发布复制 `.env.prod.example` 为 gitignored 的 `.env.prod`，填入不可变镜像和密钥后再跑
+生产发布复制 `.env.production.example` 为 gitignored 的 `.env.production`，填入不可变镜像和密钥后再跑
 `scripts/materialize_compose_secrets.py` 与 `scripts/compose_preflight.py`。
 
 Harness 的 delta 经 Runtime Event Producer SDK 排序、校验和脱敏后进入 Kafka，再由
-Streaming Ingestor 写入 Replay Bus 供 SSE 消费；Kafka 不可用只会令 Streaming Gateway
-`/health/ready` 降级，不会阻止完整模型输出与 `run.completed` 写入 Canonical Event。
+Streaming Ingestor 写入 Replay Bus 供 SSE 消费；Kafka 不可用只会令 `/health/ready` 降级，
+不会阻止完整模型输出与 `run.completed` 写入 Canonical Event。就绪响应分别报告 Model Gateway、
+producer、ingestor、总线以及统一 Runtime Worker 状态，且不会回显 API Key。
 
-远程容器运维：
+另开终端启动独立前端工作台：
+
+```bash
+cd frontend
+npm ci
+npm run dev:remote   # 默认：联调远程容器栈（.host.env → 10.244.16.131:8080）
+# npm run dev        # 仅特殊需要时再配本地后端
+```
+
+Cursor Debug 默认用 **AuraClaw: Frontend → remote containers (10.244.16.131)**；远程容器运维用 Tasks：`Remote containers: ps/logs/restart/health`，或：
 
 ```bash
 ./scripts/remote_compose.sh ps
 ./scripts/remote_compose.sh logs -f task-api
 ```
 
-AuraClaw 是纯 Python 后端。外部客户端（如智问 UI）只调用公开 HTTP/SSE API；跨域部署通过
-`AURACLAW_CORS_ALLOW_ORIGINS` 或反向代理允许所需 Origin、Methods 和 Headers。
+前端只调用公开 HTTP/SSE API，提供“智能问答”Streaming 测试页和“创建任务”Query / Result
+测试页，并支持 Session 控制、父子 Session、审批响应、断线回放、Timeline、Metrics 和脱敏请求历史。默认 API 地址为当前站点的 `/auraclaw-api`（由开发服务器代理到后端），也可在页面运行时
+配置。跨域部署需要后端或反向代理明确允许所需 Origin、Methods 和 Headers；详细说明见
+[frontend/README.md](frontend/README.md)。
 
 服务启动后可访问：
 
 - `GET /health/live`
 - `GET /health/ready`
 - `POST /v1/tasks`
-- `POST /v1/tasks/sync`（Java/脚本一次性等待结果；AuraX / Timer 不要用）
 - `GET /v1/tasks/{session_id}`
 - `GET /v1/tasks/{session_id}/result`
 - `GET /v1/tasks/{session_id}/children`
@@ -322,7 +321,9 @@ Event 回写，并通过 Task/Result Query 的 `delivery_status`、`delivery_id`
 
 当存在完整 `DB_*` 且 `storage_backend=auto` 时启用 SQL 存储，方言默认 MySQL。
 继续使用 PostgreSQL 时请显式设置 `AURACLAW_STORAGE_BACKEND=postgres`（或
-`AURACLAW_DB_DIALECT=postgres` 且 URL scheme 为 postgresql）。密码中的 `#`、`,` 由
+`AURACLAW_DB_DIALECT=postgres` 且 URL scheme 为 postgresql）。
+`MYSQL_DB_*` 仅用于 Model Skill 外部只读源，与主存储无关——切主库时改 `DB_*` /
+`AURACLAW_DATABASE_URL`，不要改 `MYSQL_DB_*`。密码中的 `#`、`,` 由
 `Settings.resolved_database_url` 自动 URL 编码。
 
 迁移：
@@ -369,10 +370,10 @@ migrations/0014_s4_policy_version.sql
 [S4 横向扩展与恢复运行说明](docs/S4%20横向扩展与恢复运行说明.md)，验证证据见
 [S4 测试报告](docs/S4%20测试报告.md)。
 
-Outbox Worker 与投影重建（需已运行的 12 服务拓扑；`projection relay --watch` 由 Compose
-在 `deployment_profile=production` 下启动，本地请用 `auraclaw serve`）：
+Outbox Worker 与投影重建：
 
 ```bash
+uv run auraclaw projection relay --watch
 uv run auraclaw projection rebuild
 uv run auraclaw projection rebuild --tenant tenant_1
 uv run auraclaw operations status --tenant tenant_1
@@ -386,7 +387,7 @@ uv run python scripts/release_gate.py
 PostgreSQL 集成测试使用独立测试库：
 
 ```bash
-# 使用当前 .env.dev 的 DB_NAME
+# 使用当前 .env 的 DB_NAME
 uv run pytest tests/integration/test_postgres_m1.py
 ```
 
@@ -412,7 +413,7 @@ src/auraclaw/
   delivery/        Delivery Worker 与 ports
   observability/   Trace / Audit / Ops 应用服务
   infrastructure/  持久化、投影、Kafka、Hands、Credential 等适配器
-  composition/     API factory、CLI、`auraclaw serve` 与 Compose 装配根
+  composition/     API、CLI 与开发 Runtime 的唯一装配根
   contracts/       跨模块稳定契约
   domain/          Session、Collaboration、Approval 聚合与规则
 ```
@@ -443,10 +444,26 @@ Vault 测试适配器；生产对象存储、企业 Vault 和外部 Connector �
 Schema、主动告警、租户隔离 Timeline、Telemetry 保留和失败队列运维；外部 Trace Collector、
 Metrics Pipeline 和 Alert Receiver 通过同一观测端口接入。
 
-## 能力与业务数据
+## 价格洞察业务 Skill
 
-AuraClaw 不再直接读取业务数据库或内置业务 Tool。Tool、Resource 与 Skill 包均通过
-`action-hands` 的 MCP / Java API egress 对账发现；业务数据由远端 MCP Server 提供。
-Skill 包经 `skill://` Resource 下载并由 `SkillPackageReconciler` 发布。开发与联调见
-[MCP 开发手册](docs/MCP%20开发手册.md)；历史价格洞察实施说明见
-[M12 价格洞察业务 Skill 实施与运维](docs/M12%20价格洞察业务%20Skill%20实施与运维.md)（**已废弃本地 DWD 直连路径**）。
+价格洞察业务 Skill 由 `action-hands` 以平台签名包发布。开发环境的
+`AURACLAW_PRICE_INSIGHT_SOURCE=auto` 使用包内黄金数据；生产环境的 `auto` 默认关闭，
+显式设置为 `mysql` 后通过独立的 `AURACLAW_PRICE_INSIGHT_MYSQL_*` 只读账号访问
+`dwd_pr_price_event_detail_di` 与 `dwd_pr_price_compare_pair_di`。Runtime 和 Skill
+都不接收数据库地址、凭证、表名或原始 SQL。完整流程与回滚见
+[M12 价格洞察业务 Skill 实施与运维](docs/M12%20价格洞察业务%20Skill%20实施与运维.md)。
+
+本机真实 DWD 可用 `scripts/seed_price_insight_mysql.py` 重复初始化；启动
+`AuraClaw: Debug local frontend + backend` 后访问
+`http://localhost:3000/price-insight`。外部模型端点不可用时，可仅在 development 设置
+`AURACLAW_DEVELOPMENT_MODEL_MODE=price-insight-scripted`，用固定模型决策序列验证真实的
+Agent Harness、Capability/Skill、Tool Gateway 与 MySQL 数据链路。
+
+## Semantic 语义问数 Skill
+
+`action-hands` 会为已配置 Java MCP Server 的租户发布平台签名
+`semantic.query.answer@1.0.0`。该 Skill 固定依赖 `semantic.meta.context`、
+`semantic.query.compile` 和 `semantic.query.execute`，运行链路为
+`Skill -> Python MCP Client -> Java Runtime MCP -> Semantic`。Python 不直连 Semantic API，
+也不接收 SQL、数据库连接或调用者身份参数；身份由受信 MCP 调用链传递。Java MCP Tool
+同步失败或 Semantic/Cube 下游不可用时，Skill 解析或执行会失败关闭。

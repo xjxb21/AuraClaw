@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -18,6 +21,10 @@ from auraclaw.contracts.errors import (
 from auraclaw.runtime.ports import ModelRequest, ModelResponse, ModelStreamChunk, ToolCall
 
 logger = logging.getLogger(__name__)
+
+_MODEL_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MODEL_TOOL_NAME_UNSAFE_PATTERN = re.compile(r"[^A-Za-z0-9_-]")
+_MODEL_TOOL_NAME_DIGEST_LENGTH = 12
 
 
 class OpenAICompatibleProvider:
@@ -99,15 +106,22 @@ class OpenAICompatibleProvider:
         self, request: ModelRequest, *, credential: str
     ) -> AsyncIterator[ModelStreamChunk]:
         model = request.policy.preferred_model or self._model
+        tool_name_aliases: dict[str, str] = {}
+        model_tools: list[dict[str, Any]] | None = None
+        if request.tools:
+            model_tools, tool_name_aliases = self._model_tools(request.tools)
         payload: dict[str, Any] = {
             "model": model,
-            "messages": list(request.messages),
+            "messages": self._model_messages(
+                request.messages,
+                tool_name_aliases=tool_name_aliases,
+            ),
             "max_tokens": request.max_output_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if request.tools:
-            payload["tools"] = list(request.tools)
+        if model_tools is not None:
+            payload["tools"] = model_tools
         if self._thinking_enabled is not None:
             payload["thinking"] = {
                 "type": "enabled" if self._thinking_enabled else "disabled",
@@ -188,7 +202,11 @@ class OpenAICompatibleProvider:
                 model=model,
                 completed_output="".join(deltas),
                 deltas=tuple(deltas),
-                tool_calls=self._tool_calls(request, tool_fragments),
+                tool_calls=self._tool_calls(
+                    request,
+                    tool_fragments,
+                    tool_name_aliases=tool_name_aliases,
+                ),
                 finish_reason=finish_reason,
                 usage=usage,
             ),
@@ -286,9 +304,97 @@ class OpenAICompatibleProvider:
                     target["arguments"] += str(function["arguments"])
 
     @staticmethod
+    def _model_tools(
+        tools: tuple[dict[str, Any], ...],
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Return provider-safe tools and an alias-to-canonical name map."""
+        canonical_names: list[str] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                raise ModelProviderError("model tool must be an object")
+            if tool.get("type") != "function":
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                raise ModelProviderError("model function tool must define function")
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                raise ModelProviderError("model function tool name must be a non-empty string")
+            canonical_names.append(name)
+
+        aliases_by_name = {
+            name: name for name in canonical_names if _MODEL_TOOL_NAME_PATTERN.fullmatch(name)
+        }
+        aliases_in_use = set(aliases_by_name.values())
+        for name in dict.fromkeys(canonical_names):
+            if name in aliases_by_name:
+                continue
+            stem = _MODEL_TOOL_NAME_UNSAFE_PATTERN.sub("_", name).strip("_") or "tool"
+            candidate = stem[:64]
+            if candidate in aliases_in_use or len(stem) > 64:
+                digest = hashlib.sha256(name.encode()).hexdigest()[:_MODEL_TOOL_NAME_DIGEST_LENGTH]
+                stem_limit = 64 - _MODEL_TOOL_NAME_DIGEST_LENGTH - 1
+                candidate = f"{stem[:stem_limit]}_{digest}"
+            if candidate in aliases_in_use:
+                raise ModelProviderError("model tool name aliases collide")
+            aliases_by_name[name] = candidate
+            aliases_in_use.add(candidate)
+
+        prepared: list[dict[str, Any]] = []
+        aliases_to_names: dict[str, str] = {}
+        for tool in tools:
+            model_tool = copy.deepcopy(tool)
+            if model_tool.get("type") == "function":
+                function = model_tool["function"]
+                canonical_name = str(function["name"])
+                alias = aliases_by_name[canonical_name]
+                function["name"] = alias
+                aliases_to_names[alias] = canonical_name
+            prepared.append(model_tool)
+        return prepared, aliases_to_names
+
+    @staticmethod
+    def _model_messages(
+        messages: tuple[dict[str, Any], ...],
+        *,
+        tool_name_aliases: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """Keep provider-visible tool history consistent with declared aliases."""
+        names_to_aliases = {
+            canonical_name: alias
+            for alias, canonical_name in tool_name_aliases.items()
+        }
+        prepared = copy.deepcopy(list(messages))
+        for message in prepared:
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    name = function.get("name")
+                    if isinstance(name, str):
+                        function["name"] = names_to_aliases.get(name, name)
+            function_call = message.get("function_call")
+            if isinstance(function_call, dict):
+                name = function_call.get("name")
+                if isinstance(name, str):
+                    function_call["name"] = names_to_aliases.get(name, name)
+            name = message.get("name")
+            if isinstance(name, str):
+                message["name"] = names_to_aliases.get(name, name)
+        return prepared
+
+    @staticmethod
     def _tool_calls(
-        request: ModelRequest, fragments: dict[int, dict[str, str]]
+        request: ModelRequest,
+        fragments: dict[int, dict[str, str]],
+        *,
+        tool_name_aliases: dict[str, str] | None = None,
     ) -> tuple[ToolCall, ...]:
+        aliases = tool_name_aliases or {}
         calls: list[ToolCall] = []
         for index, fragment in sorted(fragments.items()):
             raw_arguments = fragment["arguments"] or "{}"
@@ -301,7 +407,7 @@ class OpenAICompatibleProvider:
             calls.append(
                 ToolCall(
                     tool_invocation_id=fragment["id"] or f"tool_{request.run_id}_{index}",
-                    name=fragment["name"],
+                    name=aliases.get(fragment["name"], fragment["name"]),
                     arguments=arguments,
                 )
             )
