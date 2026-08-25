@@ -74,6 +74,7 @@ class LeaseAssertion(ContractModel):
     run_id: str
     runtime_id: str | None = None
     user_id: str | None = None
+    dept_id: str | None = None
     lease_id: str
     fencing_token: int = Field(ge=1)
     expires_at: datetime
@@ -519,3 +520,48 @@ class AdminOperationResponse(ContractModel):
     operation_id: str
     status: Literal["accepted", "running", "completed", "failed"]
     result: dict[str, Any] = Field(default_factory=dict)
+
+
+class McpRegistryAdminRequest(ContractModel):
+    context: InternalRequestContext
+    command_id: str
+    actor_id: str
+    expected_revision: int = 0
+    operation: str
+    server_id: str | None = None
+    config: dict[str, Any] | None = None
+    target_revision: int | None = None
+
+
+class McpRegistryAdminResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    operation_id: str
+    status: str
+    server_id: str
+    target_revision: int | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
+    safe_error_code: str | None = None
+
+
+class McpRegistrySnapshotRequest(ContractModel):
+    context: InternalRequestContext
+
+
+class McpRegistrySnapshotResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    servers: tuple[dict[str, Any], ...] = ()
+
+
+class McpEgressCommandRequest(ContractModel):
+    context: InternalRequestContext
+    operation: Literal["apply", "revoke"]
+    server_id: str
+    entry: dict[str, Any] | None = None
+
+
+class McpEgressCommandResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    server_id: str
+    operation: str
+    status: Literal["applied", "revoked"]
+

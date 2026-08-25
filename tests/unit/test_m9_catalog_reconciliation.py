@@ -611,3 +611,31 @@ def test_mcp_business_status_is_not_treated_as_tool_result_status() -> None:
         }
 
     asyncio.run(scenario())
+
+
+def test_trusted_remote_tool_annotations_use_safe_defaults_when_missing() -> None:
+    from datetime import UTC, datetime
+
+    from auraclaw.action.catalog_reconciler import _tool_capability
+    from auraclaw.contracts.capabilities import CapabilityDescriptor
+
+    descriptor = CapabilityDescriptor(
+        capability_id="cap-tool-1",
+        kind=CapabilityKind.TOOL,
+        server_id="remote-mcp",
+        canonical_name="remote.tool",
+        version="1.0.0",
+        content_digest="digest-1",
+        title="Remote tool",
+        updated_at=datetime.now(UTC),
+        metadata={"source": {}},
+    )
+
+    capability = _tool_capability(
+        descriptor,
+        "remote-mcp",
+        trust_annotations=True,
+    )
+
+    assert capability.permission.value == "write-with-approval"
+    assert capability.risk_level.value == "high"

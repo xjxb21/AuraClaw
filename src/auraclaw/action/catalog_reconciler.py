@@ -280,6 +280,19 @@ class CapabilityCatalogReconciler:
             {capability.name: executor for capability in capabilities},
         )
 
+    async def drop_server(self, server_id: str) -> None:
+        server = await self._store.get_server(server_id)
+        if server is None:
+            server = McpServerDefinition(
+                server_id=server_id,
+                title=server_id,
+                endpoint="https://invalid.invalid/mcp",
+            )
+        self._remove_remote_tools(server)
+        await self._catalog.replace_server_capabilities(server_id, ())
+        self._failures.pop(server_id, None)
+        self._dirty.discard(server_id)
+
     def _remove_remote_tools(self, server: McpServerDefinition) -> None:
         if self._tool_registry is None or self._hands_router is None:
             return
@@ -457,16 +470,13 @@ def _tool_capability(
     output_schema = source.get("outputSchema", {"type": "object"})
     if not isinstance(input_schema, dict) or not isinstance(output_schema, dict):
         raise ValueError("remote MCP Tool schemas are invalid")
-    permission = (
-        ToolPermission(descriptor.permission)
-        if trust_annotations
-        else ToolPermission.WRITE_WITH_APPROVAL
-    )
-    risk_level = (
-        RiskLevel(descriptor.risk_level)
-        if trust_annotations
-        else RiskLevel.HIGH
-    )
+    permission = ToolPermission.WRITE_WITH_APPROVAL
+    risk_level = RiskLevel.HIGH
+    if trust_annotations:
+        permission = ToolPermission(
+            descriptor.permission or ToolPermission.WRITE_WITH_APPROVAL
+        )
+        risk_level = RiskLevel(descriptor.risk_level or RiskLevel.HIGH)
     return ToolCapability(
         name=descriptor.canonical_name,
         version=descriptor.version,

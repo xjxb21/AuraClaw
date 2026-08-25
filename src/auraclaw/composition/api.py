@@ -4,6 +4,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -23,6 +24,9 @@ from auraclaw.api.dependencies import (
     get_streaming_gateway as streaming_gateway_dependency,
 )
 from auraclaw.api.dependencies import (
+    get_sync_invocation_gateway as sync_invocation_gateway_dependency,
+)
+from auraclaw.api.dependencies import (
     get_task_command_gateway as task_command_gateway_dependency,
 )
 from auraclaw.api.dependencies import (
@@ -31,76 +35,64 @@ from auraclaw.api.dependencies import (
 from auraclaw.api.dependencies import (
     get_task_query_service as task_query_service_dependency,
 )
+from auraclaw.api.dependencies import (
+    get_task_result_waiter as task_result_waiter_dependency,
+)
 from auraclaw.api.routes.health import router as health_router
 from auraclaw.api.routes.operations import router as operations_router
 from auraclaw.api.routes.streams import router as stream_router
 from auraclaw.api.routes.tasks import router as task_router
 from auraclaw.composition import providers
 from auraclaw.composition.identity import build_identity_verifier
-from auraclaw.config import get_settings
+from auraclaw.config import Settings, get_settings
 from auraclaw.contracts.errors import AuraClawError
 from auraclaw.contracts.observability import TraceContext
 from auraclaw.infrastructure.observability.stores import StructuredLogger
 
+ApiProfile = Literal["task-api", "streaming-gateway"]
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    app.state.service_name = "combined"
-    settings = get_settings()
-    producer = providers.get_runtime_event_producer()
-    ingestor = providers.get_streaming_ingestor()
-    runtime_worker = None
-    runtime_worker_task: asyncio.Task[None] | None = None
-    app.state.runtime_worker_ready = False
-    app.state.model_gateway_ready = settings.model_gateway_configured
-    app.state.runtime_event_producer_ready = not settings.kafka_enabled
-    app.state.runtime_event_ingestor_ready = not settings.kafka_enabled
-    if settings.kafka_enabled:
-        start = getattr(producer, "start", None)
-        if start is not None:
-            try:
-                await asyncio.wait_for(start(), timeout=10)
-                app.state.runtime_event_producer_ready = True
-            except Exception:
-                # Runtime events are best-effort; Canonical writes remain available.
-                app.state.runtime_event_producer_ready = False
-    if ingestor is not None:
-        try:
-            await asyncio.wait_for(ingestor.start(), timeout=10)
-            app.state.runtime_event_ingestor_ready = True
-        except Exception:
-            # Streaming is best-effort; Canonical Session APIs must remain available.
-            app.state.runtime_event_ingestor_ready = False
-    app.state.runtime_event_bus_ready = bool(
-        app.state.runtime_event_producer_ready
-        and app.state.runtime_event_ingestor_ready
+DEVELOPMENT_CORS_ORIGIN_REGEX = (
+    r"^https?://(localhost|127\.0\.0\.1|\[::1\]|"
+    r"10(?:\.\d{1,3}){3}|"
+    r"192\.168(?:\.\d{1,3}){2}|"
+    r"172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})"
+    r"(?::\d+)?$"
+)
+DEVELOPMENT_TAURI_ORIGINS = ("tauri://localhost", "https://tauri.localhost")
+_CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "OPTIONS"]
+_CORS_ALLOW_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    "Idempotency-Key",
+    "If-None-Match",
+    "Last-Event-ID",
+    "X-Actor-ID",
+    "X-Correlation-ID",
+    "X-CT-Agent-Context",
+    "X-Dept-ID",
+    "X-Expected-Revision",
+    "X-Expected-Version",
+    "X-Tenant-ID",
+]
+_CORS_EXPOSE_HEADERS = ["ETag", "Retry-After", "traceparent"]
+
+
+def install_public_cors(app: FastAPI, settings: Settings) -> None:
+    origins = list(settings.allowed_cors_origins)
+    origin_regex: str | None = None
+    if settings.deployment_profile == "development":
+        origins = list(dict.fromkeys([*origins, *DEVELOPMENT_TAURI_ORIGINS]))
+        origin_regex = DEVELOPMENT_CORS_ORIGIN_REGEX
+    if not origins and origin_regex is None:
+        return
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_origin_regex=origin_regex,
+        allow_methods=_CORS_ALLOW_METHODS,
+        allow_headers=_CORS_ALLOW_HEADERS,
+        expose_headers=_CORS_EXPOSE_HEADERS,
     )
-    if settings.runtime_enabled and settings.model_gateway_configured:
-        runtime_worker = providers.build_runtime_worker()
-        runtime_worker_task = asyncio.create_task(runtime_worker.run())
-        app.state.runtime_worker_ready = True
-        logging.getLogger(__name__).info(
-            "runtime worker started (storage=%s, runtime_events=%s, model_provider=%s)",
-            settings.storage_label,
-            "kafka" if settings.kafka_enabled else "memory",
-            settings.model_provider,
-        )
-    yield
-    if runtime_worker is not None and runtime_worker_task is not None:
-        await runtime_worker.stop()
-        with suppress(Exception):
-            await asyncio.wait_for(runtime_worker_task, timeout=10)
-    if ingestor is not None:
-        with suppress(Exception):
-            await asyncio.wait_for(ingestor.close(), timeout=10)
-    close = getattr(producer, "close", None)
-    if close is not None:
-        with suppress(Exception):
-            await asyncio.wait_for(close(), timeout=10)
-    await providers.get_runtime_replay_bus().close()
-    close_identity = getattr(app.state.identity_verifier, "close", None)
-    if close_identity is not None:
-        await close_identity()
 
 
 @asynccontextmanager
@@ -140,15 +132,12 @@ async def streaming_lifespan(app: FastAPI) -> AsyncIterator[None]:
             await close_identity()
 
 
-def create_app(*, profile: str = "development") -> FastAPI:
+def create_app(*, profile: ApiProfile) -> FastAPI:
     settings = get_settings()
     selected_lifespan = {
-        "development": lifespan,
         "task-api": task_api_lifespan,
         "streaming-gateway": streaming_lifespan,
-    }.get(profile)
-    if selected_lifespan is None:
-        raise ValueError(f"unsupported API composition profile: {profile}")
+    }[profile]
     app = FastAPI(
         title=f"AuraClaw {profile}",
         version=__version__,
@@ -160,36 +149,20 @@ def create_app(*, profile: str = "development") -> FastAPI:
             task_command_gateway_dependency: providers.get_task_command_gateway,
             task_projection_dependency: providers.get_task_projection,
             task_query_service_dependency: providers.get_task_query_service,
+            task_result_waiter_dependency: providers.get_task_result_waiter,
+            sync_invocation_gateway_dependency: providers.get_sync_invocation_gateway,
             collaboration_projection_dependency: providers.get_collaboration_projection,
             streaming_gateway_dependency: providers.get_streaming_gateway,
             observability_service_dependency: providers.get_observability_service,
         }
     )
     app.state.identity_verifier = build_identity_verifier(settings)
-    if settings.allowed_cors_origins:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=settings.allowed_cors_origins,
-            allow_methods=["GET", "POST", "OPTIONS"],
-            allow_headers=[
-                "Authorization",
-                "Content-Type",
-                "Idempotency-Key",
-                "If-None-Match",
-                "Last-Event-ID",
-                "X-Actor-ID",
-                "X-Correlation-ID",
-                "X-CT-Agent-Context",
-                "X-Expected-Version",
-                "X-Tenant-ID",
-            ],
-            expose_headers=["ETag", "Retry-After", "traceparent"],
-        )
+    install_public_cors(app, settings)
     app.include_router(health_router)
-    if profile in {"development", "task-api"}:
+    if profile == "task-api":
         app.include_router(task_router)
         app.include_router(operations_router)
-    if profile in {"development", "streaming-gateway"}:
+    else:
         app.include_router(stream_router)
     structured_logger = StructuredLogger()
 
@@ -251,12 +224,13 @@ def create_app(*, profile: str = "development") -> FastAPI:
 
     @app.exception_handler(AuraClawError)
     async def handle_auraclaw_error(_: Request, exc: AuraClawError) -> JSONResponse:
+        headers = {}
+        if exc.retry_after is not None:
+            headers["Retry-After"] = str(exc.retry_after)
         return JSONResponse(
             status_code=exc.status_code,
             content={"code": exc.code, "message": exc.message, "detail": exc.detail},
+            headers=headers,
         )
 
     return app
-
-
-app = create_app()

@@ -1,0 +1,34 @@
+[
+  {
+    "server_id": "java-mcp",
+    "tenant_id": "1",
+    "title": "Java Agent Runtime MCP",
+    "endpoint": "http://127.0.0.1:48090/rpc-api/agent-runtime/mcp",
+    "protocol_revision": "2025-06-18",
+    "credential_ref": "vault/java-mcp#client_secret",
+    "auth_strategy": "workload_trusted_context",
+    "trust_level": "tenant_verified",
+    "allowed_tool_prefixes": [""],
+    "allowed_resource_schemes": [],
+    "allowed_prompt_prefixes": [""],
+    "allowed_private_hosts": ["127.0.0.1"],
+    "metadata": {
+      "search_tags": ["价格洞察", "采购价格", "price_insight"],
+      "tool_name_aliases": {
+        "price_insight.dataset.profile": "procurement.price.dataset.profile",
+        "price_insight.dataset.quality_check": "procurement.price.dataset.quality.check",
+        "price_insight.metric.history_deviation.compute": "procurement.price.metric.history-deviation.compute",
+        "price_insight.metric.region_max_gap.compute": "procurement.price.metric.region-max-gap.compute",
+        "price_insight.metric.market_deviation.compute": "procurement.price.metric.market-deviation.compute",
+        "price_insight.metric.positive_impact_amount.compute": "procurement.price.metric.positive-impact-amount.compute",
+        "price_insight.metric.negative_impact_amount.compute": "procurement.price.metric.negative-impact-amount.compute",
+        "price_insight.metric.positive_impact_share.compute": "procurement.price.metric.positive-impact-share.compute",
+        "price_insight.metric.negative_impact_share.compute": "procurement.price.metric.negative-impact-share.compute",
+        "price_insight.metric.market_deviation_count.compute": "procurement.price.metric.market-deviation-count.compute",
+        "price_insight.metric.evidence.list": "procurement.price.metric.evidence.list"
+      }
+    },
+    "status": "active",
+    "enabled": true
+  }
+]

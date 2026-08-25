@@ -37,4 +37,3 @@ async def test_remote_task_projection_rebuilds_view_from_session_feed() -> None:
     assert view["session_id"] == "ses-1"
     assert view["goal"] == "hello"
     assert view["projection_version"] == 1
-

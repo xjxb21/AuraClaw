@@ -11,7 +11,11 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 
-from auraclaw.contracts.capabilities import McpAuthStrategy, McpServerDefinition
+from auraclaw.contracts.capabilities import (
+    McpAuthStrategy,
+    McpNetworkMode,
+    McpServerDefinition,
+)
 from auraclaw.contracts.errors import CredentialAccessError
 from auraclaw.infrastructure.connectors.mcp.wire import (
     MCP_CLIENT_CAPABILITIES_META_KEY,
@@ -158,9 +162,13 @@ class ManagedMcpEgressAdapter:
     ) -> None:
         if not server.enabled:
             raise ValueError("MCP egress server must be enabled")
-        if server.credential_ref is None:
+        auth = server.resolved_auth_strategy
+        if auth is McpAuthStrategy.NONE:
+            if server.resolved_network_mode is McpNetworkMode.PUBLIC:
+                raise ValueError("public MCP egress cannot use auth_strategy none")
+        elif server.credential_ref is None:
             raise ValueError("MCP egress server requires a credential_ref")
-        if server.resolved_auth_strategy is McpAuthStrategy.OAUTH_CLIENT_CREDENTIALS:
+        if auth is McpAuthStrategy.OAUTH_CLIENT_CREDENTIALS:
             if server.oauth is None:
                 raise ValueError("MCP egress server requires managed OAuth configuration")
             _validate_https_url(server.oauth.protected_resource_metadata_url)
@@ -177,6 +185,14 @@ class ManagedMcpEgressAdapter:
         self._token: _CachedToken | None = None
         self._token_lock = asyncio.Lock()
         self._discovery_complete = False
+
+    @property
+    def secret_required(self) -> bool:
+        return self._server.resolved_auth_strategy is not McpAuthStrategy.NONE
+
+    @property
+    def config_revision(self) -> int | None:
+        return self._server.config_revision
 
     @property
     def credential_provider(self) -> str:
@@ -201,6 +217,7 @@ class ManagedMcpEgressAdapter:
             "method",
             "params",
             "server_id",
+            "config_revision",
             "_auraclaw_identity",
         }:
             raise CredentialAccessError("MCP egress request contains unsupported fields")
@@ -213,6 +230,10 @@ class ManagedMcpEgressAdapter:
             raise CredentialAccessError("MCP egress request may not carry credentials or targets")
         if payload.get("server_id") != self._server.server_id:
             raise CredentialAccessError("MCP egress server binding does not match")
+        requested_revision = payload.get("config_revision")
+        if self._server.config_revision is not None:
+            if requested_revision != self._server.config_revision:
+                raise CredentialAccessError("MCP config revision mismatch")
         method = str(payload.get("method", ""))
         params = payload.get("params", {})
         if method not in _METHODS or not isinstance(params, dict):
@@ -233,7 +254,6 @@ class ManagedMcpEgressAdapter:
         token = await self._access_token(client_secret)
         headers = {
             "Accept": "application/json, text/event-stream",
-            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "MCP-Protocol-Version": self._server.protocol_revision,
             "Mcp-Method": method,
@@ -244,6 +264,8 @@ class ManagedMcpEgressAdapter:
             ),
             "Origin": _origin(self._server.endpoint),
         }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         if (
             self._server.resolved_auth_strategy
             is McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT
@@ -251,11 +273,14 @@ class ManagedMcpEgressAdapter:
         ):
             tenant_id = identity.get("tenant_id")
             user_id = identity.get("user_id")
+            dept_id = identity.get("dept_id")
             session_id = identity.get("session_id")
             if tenant_id:
                 headers["X-CT-Tenant-ID"] = str(tenant_id)
             if user_id:
                 headers["X-CT-User-ID"] = str(user_id)
+            if dept_id:
+                headers["X-CT-Dept-ID"] = str(dept_id)
             if session_id:
                 headers["X-CT-Session-ID"] = str(session_id)
         jsonrpc_body = json.dumps(
@@ -274,7 +299,7 @@ class ManagedMcpEgressAdapter:
             content=jsonrpc_body,
         )
         result = _decode_mcp_response(response, self._max_response_bytes)
-        return dict(_redact_exact(result, token))
+        return dict(_redact_exact(result, token) if token else result)
 
     async def aclose(self) -> None:
         close = getattr(self._sender, "aclose", None)
@@ -282,6 +307,8 @@ class ManagedMcpEgressAdapter:
             await close()
 
     async def _access_token(self, client_secret: str) -> str:
+        if self._server.resolved_auth_strategy is McpAuthStrategy.NONE:
+            return ""
         if (
             self._server.resolved_auth_strategy
             is McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT
@@ -416,11 +443,22 @@ class ManagedMcpEgressAdapter:
         addresses = await self._resolver.resolve(
             host, parsed.port or _default_port(parsed.scheme)
         )
-        approved = _approved_addresses(
-            addresses,
-            hostname=host,
-            allowed_private_hosts=self._server.allowed_private_hosts,
-        )
+        if self._server.network_mode is None:
+            approved = _legacy_approved_addresses(
+                addresses,
+                hostname=host,
+                allowed_private_hosts=self._server.allowed_private_hosts,
+                allow_global=parsed.scheme == "https",
+            )
+        else:
+            approved = _approved_addresses(
+                addresses,
+                hostname=host,
+                network_mode=self._server.resolved_network_mode,
+                allowed_private_hosts=self._server.allowed_private_hosts,
+                allowed_cidrs=self._server.allowed_cidrs,
+                scheme=parsed.scheme,
+            )
         if not approved:
             raise CredentialAccessError("MCP egress DNS has no public address")
         response = await self._sender.send(
@@ -462,11 +500,12 @@ def _validate_https_url(value: str) -> None:
         raise ValueError("MCP egress URL must be an absolute HTTPS URL without userinfo")
 
 
-def _approved_addresses(
+def _legacy_approved_addresses(
     addresses: tuple[str, ...],
     *,
     hostname: str,
     allowed_private_hosts: tuple[str, ...],
+    allow_global: bool,
 ) -> tuple[str, ...]:
     allow_private = hostname.lower() in {item.lower() for item in allowed_private_hosts}
     approved: list[str] = []
@@ -475,13 +514,63 @@ def _approved_addresses(
             address = ipaddress.ip_address(value)
         except ValueError as exc:
             raise CredentialAccessError("MCP DNS returned an invalid address") from exc
-        if address.is_global:
+        if address.is_global and allow_global:
             approved.append(address.compressed)
             continue
+        if address.is_global:
+            raise CredentialAccessError("public MCP egress requires HTTPS")
         if allow_private and (address.is_private or address.is_loopback):
             approved.append(address.compressed)
             continue
         raise CredentialAccessError("MCP DNS resolved to a non-public address")
+    return tuple(sorted(set(approved)))
+
+
+def _approved_addresses(
+    addresses: tuple[str, ...],
+    *,
+    hostname: str,
+    network_mode: McpNetworkMode,
+    allowed_private_hosts: tuple[str, ...],
+    allowed_cidrs: tuple[str, ...] = (),
+    scheme: str,
+) -> tuple[str, ...]:
+    if not addresses:
+        raise CredentialAccessError("MCP DNS returned no addresses")
+    allowlisted = hostname.lower() in {item.lower() for item in allowed_private_hosts}
+    networks = tuple(ipaddress.ip_network(item, strict=False) for item in allowed_cidrs)
+    approved: list[str] = []
+    for value in addresses:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise CredentialAccessError("MCP DNS returned an invalid address") from exc
+        if address.is_link_local or address.is_multicast or address.is_unspecified:
+            raise CredentialAccessError("MCP DNS resolved to a forbidden address")
+        if address.is_reserved and not address.is_loopback:
+            raise CredentialAccessError("MCP DNS resolved to a forbidden address")
+        if network_mode is McpNetworkMode.PUBLIC:
+            if scheme != "https":
+                raise CredentialAccessError("public MCP egress requires HTTPS")
+            if not address.is_global:
+                raise CredentialAccessError("MCP DNS resolved to a non-public address")
+            approved.append(address.compressed)
+            continue
+        if network_mode is McpNetworkMode.LOOPBACK:
+            if not address.is_loopback:
+                raise CredentialAccessError(
+                    "loopback MCP DNS resolved outside loopback "
+                    "(addresses are relative to the Credential Proxy network namespace)"
+                )
+            approved.append(address.compressed)
+            continue
+        if not allowlisted:
+            raise CredentialAccessError("private MCP host is not allowlisted")
+        if not networks:
+            raise CredentialAccessError("private MCP egress requires allowed_cidrs")
+        if not any(address in network for network in networks):
+            raise CredentialAccessError("private MCP address is outside allowed_cidrs")
+        approved.append(address.compressed)
     return tuple(sorted(set(approved)))
 
 

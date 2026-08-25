@@ -10,7 +10,7 @@ from urllib.parse import quote
 from pydantic import Field, SecretStr, TypeAdapter, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from auraclaw.contracts.capabilities import JavaApiServerDefinition, McpServerDefinition
+from auraclaw.contracts.capabilities import JavaApiServerDefinition
 
 _SECRET_FILE_VARIABLES = {
     "AURACLAW_DATABASE_URL",
@@ -30,10 +30,8 @@ _SECRET_FILE_VARIABLES = {
     "AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON",
     "AURACLAW_LEASE_SIGNING_KEY",
     "AURACLAW_MODEL_API_KEY",
-    "AURACLAW_MODEL_SKILL_SIGNING_KEY",
-    "AURACLAW_PRICE_INSIGHT_MYSQL_PASSWORD",
+    "AURACLAW_SKILL_SIGNING_KEY",
     "AURACLAW_CREDENTIAL_VAULT_TOKEN",
-    "MYSQL_DB_PWD",
     "SEAWEEDFS_ACCESS_KEY",
     "SEAWEEDFS_SECRET_KEY",
 }
@@ -64,15 +62,74 @@ def _resolve_settings_env_file() -> str | None:
     configured = os.environ.get("AURACLAW_ENV_FILE")
     if configured:
         return configured
-    for candidate in (".env.debug", ".env"):
+    for candidate in (".env.dev",):
         if Path(candidate).is_file():
             return candidate
     return None
 
 
+def _is_local_dev_env_file(path: str | Path | None) -> bool:
+    """True only for local developer env files (not server .env.test / .env.prod)."""
+    if path is None:
+        return False
+    return Path(path).name == ".env.dev"
+
+
+def _parse_dotenv_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'").strip('"')
+    return values
+
+
+def apply_local_dev_proxy_env(env_file: str | Path | None = None) -> None:
+    """Apply NO_PROXY / clear HTTP(S)_PROXY for local `.env.dev` only.
+
+    Corporate HTTP proxies on developer machines break access to private Kafka /
+    MySQL / SeaweedFS / Vault hosts. Server test and production Compose do not
+    need this — they run without local proxy interference.
+    """
+    path = Path(env_file) if env_file is not None else None
+    if path is None:
+        resolved = _resolve_settings_env_file()
+        path = Path(resolved) if resolved else None
+    if not _is_local_dev_env_file(path):
+        return
+    assert path is not None
+    file_values = _parse_dotenv_values(path)
+    for key in ("NO_PROXY", "no_proxy"):
+        # Prefer .env.dev so private middleware hosts are always covered, even when
+        # the shell already exports a generic NO_PROXY (e.g. 127.0.0.1,localhost).
+        value = file_values.get(key) or os.environ.get(key)
+        if value:
+            os.environ[key] = value
+    if os.environ.get("AURACLAW_MODEL_USE_PROXY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    for key in (
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        os.environ.pop(key, None)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_prefix="AURACLAW_", extra="ignore"
+        env_file=".env.dev", env_prefix="AURACLAW_", extra="ignore"
     )
 
     host: str = "127.0.0.1"
@@ -121,44 +178,15 @@ class Settings(BaseSettings):
     policy_base_url: str = "http://127.0.0.1:8007"
     credential_proxy_base_url: str = "http://127.0.0.1:8008"
     credential_egress_allowlist: str = ""
-    mcp_egress_servers_json: str = "[]"
-    mcp_egress_servers_file: str | None = None
     java_api_servers_json: str = "[]"
     debug_vault_secrets_json: str = "{}"
     mcp_reconcile_interval_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
+    mcp_revision_reconcile_interval_seconds: float = Field(
+        default=30.0, ge=5.0, le=3600.0
+    )
+    mcp_allow_private_auth_none: bool | None = None
     mcp_trust_remote_tool_annotations: bool = False
-    model_skill_source_enabled: bool = True
-    model_skill_source_tenant_id: int = Field(default=1, ge=0)
-    model_skill_target_tenant_id: str = Field(default="development", min_length=1)
-    model_skill_include_drafts: bool = True
-    model_skill_reconcile_interval_seconds: float = Field(
-        default=60.0,
-        ge=5.0,
-        le=3600.0,
-    )
-    model_skill_signing_key: SecretStr | None = None
-    model_skill_mysql_host: str | None = Field(
-        default=None, validation_alias="MYSQL_DB_HOST"
-    )
-    model_skill_mysql_port: int = Field(
-        default=3306, ge=1, le=65535, validation_alias="MYSQL_DB_PORT"
-    )
-    model_skill_mysql_user: str | None = Field(
-        default=None, validation_alias="MYSQL_DB_USER"
-    )
-    model_skill_mysql_password: SecretStr | None = Field(
-        default=None, validation_alias="MYSQL_DB_PWD"
-    )
-    model_skill_mysql_database: str | None = Field(
-        default=None, validation_alias="MYSQL_DB_NAME"
-    )
-    price_insight_source: Literal["auto", "disabled", "fixture", "mysql"] = "auto"
-    price_insight_target_tenant_id: str = Field(default="development", min_length=1)
-    price_insight_mysql_host: str | None = None
-    price_insight_mysql_port: int = Field(default=3306, ge=1, le=65535)
-    price_insight_mysql_user: str | None = None
-    price_insight_mysql_password: SecretStr | None = None
-    price_insight_mysql_database: str | None = None
+    skill_signing_key: SecretStr | None = None
     credential_vault_addr: str | None = None
     credential_vault_token: SecretStr | None = None
     credential_vault_mount: str = "secret"
@@ -216,10 +244,9 @@ class Settings(BaseSettings):
     runtime_event_retention_events: int = 1_000
     stream_connection_queue_size: int = 128
     cors_allow_origins: str = ""
-    runtime_enabled: bool = True
     runtime_poll_interval: float = 0.05
     # Shared production-topology worker ticks (Outbox → Feed / Projection).
-    # Keep identical semantics across compose.services and compose.production.
+    # Keep identical semantics across compose.test and compose.prod.
     # With worker_wake_enabled, idle uses worker_idle_interval; busy ticks drain
     # immediately after Session outbox HTTP wake.
     worker_wake_enabled: bool = True
@@ -227,6 +254,10 @@ class Settings(BaseSettings):
     projection_worker_interval: float = Field(default=0.1, ge=0.01, le=30.0)
     orchestrator_worker_interval: float = Field(default=0.1, ge=0.01, le=30.0)
     orchestrator_lease_ttl_seconds: int = Field(default=300, ge=30, le=3600)
+    sync_invoke_default_timeout_seconds: int = Field(default=60, ge=1, le=3600)
+    sync_invoke_max_timeout_seconds: int = Field(default=120, ge=1, le=3600)
+    sync_invoke_poll_interval_seconds: float = Field(default=0.25, ge=0.05, le=5.0)
+    sync_invoke_max_concurrent: int = Field(default=32, ge=1, le=1000)
     runtime_id: str = "runtime-local-1"
     runtime_role: str = "root"
     runtime_node_id: str = "local"
@@ -235,7 +266,6 @@ class Settings(BaseSettings):
     model_base_url: str | None = None
     model_name: str | None = None
     model_provider: str = "openai_compatible"
-    development_model_mode: Literal["provider", "price-insight-scripted"] = "provider"
     model_timeout_seconds: float = 120.0
     model_tenant_token_limit_per_hour: int = Field(default=1_000_000, ge=1)
     # None omits the field; True/False maps to OpenAI-compatible thinking.type enabled/disabled.
@@ -395,17 +425,6 @@ class Settings(BaseSettings):
         )
 
     @property
-    def mcp_egress_servers(self) -> tuple[McpServerDefinition, ...]:
-        raw = self.mcp_egress_servers_json
-        if self.mcp_egress_servers_file:
-            raw = Path(self.mcp_egress_servers_file).read_text(encoding="utf-8")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError("MCP egress server configuration is invalid JSON") from exc
-        return TypeAdapter(tuple[McpServerDefinition, ...]).validate_python(payload)
-
-    @property
     def debug_vault_secrets(self) -> dict[str, str]:
         try:
             payload = json.loads(self.debug_vault_secrets_json)
@@ -426,37 +445,6 @@ class Settings(BaseSettings):
     @property
     def model_gateway_configured(self) -> bool:
         return bool(self.model_api_key and self.model_base_url and self.model_name)
-
-    @property
-    def model_skill_source_configured(self) -> bool:
-        return bool(
-            self.model_skill_source_enabled
-            and self.model_skill_mysql_host
-            and self.model_skill_mysql_user
-            and self.model_skill_mysql_password is not None
-            and self.model_skill_mysql_password.get_secret_value()
-            and self.model_skill_mysql_database
-        )
-
-    @property
-    def resolved_price_insight_source(
-        self,
-    ) -> Literal["disabled", "fixture", "mysql"]:
-        if self.price_insight_source != "auto":
-            return self.price_insight_source
-        if self.price_insight_mysql_configured:
-            return "mysql"
-        return "disabled"
-
-    @property
-    def price_insight_mysql_configured(self) -> bool:
-        return bool(
-            self.price_insight_mysql_host
-            and self.price_insight_mysql_user
-            and self.price_insight_mysql_password is not None
-            and self.price_insight_mysql_password.get_secret_value()
-            and self.price_insight_mysql_database
-        )
 
     @property
     def insecure_identity_headers_enabled(self) -> bool:
@@ -530,4 +518,6 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     load_secret_files()
-    return Settings(_env_file=_resolve_settings_env_file())
+    env_file = _resolve_settings_env_file()
+    apply_local_dev_proxy_env(env_file)
+    return Settings(_env_file=env_file)
