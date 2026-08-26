@@ -50,6 +50,8 @@ _METHODS = {
     "prompts/list",
     "prompts/get",
 }
+# Streamable HTTP (2025-06-18+): Spring MCP returns HTTP 400 unless both are listed.
+MCP_STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream"
 
 
 class McpDnsResolver(Protocol):
@@ -135,11 +137,34 @@ class HttpxPinnedMcpSender:
         )
         if parsed.scheme == "https":
             request.extensions["sni_hostname"] = server_hostname.encode()
-        response = await self._client.send(request, follow_redirects=False)
+        try:
+            response = await self._client.send(
+                request, follow_redirects=False, stream=True
+            )
+        except httpx.RequestError as exc:
+            raise CredentialAccessError(
+                "MCP egress target is unreachable",
+                detail=type(exc).__name__,
+            ) from exc
+        try:
+            content_type = (
+                response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            )
+            if content_type == "text/event-stream":
+                content = await _read_sse_until_rpc_response(response)
+            else:
+                content = await response.aread()
+        except httpx.RequestError as exc:
+            raise CredentialAccessError(
+                "MCP egress target is unreachable",
+                detail=type(exc).__name__,
+            ) from exc
+        finally:
+            await response.aclose()
         return McpEgressResponse(
             status_code=response.status_code,
             headers={key.lower(): value for key, value in response.headers.items()},
-            content=response.content,
+            content=content,
         )
 
 
@@ -185,6 +210,7 @@ class ManagedMcpEgressAdapter:
         self._token: _CachedToken | None = None
         self._token_lock = asyncio.Lock()
         self._discovery_complete = False
+        self._mcp_session_id: str | None = None
 
     @property
     def secret_required(self) -> bool:
@@ -253,7 +279,7 @@ class ManagedMcpEgressAdapter:
         self._authorize_method(method, params)
         token = await self._access_token(client_secret)
         headers = {
-            "Accept": "application/json, text/event-stream",
+            "Accept": MCP_STREAMABLE_HTTP_ACCEPT,
             "Content-Type": "application/json",
             "MCP-Protocol-Version": self._server.protocol_revision,
             "Mcp-Method": method,
@@ -266,10 +292,12 @@ class ManagedMcpEgressAdapter:
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        if (
+        if self._mcp_session_id:
+            headers["Mcp-Session-Id"] = self._mcp_session_id
+        if isinstance(identity, dict) and (
             self._server.resolved_auth_strategy
             is McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT
-            and isinstance(identity, dict)
+            or _loopback_hostname(self._server.endpoint)
         ):
             tenant_id = identity.get("tenant_id")
             user_id = identity.get("user_id")
@@ -283,21 +311,24 @@ class ManagedMcpEgressAdapter:
                 headers["X-CT-Dept-ID"] = str(dept_id)
             if session_id:
                 headers["X-CT-Session-ID"] = str(session_id)
-        jsonrpc_body = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": payload.get("id"),
-                "method": method,
-                "params": params,
-            },
-            separators=(",", ":"),
-        ).encode()
+        message: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }
+        request_id = payload.get("id")
+        if request_id is not None:
+            message["id"] = request_id
+        jsonrpc_body = json.dumps(message, separators=(",", ":")).encode()
         response = await self._send_pinned(
             "POST",
             self._server.endpoint,
             headers=headers,
             content=jsonrpc_body,
         )
+        session_header = response.headers.get("mcp-session-id")
+        if session_header:
+            self._mcp_session_id = session_header
         result = _decode_mcp_response(response, self._max_response_bytes)
         return dict(_redact_exact(result, token) if token else result)
 
@@ -580,8 +611,13 @@ def _decode_mcp_response(
 ) -> dict[str, Any]:
     if len(response.content) > max_response_bytes:
         raise CredentialAccessError("MCP response exceeds the configured limit")
+    if response.status_code == 202:
+        return {"jsonrpc": "2.0", "id": None, "result": {}}
     if not 200 <= response.status_code < 300:
-        raise CredentialAccessError(f"MCP server returned HTTP {response.status_code}")
+        raise CredentialAccessError(
+            f"MCP server returned HTTP {response.status_code}"
+            f"{_http_error_suffix(response)}"
+        )
     content_type = response.headers.get("content-type", "").split(";", 1)[0]
     try:
         if content_type == "text/event-stream":
@@ -661,6 +697,32 @@ def _prefix_allowed(value: str, prefixes: tuple[str, ...]) -> bool:
     return bool(value) and any(value.startswith(prefix) for prefix in prefixes)
 
 
+def _http_error_suffix(response: McpEgressResponse) -> str:
+    raw = response.content[:300].decode("utf-8", errors="replace").strip()
+    if not raw:
+        return ""
+    compact = " ".join(raw.split())
+    return f": {compact[:200]}"
+
+
+async def _read_sse_until_rpc_response(response: httpx.Response) -> bytes:
+    chunks: list[bytes] = []
+    async for line in response.aiter_lines():
+        chunks.append(f"{line}\n".encode())
+        if not line.startswith("data:"):
+            continue
+        value = line[5:].strip()
+        if not value or value == "[DONE]":
+            continue
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and "id" in payload:
+            break
+    return b"".join(chunks)
+
+
 def _request_target_name(method: str, params: dict[str, Any]) -> str | None:
     key = {
         "tools/call": "name",
@@ -673,6 +735,11 @@ def _request_target_name(method: str, params: dict[str, Any]) -> str | None:
 
 def _default_port(scheme: str) -> int:
     return 80 if scheme == "http" else 443
+
+
+def _loopback_hostname(url: str) -> bool:
+    hostname = (urlsplit(url).hostname or "").lower()
+    return hostname in {"localhost", "127.0.0.1", "::1"}
 
 
 def _origin(value: str) -> str:

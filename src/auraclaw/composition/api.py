@@ -98,6 +98,9 @@ def install_public_cors(app: FastAPI, settings: Settings) -> None:
 @asynccontextmanager
 async def task_api_lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.service_name = "task-api"
+    initialize = getattr(app.state, "initialize", None)
+    if initialize is not None:
+        await initialize()
     app.state.service_ready = bool(getattr(app.state, "config_ready", True))
     try:
         yield

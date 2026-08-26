@@ -51,8 +51,33 @@ class HandsResourceRegistry:
         uri = resource.descriptor.uri
         if uri is None:
             raise ValueError("Resource descriptor must define a uri")
-        if uri in self._resources:
-            raise ValueError(f"Resource already registered: {uri}")
+        if any(content.uri != uri for content in resource.contents):
+            raise ValueError("Resource content URI must match the descriptor URI")
+        existing = self._resources.get(uri)
+        if existing is not None:
+            if (
+                existing.descriptor.content_digest != resource.descriptor.content_digest
+                or existing.contents != resource.contents
+            ):
+                raise ValueError(f"Resource already registered: {uri}")
+            if not existing.tenant_ids or not resource.tenant_ids:
+                merged_tenants: tuple[str, ...] = ()
+            else:
+                merged_tenants = tuple(
+                    dict.fromkeys((*existing.tenant_ids, *resource.tenant_ids))
+                )
+            self._resources[uri] = RegisteredResource(
+                descriptor=existing.descriptor,
+                contents=existing.contents,
+                tenant_ids=merged_tenants,
+            )
+            return
+        self._resources[uri] = resource
+
+    def replace_resource(self, resource: RegisteredResource) -> None:
+        uri = resource.descriptor.uri
+        if uri is None:
+            raise ValueError("Resource descriptor must define a uri")
         if any(content.uri != uri for content in resource.contents):
             raise ValueError("Resource content URI must match the descriptor URI")
         self._resources[uri] = resource

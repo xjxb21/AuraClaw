@@ -8,8 +8,12 @@
       "module": "auraclaw",
       "args": ["serve", "--host", "0.0.0.0"],
       "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "envFile": "${workspaceFolder}/.env.dev",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "envFile": "${workspaceFolder}/.env.debug.example",
+      "env": {
+        "AURACLAW_ENV_FILE": "${workspaceFolder}/.env.debug.example",
+        "AURACLAW_RUNTIME_ROLE": "agent"
+      },
       "console": "integratedTerminal",
       "justMyCode": false
     },
@@ -20,7 +24,7 @@
       "module": "auramcp",
       "args": ["run", "--host", "127.0.0.1", "--port", "8020"],
       "cwd": "${workspaceFolder}/../AuraMCP",
-      "python": "${workspaceFolder}/../AuraMCP/.venv/bin/python",
+      "python": "${workspaceFolder}/../AuraMCP/.venv/Scripts/python.exe",
       "envFile": "${workspaceFolder}/../AuraMCP/.env",
       "console": "integratedTerminal",
       "justMyCode": false

@@ -106,6 +106,7 @@ class ManagedMcpConnector:
             extra["capabilities"] = capabilities
             if isinstance(discovery.get("serverInfo"), dict):
                 extra["server_info"] = dict(discovery["serverInfo"])
+            await self._notify(mcp_trusted, "notifications/initialized", {})
         else:
             raise ValueError("remote MCP protocol version is not supported")
         capabilities = extra["capabilities"]
@@ -376,6 +377,24 @@ class ManagedMcpConnector:
                 f"remote MCP error {response.error.code}: {response.error.message}"
             )
         return dict(response.result or {})
+
+    async def _notify(
+        self,
+        trusted: McpTrustedContext,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        request_params = dict(params)
+        identity_meta = _identity_meta(trusted)
+        if identity_meta:
+            request_params["_meta"] = {
+                **dict(request_params.get("_meta") or {}),
+                **identity_meta,
+            }
+        await self._transport.send(
+            McpJsonRpcRequest(id=None, method=method, params=request_params),
+            trusted_context=trusted,
+        )
 
 
 def _modern_meta() -> dict[str, Any]:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import suppress
 
 import httpx
 
+from auraclaw.contracts.errors import AuraClawError, LeaseConflictError
 from auraclaw.contracts.internal import (
     InternalRequestContext,
     ModelGenerateRequest,
@@ -14,6 +17,12 @@ from auraclaw.contracts.internal import (
 )
 from auraclaw.internal.http import HttpContractClient
 from auraclaw.runtime.ports import ModelRequest, ModelResponse, ModelStreamChunk, ToolCall
+
+logger = logging.getLogger(__name__)
+
+
+def _is_peer_closed_stream(exc: BaseException) -> bool:
+    return isinstance(exc, AuraClawError) and "closed by the peer" in exc.message
 
 
 class RemoteModelClient:
@@ -27,10 +36,12 @@ class RemoteModelClient:
         timeout: float = 120.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        self._reconnect_timeout = timeout
         self._client = httpx.AsyncClient(
             base_url=base_url,
             timeout=timeout,
             transport=transport,
+            trust_env=False,
         )
         self._contract = HttpContractClient(self._client, bearer_token=bearer_token)
 
@@ -54,7 +65,67 @@ class RemoteModelClient:
     async def generate_stream(
         self, request: ModelRequest
     ) -> AsyncIterator[ModelStreamChunk]:
-        payload = ModelGenerateRequest(
+        payload = self._payload(request)
+        got_completed = False
+        wait_inflight = False
+        last_error: AuraClawError | None = None
+        try:
+            async for chunk in self._consume_stream(payload):
+                if chunk.kind == "completed":
+                    got_completed = True
+                yield chunk
+        except LeaseConflictError as exc:
+            last_error = exc
+            wait_inflight = True
+        except AuraClawError as exc:
+            if got_completed or not _is_peer_closed_stream(exc):
+                raise
+            last_error = exc
+            wait_inflight = True
+            logger.warning(
+                "model stream closed by peer; reconnecting model_call=%s error=%s",
+                request.model_call_id,
+                exc.detail or exc.message,
+            )
+        if got_completed:
+            return
+        # Tail event can be lost after gateway has already finished (and cached).
+        # Mid-stream RST and an in-progress 409 are the same class of loss.
+        deadline = asyncio.get_running_loop().time() + self._reconnect_timeout
+        attempt = 0
+        while True:
+            attempt += 1
+            logger.warning(
+                "model stream ended without completed; reconnecting model_call=%s attempt=%s",
+                request.model_call_id,
+                attempt,
+            )
+            try:
+                async for chunk in self._consume_stream(payload):
+                    if chunk.kind == "completed":
+                        yield chunk
+                        return
+                if not wait_inflight:
+                    return
+            except LeaseConflictError as exc:
+                last_error = exc
+                wait_inflight = True
+            except AuraClawError as exc:
+                if not _is_peer_closed_stream(exc):
+                    raise
+                last_error = exc
+                wait_inflight = True
+            if not wait_inflight:
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                if last_error is not None:
+                    raise last_error
+                return
+            await asyncio.sleep(min(1.0, remaining))
+
+    def _payload(self, request: ModelRequest) -> ModelGenerateRequest:
+        return ModelGenerateRequest(
             context=InternalRequestContext(
                 tenant_id=request.tenant_id,
                 service_identity=ServiceIdentity.AGENT_RUNTIME,
@@ -72,6 +143,10 @@ class RemoteModelClient:
             data_classification=request.policy.data_classification,
             max_output_tokens=request.max_output_tokens,
         )
+
+    async def _consume_stream(
+        self, payload: ModelGenerateRequest
+    ) -> AsyncIterator[ModelStreamChunk]:
         async for event in self._contract.stream(
             "/internal/v1/model/stream",
             payload,
@@ -89,7 +164,10 @@ class RemoteModelClient:
                 )
             elif event.type == "error":
                 message = event.payload.get("message") or "model stream reported an error"
-                raise RuntimeError(str(message))
+                text = str(message)
+                if "already in progress" in text:
+                    raise LeaseConflictError(text)
+                raise RuntimeError(text)
 
     @staticmethod
     def _to_model_response(response: ModelGenerateResponse) -> ModelResponse:

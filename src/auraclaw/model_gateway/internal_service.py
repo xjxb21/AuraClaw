@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Protocol
 
@@ -15,6 +16,8 @@ from auraclaw.contracts.errors import (
     PolicyDeniedError,
     VersionConflictError,
 )
+
+logger = logging.getLogger(__name__)
 from auraclaw.contracts.internal import (
     ModelCancelRequest,
     ModelCancelResponse,
@@ -51,11 +54,15 @@ class ModelGatewayInternalService:
         policy: ModelPolicyEnforcer | None = None,
         state: ModelStateStore | None = None,
         tenant_token_limit: int = 1_000_000,
+        inflight_wait_seconds: float = 120.0,
+        inflight_poll_seconds: float = 0.25,
     ) -> None:
         self._model = model
         self._policy = policy
         self._state = state
         self._tenant_token_limit = tenant_token_limit
+        self._inflight_wait_seconds = inflight_wait_seconds
+        self._inflight_poll_seconds = inflight_poll_seconds
 
     @staticmethod
     def _require_runtime(identity: ServiceIdentity) -> None:
@@ -77,6 +84,8 @@ class ModelGatewayInternalService:
         self._require_runtime(request.context.service_identity)
         request_digest = self._request_digest(request)
         reservation = await self._prepare_stream(request, request_digest)
+        if reservation is not None and reservation.status == "in_progress":
+            reservation = await self._wait_for_inflight(request, request_digest)
         if reservation is not None:
             if reservation.status == "completed":
                 assert reservation.cached_response is not None
@@ -122,22 +131,17 @@ class ModelGatewayInternalService:
                 elif chunk.kind == "completed":
                     response = chunk.response
         except Exception as exc:
-            if self._state is not None:
-                await self._state.fail(
-                    tenant_id=request.context.tenant_id,
-                    model_call_id=request.model_call_id,
-                    error_code=type(exc).__name__,
-                )
+            await self._fail_call(request, type(exc).__name__)
+            raise
+        except BaseException:
+            if response is None:
+                await self._fail_call(request, "CancelledError")
             raise
         if response is None:
             raise ModelProviderError("model stream ended without a completed response")
         result = self._to_generate_response(response)
-        if self._state is not None:
-            await self._state.complete(
-                tenant_id=request.context.tenant_id,
-                model_call_id=request.model_call_id,
-                response=result,
-            )
+        # Yield completed before persisting so Runtime receives the terminal event
+        # even if the DB write is slow or the SSE connection drops mid-persist.
         sequence += 1
         yield ModelStreamEvent(
             model_call_id=request.model_call_id,
@@ -145,6 +149,20 @@ class ModelGatewayInternalService:
             type="completed",
             payload=result.model_dump(mode="json"),
         )
+        if self._state is not None:
+            try:
+                await self._state.complete(
+                    tenant_id=request.context.tenant_id,
+                    model_call_id=request.model_call_id,
+                    response=result,
+                )
+            except Exception:
+                logger.exception(
+                    "model call completed for client but persistence failed "
+                    "tenant=%s model_call=%s",
+                    request.context.tenant_id,
+                    request.model_call_id,
+                )
 
     async def cancel(self, request: ModelCancelRequest) -> ModelCancelResponse:
         self._require_runtime(request.context.service_identity)
@@ -183,17 +201,41 @@ class ModelGatewayInternalService:
             raise reservation
         if isinstance(policy_result, BaseException):
             if (
-                self._state is not None
-                and isinstance(reservation, ModelCallReservation)
+                isinstance(reservation, ModelCallReservation)
                 and reservation.status == "reserved"
             ):
-                await self._state.fail(
-                    tenant_id=request.context.tenant_id,
-                    model_call_id=request.model_call_id,
-                    error_code=type(policy_result).__name__,
-                )
+                await self._fail_call(request, type(policy_result).__name__)
             raise policy_result
         return reservation if isinstance(reservation, ModelCallReservation) else None
+
+    async def _wait_for_inflight(
+        self, request: ModelGenerateRequest, request_digest: str
+    ) -> ModelCallReservation:
+        assert self._state is not None
+        deadline = asyncio.get_running_loop().time() + self._inflight_wait_seconds
+        reservation = ModelCallReservation("in_progress")
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(self._inflight_poll_seconds)
+            reservation = await self._state.reserve(
+                tenant_id=request.context.tenant_id,
+                model_call_id=request.model_call_id,
+                run_id=request.run_id,
+                request_digest=request_digest,
+                reserved_tokens=request.max_output_tokens,
+                token_limit=self._tenant_token_limit,
+            )
+            if reservation.status != "in_progress":
+                return reservation
+        return reservation
+
+    async def _fail_call(self, request: ModelGenerateRequest, error_code: str) -> None:
+        if self._state is None:
+            return
+        await self._state.fail(
+            tenant_id=request.context.tenant_id,
+            model_call_id=request.model_call_id,
+            error_code=error_code,
+        )
 
     async def _enforce_policy(self, request: ModelGenerateRequest) -> None:
         if self._policy is None:

@@ -11,6 +11,7 @@ from auraclaw.contracts.capabilities import (
     CapabilityStatus,
     CapabilityTrustLevel,
     McpAuthStrategy,
+    McpNetworkMode,
     McpOAuthConfiguration,
     McpServerDefinition,
 )
@@ -25,6 +26,7 @@ from auraclaw.infrastructure.connectors.mcp.wire import (
     McpTrustedContext,
 )
 from auraclaw.infrastructure.credentials.mcp_egress import (
+    MCP_STREAMABLE_HTTP_ACCEPT,
     ManagedMcpEgressAdapter,
     McpEgressResponse,
 )
@@ -252,6 +254,7 @@ def test_mcp_egress_uses_resource_indicator_pins_dns_and_hides_tokens() -> None:
         assert request_headers["MCP-Protocol-Version"] == MCP_PROTOCOL_VERSION
         assert request_headers["Mcp-Method"] == "tools/call"
         assert request_headers["Mcp-Name"] == "github.issue.get"
+        assert request_headers["Accept"] == MCP_STREAMABLE_HTTP_ACCEPT
         assert resolver.calls == [
             ("mcp.example", 443),
             ("auth.example", 443),
@@ -585,6 +588,163 @@ def test_mcp_egress_sends_department_snapshot_headers() -> None:
         assert isinstance(missing, dict)
         assert "X-CT-Dept-ID" not in missing
         assert missing["X-CT-User-ID"] == "101"
+
+
+def test_mcp_egress_http_400_includes_server_body() -> None:
+    async def scenario() -> None:
+        class _BadSender(_Sender):
+            async def send(self, **request: object) -> McpEgressResponse:
+                self.calls.append(request)
+                return McpEgressResponse(
+                    status_code=400,
+                    headers={"content-type": "text/plain"},
+                    content=b"Accept header must include both application/json and text/event-stream",
+                )
+
+        sender = _BadSender()
+        sender.require_oauth_bearer = False
+        server = McpServerDefinition(
+            server_id="java-mcp",
+            tenant_id="local-org",
+            title="Java MCP",
+            endpoint="http://127.0.0.1:48090/rpc-api/agent-runtime/mcp",
+            protocol_revision="2025-06-18",
+            auth_strategy=McpAuthStrategy.NONE,
+            network_mode=McpNetworkMode.LOOPBACK,
+            trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
+            allowed_tool_prefixes=("price_insight.",),
+            allowed_private_hosts=("127.0.0.1",),
+            status=CapabilityStatus.ACTIVE,
+            enabled=True,
+        )
+        adapter = ManagedMcpEgressAdapter(
+            server,
+            resolver=_Resolver(("127.0.0.1",)),
+            sender=sender,
+        )
+        with pytest.raises(CredentialAccessError, match="HTTP 400.*Accept header"):
+            await adapter(
+                {
+                    "server_id": "java-mcp",
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18"},
+                },
+                "",
+            )
+
+    asyncio.run(scenario())
+
+
+def test_mcp_egress_forwards_mcp_session_id() -> None:
+    async def scenario() -> None:
+        class _SessionSender(_Sender):
+            async def send(self, **request: object) -> McpEgressResponse:
+                self.calls.append(request)
+                headers = request["headers"]
+                assert isinstance(headers, dict)
+                if len(self.calls) == 1:
+                    assert "Mcp-Session-Id" not in headers
+                    return McpEgressResponse(
+                        status_code=200,
+                        headers={
+                            "content-type": "application/json",
+                            "mcp-session-id": "sess-java-1",
+                        },
+                        content=b'{"jsonrpc":"2.0","id":1,"result":{}}',
+                    )
+                assert headers["Mcp-Session-Id"] == "sess-java-1"
+                return McpEgressResponse(
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    content=b'{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}',
+                )
+
+        sender = _SessionSender()
+        sender.require_oauth_bearer = False
+        server = McpServerDefinition(
+            server_id="java-mcp",
+            tenant_id="local-org",
+            title="Java MCP",
+            endpoint="http://127.0.0.1:48090/rpc-api/agent-runtime/mcp",
+            protocol_revision="2025-06-18",
+            auth_strategy=McpAuthStrategy.NONE,
+            network_mode=McpNetworkMode.LOOPBACK,
+            trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
+            allowed_tool_prefixes=("price_insight.",),
+            allowed_private_hosts=("127.0.0.1",),
+            status=CapabilityStatus.ACTIVE,
+            enabled=True,
+        )
+        adapter = ManagedMcpEgressAdapter(
+            server,
+            resolver=_Resolver(("127.0.0.1",)),
+            sender=sender,
+        )
+        payload = {
+            "server_id": "java-mcp",
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"},
+        }
+        await adapter({**payload, "id": 1}, "")
+        await adapter({**payload, "id": 2, "method": "tools/list", "params": {}}, "")
+        assert len(sender.calls) == 2
+
+    asyncio.run(scenario())
+
+    asyncio.run(scenario())
+
+
+def test_mcp_egress_loopback_none_forwards_identity_and_prefers_json() -> None:
+    async def scenario() -> None:
+        sender = _Sender()
+        sender.require_oauth_bearer = False
+        server = McpServerDefinition(
+            server_id="java-mcp",
+            tenant_id="local-org",
+            title="Java MCP",
+            endpoint="http://127.0.0.1:48090/rpc-api/agent-runtime/mcp",
+            protocol_revision="2025-06-18",
+            auth_strategy=McpAuthStrategy.NONE,
+            network_mode=McpNetworkMode.LOOPBACK,
+            trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
+            allowed_tool_prefixes=("price_insight.",),
+            allowed_private_hosts=("127.0.0.1",),
+            status=CapabilityStatus.ACTIVE,
+            enabled=True,
+        )
+        adapter = ManagedMcpEgressAdapter(
+            server,
+            resolver=_Resolver(("127.0.0.1",)),
+            sender=sender,
+        )
+        await adapter(
+            {
+                "server_id": "java-mcp",
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "price_insight.metric.positive_impact_amount.compute",
+                    "arguments": {},
+                },
+                "_auraclaw_identity": {
+                    "tenant_id": "local-org",
+                    "user_id": "local-user",
+                    "dept_id": None,
+                    "session_id": "ses-1",
+                },
+            },
+            "",
+        )
+        headers = sender.calls[-1]["headers"]
+        assert isinstance(headers, dict)
+        assert headers["Accept"] == MCP_STREAMABLE_HTTP_ACCEPT
+        assert headers["X-CT-Tenant-ID"] == "local-org"
+        assert headers["X-CT-User-ID"] == "local-user"
+        assert "X-CT-Dept-ID" not in headers
 
     asyncio.run(scenario())
 

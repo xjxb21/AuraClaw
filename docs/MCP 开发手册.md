@@ -293,12 +293,6 @@ routed_hands = RoutedHandsExecutor(
 | `auraclaw.capabilities.load` | 按 id 加载完整契约，单次最多 8 个 |
 | `auraclaw.skills.resolve` | 解析并绑定一个 Skill 版本 |
 
-这些点号名称是 AuraClaw 内部规范名，不能为适配某个模型供应商而修改。模型
-Provider 会在发送前将不符合 Function Calling 约束的名称转换为仅包含字母、数字、
-下划线和短横线的临时别名；工具声明和后续轮次的 Tool Call 历史使用同一别名，模型返回
-Tool Call 后再还原为内部规范名。动态对账得到的 Java MCP Tool 也经过同一映射；别名不得
-写入 Catalog、Skill 或 Hands 路由。
-
 ---
 
 ## 5. 把 Java 服务接进来

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -35,6 +36,7 @@ class HandsGateway:
         resource_reader: ResourceReader | None = None,
         prompts: HandsPromptRegistry | None = None,
         page_size: int = 50,
+        on_missing_resource: Callable[[str], None] | None = None,
     ) -> None:
         if page_size < 1 or page_size > 100:
             raise ValueError("Hands page_size must be between 1 and 100")
@@ -44,6 +46,7 @@ class HandsGateway:
         self._resource_reader = resource_reader
         self._prompts = prompts or HandsPromptRegistry()
         self._page_size = page_size
+        self._on_missing_resource = on_missing_resource
 
     async def list_tools(
         self,
@@ -90,9 +93,25 @@ class HandsGateway:
         trusted: HandsTrustedContext,
         uri: str,
     ) -> tuple[HandsResourceContent, ...]:
-        if self._resource_reader is not None:
+        try:
+            return await self._read_resource_once(trusted, uri)
+        except KeyError:
+            if self._on_missing_resource is None:
+                raise
+            self._on_missing_resource(uri)
+            return await self._read_resource_once(trusted, uri)
+
+    async def _read_resource_once(
+        self,
+        trusted: HandsTrustedContext,
+        uri: str,
+    ) -> tuple[HandsResourceContent, ...]:
+        try:
+            return self._resources.read(trusted.tenant_id, uri)
+        except KeyError:
+            if self._resource_reader is None:
+                raise
             return await self._resource_reader.read(trusted, uri)
-        return self._resources.read(trusted.tenant_id, uri)
 
     async def list_prompts(
         self,

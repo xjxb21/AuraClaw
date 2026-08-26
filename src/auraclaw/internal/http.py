@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, NoReturn, TypeVar
@@ -35,6 +36,7 @@ RequestModel = TypeVar("RequestModel", bound=ContractModel)
 ResponseModel = TypeVar("ResponseModel", bound=ContractModel)
 ContractHandler = Callable[[ContractModel], Awaitable[ContractModel]]
 StreamContractHandler = Callable[[ContractModel], AsyncIterator[ContractModel]]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -206,10 +208,27 @@ def create_contract_app(
             _authenticate(request_model, raw_request)
 
             async def event_stream() -> AsyncIterator[str]:
-                async for event in route.handler(request_model):
-                    validated = route.event_model.model_validate(event)
-                    yield f"data: {validated.model_dump_json()}\n\n"
-                yield "data: [DONE]\n\n"
+                try:
+                    async for event in route.handler(request_model):
+                        validated = route.event_model.model_validate(event)
+                        yield f"data: {validated.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as exc:
+                    logger.exception("internal stream handler failed")
+                    error_event = {
+                        "model_call_id": getattr(
+                            request_model, "model_call_id", "unknown"
+                        ),
+                        "sequence": 1,
+                        "type": "error",
+                        "payload": {"message": str(exc)},
+                    }
+                    try:
+                        validated = route.event_model.model_validate(error_event)
+                        yield f"data: {validated.model_dump_json()}\n\n"
+                    except Exception:
+                        logger.exception("internal stream error event was invalid")
+                    yield "data: [DONE]\n\n"
 
             return StreamingResponse(
                 event_stream(),
@@ -281,11 +300,17 @@ class HttpContractClient:
         request: RequestModel,
         response_model: type[ResponseModel],
     ) -> ResponseModel:
-        response = await self._client.post(
-            path,
-            json=request.model_dump(mode="json"),
-            headers=self._headers(),
-        )
+        try:
+            response = await self._client.post(
+                path,
+                json=request.model_dump(mode="json"),
+                headers=self._headers(),
+            )
+        except httpx.RequestError as exc:
+            raise AuraClawError(
+                "internal contract peer closed the connection",
+                detail=type(exc).__name__,
+            ) from exc
         if response.is_error:
             _raise_contract_error(response)
         return response_model.model_validate(response.json())
@@ -296,19 +321,25 @@ class HttpContractClient:
         request: RequestModel,
         event_model: type[ResponseModel],
     ) -> AsyncIterator[ResponseModel]:
-        async with self._client.stream(
-            "POST",
-            path,
-            json=request.model_dump(mode="json"),
-            headers=self._headers(),
-        ) as response:
-            if response.is_error:
-                await response.aread()
-                _raise_contract_error(response)
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                value = line[5:].strip()
-                if not value or value == "[DONE]":
-                    continue
-                yield event_model.model_validate_json(value)
+        try:
+            async with self._client.stream(
+                "POST",
+                path,
+                json=request.model_dump(mode="json"),
+                headers=self._headers(),
+            ) as response:
+                if response.is_error:
+                    await response.aread()
+                    _raise_contract_error(response)
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    value = line[5:].strip()
+                    if not value or value == "[DONE]":
+                        continue
+                    yield event_model.model_validate_json(value)
+        except httpx.RequestError as exc:
+            raise AuraClawError(
+                "internal stream was closed by the peer",
+                detail=type(exc).__name__,
+            ) from exc

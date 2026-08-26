@@ -8,6 +8,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -15,6 +16,7 @@ from uuid import uuid4
 
 from auraclaw.contracts.errors import (
     BudgetExceededError,
+    CollaborationValidationError,
     ModelProviderError,
     RuntimeCancelledError,
 )
@@ -23,6 +25,7 @@ from auraclaw.contracts.state import Visibility
 from auraclaw.control.ports import RuntimeAssignment, RuntimeCheckpoint
 from auraclaw.runtime.capability_controller import RuntimeCapabilityController
 from auraclaw.runtime.clients import assignment_resource_id
+from auraclaw.runtime.collaboration_controller import RuntimeCollaborationController
 from auraclaw.runtime.model_stream import iter_model_stream
 from auraclaw.runtime.ports import (
     ModelClient,
@@ -73,6 +76,7 @@ class AgentHarness:
         runtime_events: RuntimeEventPublisher,
         model_policy: ModelPolicy | None = None,
         capability_controller: RuntimeCapabilityController | None = None,
+        collaboration_controller: RuntimeCollaborationController | None = None,
         failure_injector: FailureInjector | None = None,
     ) -> None:
         self._control = control_store
@@ -82,6 +86,7 @@ class AgentHarness:
         self._runtime_events = runtime_events
         self._policy = model_policy or ModelPolicy()
         self._capability_controller = capability_controller
+        self._collaboration_controller = collaboration_controller
         self._failure_injector = failure_injector
 
     async def execute(self, assignment: RuntimeAssignment) -> None:
@@ -109,7 +114,10 @@ class AgentHarness:
         ):
             await self._control.finish_assignment(self._task_id(assignment), "completed")
             return
-        if self._capability_controller is not None:
+        if (
+            self._capability_controller is not None
+            or self._collaboration_controller is not None
+        ):
             await self._execute_capability_loop(
                 assignment, events=events, execute_started=execute_started
             )
@@ -138,16 +146,20 @@ class AgentHarness:
                     "model request has no user/assistant messages "
                     f"(session={assignment.session_id} run={assignment.run_id})"
                 )
+            request = ModelRequest(
+                model_call_id=model_call_id,
+                tenant_id=assignment.tenant_id,
+                run_id=assignment.run_id,
+                messages=messages,
+                policy=self._policy,
+                max_output_tokens=assignment.budget.max_output_tokens,
+            )
+            await self._record_model_input(
+                assignment, events, request=request, turn_index=0
+            )
             response, sequence = await self._generate_with_live_deltas(
                 assignment,
-                ModelRequest(
-                    model_call_id=model_call_id,
-                    tenant_id=assignment.tenant_id,
-                    run_id=assignment.run_id,
-                    messages=messages,
-                    policy=self._policy,
-                    max_output_tokens=assignment.budget.max_output_tokens,
-                ),
+                request,
                 sequence=0,
                 execute_started=execute_started,
                 prep=checkpoint_ready,
@@ -239,7 +251,10 @@ class AgentHarness:
         events: list[Any] | None = None,
         execute_started: float | None = None,
     ) -> None:
-        assert self._capability_controller is not None
+        assert (
+            self._capability_controller is not None
+            or self._collaboration_controller is not None
+        )
         if execute_started is None:
             execute_started = time.perf_counter()
         checkpoint = await self._control.load_checkpoint(
@@ -250,29 +265,47 @@ class AgentHarness:
         state: dict[str, Any] = (
             dict(checkpoint.state)
             if checkpoint is not None
-            and checkpoint.phase.startswith("capability.")
+            and checkpoint.phase.startswith(("capability.", "agent."))
             else {
                 "turn_index": 0,
                 "steps_used": 0,
                 "sequence": 0,
                 "usage": {},
-                "capability_state": self._capability_controller.empty_state(),
+                "capability_state": (
+                    self._capability_controller.empty_state()
+                    if self._capability_controller is not None
+                    else {}
+                ),
                 "call_index": 0,
                 "call_signatures": {},
             }
         )
+        if checkpoint is not None and checkpoint.phase == "capability.approval_waiting":
+            approval_id = str(state.get("approval_id", ""))
+            session_events = await self._session.load(assignment)
+            approved = bool(approval_id) and any(
+                event.type == "approval.approved"
+                and event.payload.get("approval_id") == approval_id
+                for event in session_events
+            )
+            if not approved:
+                await self._control.finish_assignment(
+                    self._task_id(assignment), "waiting_for_human"
+                )
+                return
         turn_events = events
         while int(state.get("steps_used", 0)) < assignment.budget.max_steps:
             await self._guard(assignment)
             turn_index = int(state.get("turn_index", 0))
             model_call_id = f"mdl_{assignment.run_id}_turn_{turn_index + 1}"
             resume_phase = checkpoint.phase if checkpoint is not None else ""
+            if resume_phase == "capability.approval_waiting":
+                resume_phase = "capability.model_completed"
             if (
                 resume_phase
                 in {
                     "capability.model_completed",
                     "capability.call_completed",
-                    "capability.approval_waiting",
                 }
                 and int(state.get("turn_index", -1)) == turn_index
                 and isinstance(state.get("response"), dict)
@@ -282,9 +315,22 @@ class AgentHarness:
                 if turn_events is None:
                     turn_events = await self._session.load(assignment)
                 capability_state = dict(state.get("capability_state", {}))
-                trusted = await self._capability_controller.trusted_messages(
-                    assignment, capability_state
-                )
+                trusted: tuple[dict[str, Any], ...] = ()
+                if self._capability_controller is not None:
+                    trusted += await self._capability_controller.trusted_messages(
+                        assignment, capability_state
+                    )
+                if self._collaboration_controller is not None:
+                    trusted += await self._collaboration_controller.trusted_messages(
+                        assignment
+                    )
+                model_tools: tuple[dict[str, Any], ...] = ()
+                if self._capability_controller is not None:
+                    model_tools += self._capability_controller.model_tools(
+                        capability_state
+                    )
+                if self._collaboration_controller is not None:
+                    model_tools += self._collaboration_controller.model_tools(assignment)
                 output_tokens_used = int(
                     dict(state.get("usage", {})).get("output_tokens", 0)
                 )
@@ -308,22 +354,27 @@ class AgentHarness:
                 )
                 await self._inject(InjectionPoint.BEFORE_MODEL)
                 await self._guard(assignment)
+                request = ModelRequest(
+                    model_call_id=model_call_id,
+                    tenant_id=assignment.tenant_id,
+                    run_id=assignment.run_id,
+                    messages=(
+                        *trusted,
+                        *self._build_capability_messages(turn_events),
+                    ),
+                    tools=model_tools,
+                    policy=self._policy,
+                    max_output_tokens=remaining_output_tokens,
+                )
+                await self._record_model_input(
+                    assignment,
+                    turn_events,
+                    request=request,
+                    turn_index=turn_index,
+                )
                 response, sequence = await self._generate_with_live_deltas(
                     assignment,
-                    ModelRequest(
-                        model_call_id=model_call_id,
-                        tenant_id=assignment.tenant_id,
-                        run_id=assignment.run_id,
-                        messages=(
-                            *trusted,
-                            *self._build_capability_messages(turn_events),
-                        ),
-                        tools=self._capability_controller.model_tools(
-                            capability_state
-                        ),
-                        policy=self._policy,
-                        max_output_tokens=remaining_output_tokens,
-                    ),
+                    request,
                     sequence=int(state.get("sequence", 0)),
                     publish_deltas=True,
                     execute_started=execute_started,
@@ -384,6 +435,13 @@ class AgentHarness:
             call_index = int(state.get("call_index", 0))
             while call_index < len(response.tool_calls):
                 call = response.tool_calls[call_index]
+                pending_approval_id = state.get("approval_id")
+                if (
+                    pending_approval_id
+                    and call.tool_invocation_id == state.get("tool_invocation_id")
+                    and call.approval_id is None
+                ):
+                    call = replace(call, approval_id=str(pending_approval_id))
                 events = await self._session.load(assignment)
                 await self._append_once(
                     assignment,
@@ -394,6 +452,11 @@ class AgentHarness:
                         "name": call.name,
                         "arguments": call.arguments,
                         "turn_index": turn_index,
+                        "version": call.version,
+                        "expected_side_effect": call.expected_side_effect,
+                        "activity": self._tool_activity_metadata(
+                            dict(state.get("capability_state", {})), call
+                        ),
                     },
                     identity=call.tool_invocation_id,
                 )
@@ -419,6 +482,11 @@ class AgentHarness:
                         )
                         for item in checkpoint.state.get("side_events", ())
                     )
+                    terminal = bool(checkpoint.state.get("collaboration_terminal"))
+                    waiting_child_ids = tuple(
+                        str(item)
+                        for item in checkpoint.state.get("waiting_child_ids", ())
+                    )
                 else:
                     if int(state.get("steps_used", 0)) >= assignment.budget.max_steps:
                         raise BudgetExceededError(
@@ -442,14 +510,46 @@ class AgentHarness:
                     state["call_signatures"] = signatures
                     await self._inject(InjectionPoint.BEFORE_TOOL)
                     await self._guard(assignment)
-                    execution = await self._capability_controller.execute(
-                        assignment,
-                        call,
-                        dict(state.get("capability_state", {})),
-                    )
-                    result = execution.result
-                    capability_state = execution.state
-                    side_events = execution.events
+                    terminal = False
+                    waiting_child_ids = ()
+                    if (
+                        self._collaboration_controller is not None
+                        and self._collaboration_controller.owns(call.name)
+                    ):
+                        if (
+                            self._collaboration_controller.is_terminal(call.name)
+                            and call_index != len(response.tool_calls) - 1
+                        ):
+                            raise CollaborationValidationError(
+                                "terminal collaboration tool must be the final tool call"
+                            )
+                        collaboration_execution = (
+                            await self._collaboration_controller.execute(
+                                assignment, call
+                            )
+                        )
+                        result = collaboration_execution.result
+                        capability_state = dict(
+                            state.get("capability_state", {})
+                        )
+                        side_events = ()
+                        terminal = collaboration_execution.terminal
+                        waiting_child_ids = (
+                            collaboration_execution.waiting_child_ids
+                        )
+                    else:
+                        if self._capability_controller is None:
+                            raise CollaborationValidationError(
+                                f"unsupported Runtime tool: {call.name}"
+                            )
+                        execution = await self._capability_controller.execute(
+                            assignment,
+                            call,
+                            dict(state.get("capability_state", {})),
+                        )
+                        result = execution.result
+                        capability_state = execution.state
+                        side_events = execution.events
                     state = {
                         **state,
                         "capability_state": capability_state,
@@ -464,6 +564,8 @@ class AgentHarness:
                         ],
                         "tool_invocation_id": call.tool_invocation_id,
                         "call_index": call_index,
+                        "collaboration_terminal": terminal,
+                        "waiting_child_ids": list(waiting_child_ids),
                         "steps_used": int(state.get("steps_used", 0)) + 1,
                     }
                     if int(state["steps_used"]) > assignment.budget.max_steps:
@@ -512,6 +614,30 @@ class AgentHarness:
                     },
                     identity=call.tool_invocation_id,
                 )
+                if waiting_child_ids:
+                    waiting_state = {
+                        **state,
+                        "turn_index": turn_index + 1,
+                        "call_index": call_index + 1,
+                        "waiting_child_ids": list(waiting_child_ids),
+                    }
+                    waiting_state.pop("response", None)
+                    waiting_state.pop("result", None)
+                    await self._save_checkpoint(
+                        assignment, "agent.waiting_children", waiting_state
+                    )
+                    await self._control.suspend_assignment(
+                        self._task_id(assignment), "waiting_children"
+                    )
+                    return
+                if terminal:
+                    await self._save_checkpoint(
+                        assignment, "agent.completed", state
+                    )
+                    await self._control.finish_assignment(
+                        self._task_id(assignment), "completed"
+                    )
+                    return
                 call_index += 1
                 state = {
                     **state,
@@ -548,6 +674,34 @@ class AgentHarness:
                 continue
 
             events = await self._session.load(assignment)
+            if self._collaboration_controller is not None:
+                all_children, active_children = (
+                    await self._collaboration_controller.child_state(assignment)
+                )
+                if active_children:
+                    waiting_state = {
+                        **state,
+                        "turn_index": turn_index + 1,
+                        "call_index": 0,
+                        "waiting_child_ids": list(active_children),
+                    }
+                    waiting_state.pop("response", None)
+                    waiting_state.pop("result", None)
+                    await self._save_checkpoint(
+                        assignment, "agent.waiting_children", waiting_state
+                    )
+                    await self._control.suspend_assignment(
+                        self._task_id(assignment), "waiting_children"
+                    )
+                    return
+                if all_children and assignment.role in {"root", "coordinator"}:
+                    raise CollaborationValidationError(
+                        "Coordinator graph was not joined"
+                    )
+                if assignment.role in {"worker", "repair", "reviewer"}:
+                    raise CollaborationValidationError(
+                        "role output contract was not published"
+                    )
             await self._append_once(
                 assignment,
                 events,
@@ -563,11 +717,12 @@ class AgentHarness:
                 identity=response.model_call_id,
                 visibility=Visibility.USER,
             )
-            for event in self._capability_controller.terminal_events(
-                dict(state.get("capability_state", {})),
-                response.completed_output,
-            ):
-                await self._append_capability_event(assignment, event)
+            if self._capability_controller is not None:
+                for event in self._capability_controller.terminal_events(
+                    dict(state.get("capability_state", {})),
+                    response.completed_output,
+                ):
+                    await self._append_capability_event(assignment, event)
             events = await self._session.load(assignment)
             await self._append_once(
                 assignment,
@@ -769,6 +924,9 @@ class AgentHarness:
                 "tool_invocation_id": call.tool_invocation_id,
                 "name": call.name,
                 "arguments": call.arguments,
+                "version": call.version,
+                "expected_side_effect": call.expected_side_effect,
+                "activity": {"source": "tool"},
             },
             identity=call.tool_invocation_id,
         )
@@ -900,6 +1058,91 @@ class AgentHarness:
             refreshed = await self._session.load(assignment)
             existing.clear()
             existing.extend(refreshed)
+
+    async def _record_model_input(
+        self,
+        assignment: RuntimeAssignment,
+        existing: list[Any],
+        *,
+        request: ModelRequest,
+        turn_index: int,
+    ) -> None:
+        await self._append_once(
+            assignment,
+            existing,
+            "model.input.prepared",
+            self._model_input_evidence(request, turn_index=turn_index),
+            identity=request.model_call_id,
+            visibility=Visibility.USER,
+        )
+
+    @staticmethod
+    def _model_input_evidence(
+        request: ModelRequest, *, turn_index: int
+    ) -> dict[str, Any]:
+        roles: dict[str, int] = {}
+        user_prompt_preview = ""
+        for message in request.messages:
+            role = str(message.get("role", "unknown"))
+            roles[role] = roles.get(role, 0) + 1
+            if role == "user" and isinstance(message.get("content"), str):
+                user_prompt_preview = " ".join(str(message["content"]).split())[:800]
+        tool_names: list[str] = []
+        for tool in request.tools:
+            function = tool.get("function")
+            if isinstance(function, dict) and function.get("name"):
+                tool_names.append(str(function["name"]))
+        encoded = json.dumps(
+            {"messages": request.messages, "tools": request.tools},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+        tool_encoded = json.dumps(
+            request.tools,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+        return {
+            "model_call_id": request.model_call_id,
+            "turn_index": turn_index,
+            "message_count": len(request.messages),
+            "role_counts": roles,
+            "user_prompt_preview": user_prompt_preview,
+            "input_digest": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+            "tool_schema_digest": f"sha256:{hashlib.sha256(tool_encoded).hexdigest()}",
+            "tool_names": tool_names,
+            "preferred_model": request.policy.preferred_model,
+            "allowed_providers": list(request.policy.allowed_providers),
+            "data_classification": request.policy.data_classification,
+            "max_output_tokens": request.max_output_tokens,
+            "trusted_instruction_count": roles.get("system", 0),
+        }
+
+    @staticmethod
+    def _tool_activity_metadata(
+        capability_state: dict[str, Any], call: ToolCall
+    ) -> dict[str, Any]:
+        for capability_id, item in dict(capability_state.get("loaded", {})).items():
+            if not isinstance(item, dict):
+                continue
+            if item.get("kind") != "tool" or item.get("canonical_name") != call.name:
+                continue
+            server_id = str(item.get("server_id", ""))
+            return {
+                "source": "mcp" if server_id else "catalog",
+                "capability_id": str(item.get("capability_id") or capability_id),
+                "kind": "tool",
+                "server_id": server_id or None,
+                "version": str(item.get("version") or call.version),
+            }
+        return {
+            "source": "auraclaw" if call.name.startswith("auraclaw.") else "tool",
+            "version": call.version,
+        }
 
     async def _guard(self, assignment: RuntimeAssignment) -> None:
         await self._control.assert_fencing(

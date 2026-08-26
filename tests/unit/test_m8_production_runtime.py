@@ -182,11 +182,15 @@ def test_seaweedfs_settings_resolve_endpoints_and_auto_enable(
         "SEAWEEDFS_USE_SSL",
         "SEAWEEDFS_PATH_STYLE",
         "AURACLAW_ARTIFACT_BACKEND",
+        "OBS_ENDPOINT",
+        "OBS_AK",
+        "OBS_SK",
     ):
         monkeypatch.delenv(name, raising=False)
 
     local_only = Settings(_env_file=None)
     assert local_only.seaweedfs_enabled is False
+    assert local_only.object_storage_enabled is False
     assert local_only.seaweedfs_s3_endpoint == "http://127.0.0.1:8333"
 
     monkeypatch.setenv("SEAWEEDFS_HOST", "seaweed.example")
@@ -195,6 +199,8 @@ def test_seaweedfs_settings_resolve_endpoints_and_auto_enable(
     monkeypatch.setenv("SEAWEEDFS_BUCKET", "auraclaw-dev")
     auto = Settings(_env_file=None)
     assert auto.seaweedfs_enabled is True
+    assert auto.object_storage_enabled is True
+    assert auto.resolved_artifact_backend == "seaweedfs"
     assert auto.seaweedfs_master == "seaweed.example:9333"
     assert auto.seaweedfs_filer_url == "http://seaweed.example:8888"
     assert auto.seaweedfs_s3_endpoint == "http://seaweed.example:8333"
@@ -206,10 +212,40 @@ def test_seaweedfs_settings_resolve_endpoints_and_auto_enable(
     monkeypatch.setenv("AURACLAW_ARTIFACT_BACKEND", "local")
     forced_local = Settings(_env_file=None)
     assert forced_local.seaweedfs_enabled is False
+    assert forced_local.object_storage_enabled is False
 
     monkeypatch.setenv("AURACLAW_ARTIFACT_BACKEND", "seaweedfs")
     monkeypatch.delenv("SEAWEEDFS_SECRET_KEY")
     with pytest.raises(ValueError, match="SEAWEEDFS_SECRET_KEY"):
+        Settings(_env_file=None)
+
+
+def test_obs_settings_resolve_endpoint_and_require_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "AURACLAW_ARTIFACT_BACKEND",
+        "OBS_ENDPOINT",
+        "OBS_BUCKET",
+        "OBS_AK",
+        "OBS_SK",
+        "OBS_REGION",
+        "OBS_USE_SSL",
+        "OBS_PATH_STYLE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv("AURACLAW_ARTIFACT_BACKEND", "obs")
+    monkeypatch.setenv("OBS_ENDPOINT", "obsv3.example.com")
+    monkeypatch.setenv("OBS_AK", "obs-ak")
+    monkeypatch.setenv("OBS_SK", "obs-sk")
+    settings = Settings(_env_file=None)
+    assert settings.obs_enabled is True
+    assert settings.obs_s3_endpoint == "https://obsv3.example.com"
+    assert "obs-ak" not in repr(settings.obs_ak)
+
+    monkeypatch.delenv("OBS_SK")
+    with pytest.raises(ValueError, match="OBS_SK"):
         Settings(_env_file=None)
 
 
@@ -291,6 +327,82 @@ def test_openai_compatible_provider_streams_usage_and_tools() -> None:
         assert captured["body"]["stream"] is True
         assert captured["body"]["max_tokens"] == 32
         assert "thinking" not in captured["body"]
+
+    asyncio.run(scenario())
+
+
+def test_openai_compatible_provider_aliases_dotted_tool_names() -> None:
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        chunk = {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-search",
+                                "function": {
+                                    "name": "auraclaw_capabilities_search",
+                                    "arguments": '{"query":"semantic.query.answer"}',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        return httpx.Response(200, text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n")
+
+    async def scenario() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            base_url="https://models.example/v1", model="example-model", client=client
+        )
+        response = await provider.generate(
+            ModelRequest(
+                model_call_id="model-dotted-tool",
+                tenant_id="tenant-m8",
+                run_id="run-m8",
+                messages=(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-search",
+                                "type": "function",
+                                "function": {
+                                    "name": "auraclaw.capabilities.search",
+                                    "arguments": "{\"query\":\"semantic.query.answer\"}",
+                                },
+                            }
+                        ],
+                    },
+                ),
+                tools=(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "auraclaw.capabilities.search",
+                            "parameters": {"type": "object"},
+                        },
+                    },
+                ),
+            ),
+            credential="gateway-only-secret",
+        )
+        await client.aclose()
+        assert captured["body"]["tools"][0]["function"]["name"] == (
+            "auraclaw_capabilities_search"
+        )
+        assert captured["body"]["messages"][0]["tool_calls"][0]["function"]["name"] == (
+            "auraclaw_capabilities_search"
+        )
+        assert response.tool_calls[0].name == "auraclaw.capabilities.search"
 
     asyncio.run(scenario())
 
