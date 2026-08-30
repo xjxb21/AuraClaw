@@ -2271,3 +2271,25 @@ ready Skill Artifact 建立带 fencing 的物理回收流程；不把成功命�
 - [x] AuraX 产品面板、SDK、响应式与 E2E 验收完成。
 - [ ] Git 暂存范围已与现有在途改动隔离，无 Secret、缓存或环境文件。
 - [ ] 本阶段作为 intentional commit 提交并 push。
+
+## 阶段 ChatBI P5：可靠结构化终态内容
+
+状态：代码、本地定向验证、共享 KingBase 迁移和真实文字 Result API 已验证；真实图表联调与 push 待完成。
+
+### 功能与兼容
+
+- [x] `run.completed.content_parts` 按顺序保存 `text` 与受校验的 `chatbi_chart`。
+- [x] `content_parts` 贯通 Session snapshot、Task projection、Result API 和 SQL 投影存储。
+- [x] 旧事件缺少 `content_parts` 时从 `result_summary` 恢复单个 `text` 块。
+- [x] `chatbi.chart.ready` 仅作为可丢失预览；SSE 失败不影响 Canonical 终态结果。
+- [x] 最新有效预览按当前 `run_id` 选择，空数据、失败结果和旧 Run 不生成图表块。
+
+### 迁移、测试与交付
+
+- [x] PostgreSQL / KingBase `0042` 与 MySQL `0023` 正反迁移已提供。
+- [x] Compose、环境示例、KingBase 同步脚本和运维命令默认目标已同步至 `0042`。
+- [x] Content parts、Runtime、投影、Result API、迁移文件定向测试和 Mypy、Ruff 通过。
+- [x] 在共享联调 KingBase 执行 `0042`，真实 Result API 返回并持久化 `text` content part。
+- [ ] MCP 图表能力启用后完成真实 `chatbi_chart` Result API / 图表联调。
+- [x] 本阶段作为 intentional commit 提交，不包含 `.env`、Secret、缓存或无关改动。
+- [ ] 将当前分支 push 到 `origin`。

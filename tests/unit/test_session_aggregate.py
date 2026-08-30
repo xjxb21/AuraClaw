@@ -84,3 +84,26 @@ def test_legacy_root_terminal_snapshot_is_restored_as_ready() -> None:
 
     assert restored.status is SessionStatus.READY
     assert restored.run_status is RunStatus.COMPLETED
+
+
+def test_content_parts_round_trip_snapshot_reset_and_legacy_completion() -> None:
+    parts = [
+        {"type": "text", "text": "图表已生成。"},
+        {"type": "chatbi_chart", "componentKey": "metric-comparison"},
+    ]
+    session = SessionAggregate.empty("ses_1", "tenant_1")
+    session.create(goal="build a chart", run_id="run_1")
+    session.release_pending_events()
+
+    session.apply(
+        "run.completed",
+        {"result_summary": "图表已生成。", "content_parts": parts},
+    )
+    restored = SessionAggregate.from_snapshot(session.snapshot_state(), version=3)
+
+    assert restored.content_parts == parts
+    restored.apply("run.requested", {"run_id": "run_2"})
+    assert restored.content_parts == []
+
+    restored.apply("run.completed", {"result_summary": "旧事件文字结果"})
+    assert restored.content_parts == [{"type": "text", "text": "旧事件文字结果"}]

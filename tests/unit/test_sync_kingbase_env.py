@@ -47,7 +47,7 @@ def test_sync_environment_replaces_database_and_removes_mysql_settings(
     assert values["DB_PORT"] == "54321"
     assert values["DB_NAME"] == "chaintower_agent"
     assert values["AURACLAW_MIGRATIONS_DIRECTORY"] == "/app/migrations"
-    assert values["AURACLAW_MIGRATE_TARGET"] == "0041"
+    assert values["AURACLAW_MIGRATE_TARGET"] == "0042"
     assert values["AURACLAW_DATABASE_URL"] == (
         "postgresql+asyncpg://kb-user:P%40ss%20word@"
         "10.244.72.1:54321/chaintower_agent"

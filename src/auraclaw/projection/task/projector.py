@@ -159,6 +159,7 @@ class InMemoryTaskProjection:
             "progress": 0.0,
             "current_stage": "admission",
             "result_summary": None,
+            "content_parts": [],
             "result_ref": None,
             "artifact_refs": [],
             "lineage": None,
@@ -218,6 +219,7 @@ class InMemoryTaskProjection:
                 run_status=RunStatus.PENDING.value,
                 progress=0.0,
                 result_summary=None,
+                content_parts=[],
                 result_ref=None,
                 artifact_refs=[],
                 error=None,
@@ -279,6 +281,10 @@ class InMemoryTaskProjection:
                 current_stage="pending",
             )
         elif event.type == "run.completed":
+            content_parts = payload.get("content_parts")
+            if not isinstance(content_parts, list):
+                summary = payload.get("result_summary")
+                content_parts = [{"type": "text", "text": summary}] if summary else []
             view.update(
                 status=(
                     SessionStatus.READY.value
@@ -289,6 +295,7 @@ class InMemoryTaskProjection:
                 progress=1.0,
                 current_stage="completed",
                 result_summary=payload.get("result_summary"),
+                content_parts=list(content_parts),
                 result_ref=payload.get("result_ref"),
                 artifact_refs=payload.get("artifact_refs", []),
                 lineage=payload.get("lineage"),

@@ -49,6 +49,7 @@ class PostgresTaskProjection(LazyPool):
                 view = dict(row) if row is not None else InMemoryTaskProjection._new_view(event)
                 if row is not None:
                     view["projection_version"] = int(row["source_version"])
+                    view["content_parts"] = json_loads(row["content_parts"])
                     view["result_ref"] = json_loads(row["result_ref"])
                     view["artifact_refs"] = json_loads(row["artifact_refs"])
                     view["error"] = json_loads(row["error"])
@@ -67,12 +68,12 @@ class PostgresTaskProjection(LazyPool):
                     (tenant_id, session_id, root_session_id, run_id, status, goal, source,
                      schedule_id, occurrence_id, role,
                      parent_session_id, progress, current_stage, run_status,
-                     result_summary, result_ref,
+                     result_summary, content_parts, result_ref,
                      artifact_refs, error, delivery_status, delivery_id,
                      delivery_attempt_count, delivery_response_summary,
                      skill_activations, source_version, source_event_id, projected_at)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,
-                            $17::jsonb,$18::jsonb,$19,$20,$21,$22,$23::jsonb,$24,$25,$26)
+                            $17::jsonb,$18::jsonb,$19::jsonb,$20,$21,$22,$23,$24::jsonb,$25,$26,$27)
                     ON CONFLICT (tenant_id, session_id) DO UPDATE SET
                       run_id=EXCLUDED.run_id, status=EXCLUDED.status, goal=EXCLUDED.goal,
                       source=EXCLUDED.source, schedule_id=EXCLUDED.schedule_id,
@@ -80,7 +81,8 @@ class PostgresTaskProjection(LazyPool):
                       role=EXCLUDED.role, parent_session_id=EXCLUDED.parent_session_id,
                       progress=EXCLUDED.progress, current_stage=EXCLUDED.current_stage,
                       run_status=EXCLUDED.run_status,
-                      result_summary=EXCLUDED.result_summary, result_ref=EXCLUDED.result_ref,
+                      result_summary=EXCLUDED.result_summary,
+                      content_parts=EXCLUDED.content_parts, result_ref=EXCLUDED.result_ref,
                       artifact_refs=EXCLUDED.artifact_refs, error=EXCLUDED.error,
                       delivery_status=EXCLUDED.delivery_status,
                       delivery_id=EXCLUDED.delivery_id,
@@ -105,6 +107,7 @@ class PostgresTaskProjection(LazyPool):
                     view["current_stage"],
                     view.get("run_status"),
                     view.get("result_summary"),
+                    json_dumps(view.get("content_parts", [])),
                     json_dumps(view.get("result_ref")),
                     json_dumps(view.get("artifact_refs", [])),
                     json_dumps(view.get("error")),
@@ -218,6 +221,7 @@ class PostgresTaskProjection(LazyPool):
             "progress": float(row["progress"]),
             "current_stage": str(row["current_stage"]),
             "result_summary": row["result_summary"],
+            "content_parts": list(json_loads(row["content_parts"])),
             "result_ref": json_loads(row["result_ref"]),
             "artifact_refs": list(json_loads(row["artifact_refs"])),
             "error": json_loads(row["error"]),

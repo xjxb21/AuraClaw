@@ -82,6 +82,7 @@ class TaskView(BaseModel):
     progress: float
     current_stage: str
     result_summary: str | None
+    content_parts: list[dict[str, Any]] = Field(default_factory=list)
     result_ref: str | None
     artifact_refs: list[Any]
     error: dict[str, Any] | None

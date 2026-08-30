@@ -683,6 +683,22 @@ class AgentHarness:
                 ):
                     await self._append_capability_event(assignment, event)
             events = await self._session.load(assignment)
+            chart_content = self._chatbi_chart_content(events, assignment.run_id)
+            content_parts: list[dict[str, Any]] = []
+            if response.completed_output:
+                content_parts.append(
+                    {"type": "text", "text": response.completed_output}
+                )
+            if chart_content is not None:
+                content_parts.append(chart_content)
+                sequence += 1
+                await self._publish_user_event(
+                    assignment,
+                    sequence,
+                    "chatbi.chart.ready",
+                    chart_content,
+                )
+                state["sequence"] = sequence
             await self._append_once(
                 assignment,
                 events,
@@ -690,6 +706,7 @@ class AgentHarness:
                 {
                     "run_id": assignment.run_id,
                     "result_summary": response.completed_output,
+                    "content_parts": content_parts,
                 },
                 identity=assignment.run_id,
                 visibility=Visibility.USER,
@@ -1193,6 +1210,20 @@ class AgentHarness:
     async def _publish_delta(
         self, assignment: RuntimeAssignment, sequence: int, delta: str
     ) -> None:
+        await self._publish_user_event(
+            assignment,
+            sequence,
+            "model.output.delta",
+            {"delta": delta},
+        )
+
+    async def _publish_user_event(
+        self,
+        assignment: RuntimeAssignment,
+        sequence: int,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
         try:
             await self._runtime_events.publish(
                 RuntimeEvent(
@@ -1202,15 +1233,90 @@ class AgentHarness:
                     session_id=assignment.session_id,
                     run_id=assignment.run_id,
                     sequence=sequence,
-                    type="model.output.delta",
+                    type=event_type,
                     timestamp=datetime.now(UTC),
-                    payload={"delta": delta},
+                    payload=payload,
                     visibility="user",
                 )
             )
         except Exception:
             # The ephemeral stream is deliberately not a result-delivery guarantee.
             return
+
+    @staticmethod
+    def _chatbi_chart_content(
+        events: list[Any], run_id: str
+    ) -> dict[str, Any] | None:
+        for request_index in range(len(events) - 1, -1, -1):
+            requested = events[request_index]
+            request_payload = getattr(requested, "payload", {})
+            if (
+                getattr(requested, "type", None) != "tool.call.requested"
+                or getattr(requested, "run_id", None) != run_id
+                or not isinstance(request_payload, dict)
+                or request_payload.get("name") != "dashboard.chart.preview"
+            ):
+                continue
+            invocation_id = request_payload.get("tool_invocation_id")
+            if not isinstance(invocation_id, str) or not invocation_id:
+                return None
+            completed = next(
+                (
+                    event
+                    for event in reversed(events[request_index + 1 :])
+                    if getattr(event, "type", None) == "tool.call.completed"
+                    and getattr(event, "run_id", None) == run_id
+                    and isinstance(getattr(event, "payload", None), dict)
+                    and event.payload.get("name") == "dashboard.chart.preview"
+                    and event.payload.get("tool_invocation_id") == invocation_id
+                ),
+                None,
+            )
+            if completed is None:
+                return None
+
+            result = completed.payload.get("result")
+            arguments = request_payload.get("arguments")
+            if not isinstance(result, dict) or not isinstance(arguments, dict):
+                return None
+            content = result.get("content")
+            preview_input = arguments.get("input")
+            if (
+                str(result.get("status", "")).lower() != "success"
+                or not isinstance(content, dict)
+                or content.get("status") != "SUCCESS"
+                or not isinstance(preview_input, dict)
+            ):
+                return None
+            component_input = content.get("componentInput")
+            component_key = content.get("componentKey")
+            config = content.get(
+                "componentConfig", preview_input.get("componentConfig", {})
+            )
+            data_plan = preview_input.get("dataPlan")
+            input_mapping = preview_input.get("inputMapping")
+            if (
+                not isinstance(component_input, dict)
+                or not isinstance(component_input.get("rows"), list)
+                or not component_input["rows"]
+                or not isinstance(component_key, str)
+                or not component_key
+                or component_key != preview_input.get("componentKey")
+                or not isinstance(config, dict)
+                or not isinstance(data_plan, dict)
+                or data_plan.get("sourceType") != "CUBE"
+                or not isinstance(input_mapping, dict)
+            ):
+                return None
+            return {
+                "type": "chatbi_chart",
+                "componentKey": component_key,
+                "config": dict(config),
+                "dataPlan": dict(data_plan),
+                "inputMapping": dict(input_mapping),
+                "componentInput": dict(component_input),
+            }
+        return None
 
     async def _generate_with_live_deltas(
         self,

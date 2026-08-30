@@ -75,6 +75,7 @@ class TaskQueryService:
             "status": task["run_status"],
             "session_status": task["status"],
             "result_summary": task["result_summary"],
+            "content_parts": task.get("content_parts", []),
             "result_ref": task["result_ref"],
             "artifact_refs": task["artifact_refs"],
             "error": task["error"],

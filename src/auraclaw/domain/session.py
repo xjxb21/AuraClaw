@@ -28,6 +28,7 @@ class SessionAggregate:
     parent_session_id: str | None = None
     role: str = "root"
     result_summary: str | None = None
+    content_parts: list[dict[str, Any]] = field(default_factory=list)
     result_ref: str | None = None
     artifact_refs: list[str] = field(default_factory=list)
     dependency_ids: list[str] = field(default_factory=list)
@@ -69,6 +70,10 @@ class SessionAggregate:
             SessionStatus.CANCELLED,
         }:
             stored_status = SessionStatus.READY
+        content_parts = state.get("content_parts")
+        if not isinstance(content_parts, list):
+            summary = state.get("result_summary")
+            content_parts = [{"type": "text", "text": summary}] if summary else []
         aggregate = cls(
             session_id=str(state["session_id"]),
             root_session_id=str(state["root_session_id"]),
@@ -81,6 +86,7 @@ class SessionAggregate:
             parent_session_id=state.get("parent_session_id"),
             role=role,
             result_summary=state.get("result_summary"),
+            content_parts=list(content_parts),
             result_ref=state.get("result_ref"),
             artifact_refs=list(state.get("artifact_refs", [])),
             dependency_ids=list(state.get("dependency_ids", [])),
@@ -115,6 +121,7 @@ class SessionAggregate:
             "parent_session_id": self.parent_session_id,
             "role": self.role,
             "result_summary": self.result_summary,
+            "content_parts": list(self.content_parts),
             "result_ref": self.result_ref,
             "artifact_refs": list(self.artifact_refs),
             "dependency_ids": list(self.dependency_ids),
@@ -308,6 +315,7 @@ class SessionAggregate:
             self.run_id = str(payload["run_id"])
             self.run_status = RunStatus.PENDING
             self.result_summary = None
+            self.content_parts = []
             self.result_ref = None
             self.artifact_refs = []
             if self.role == "root":
@@ -339,6 +347,14 @@ class SessionAggregate:
             self.run_status = RunStatus.PENDING
         elif event_type == "run.completed":
             self.result_summary = payload.get("result_summary")
+            content_parts = payload.get("content_parts")
+            if not isinstance(content_parts, list):
+                content_parts = (
+                    [{"type": "text", "text": self.result_summary}]
+                    if self.result_summary
+                    else []
+                )
+            self.content_parts = list(content_parts)
             self.result_ref = payload.get("result_ref")
             self.artifact_refs = list(payload.get("artifact_refs", []))
             self.run_status = RunStatus.COMPLETED

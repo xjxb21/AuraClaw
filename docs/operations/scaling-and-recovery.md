@@ -40,7 +40,7 @@ registration lease 内仍活跃时，新进程注册会 fail closed。因此显�
 
 ## 生产配置门禁
 
-1. 依次应用 PostgreSQL `0010`～`0041`（MySQL 应用至 `0022`）expand migration。`0040` / MySQL
+1. 依次应用 PostgreSQL `0010`～`0042`（MySQL 应用至 `0023`）expand migration。`0040` / MySQL
    `0022` 增加 registration 与 execution claim 字段和索引；先迁移 Control 数据库，再滚动升级
    Orchestrator，最后升级 Agent Runtime。可选执行 `deploy/postgres/roles.sql` 做硬化，
    当前部署不按服务注入分角色 DSN。

@@ -136,6 +136,17 @@ class _RuntimeEvents:
         del event
 
 
+class _RecordingRuntimeEvents:
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.events: list[Any] = []
+        self.fail_on = fail_on
+
+    async def publish(self, event: Any) -> None:
+        if event.type == self.fail_on:
+            raise RuntimeError("runtime event unavailable")
+        self.events.append(event)
+
+
 class _NoApprovals:
     async def get(self, tenant_id: str, approval_id: str) -> None:
         del tenant_id, approval_id
@@ -382,6 +393,238 @@ def _response(output: str, call: ToolCall | None = None) -> ModelResponse:
         tool_calls=(call,) if call is not None else (),
         usage={"output_tokens": 1},
     )
+
+
+def _chart_preview_events(
+    tool_invocation_id: str,
+    *,
+    rows: list[dict[str, Any]],
+    status: str = "SUCCESS",
+    run_id: str = "run-a",
+) -> list[SimpleNamespace]:
+    occurred_at = datetime.now(UTC)
+    return [
+        SimpleNamespace(
+            type="tool.call.requested",
+            payload={
+                "tool_invocation_id": tool_invocation_id,
+                "name": "dashboard.chart.preview",
+                "arguments": {
+                    "input": {
+                        "componentKey": "metric-comparison",
+                        "componentConfig": {"title": "销售额对比"},
+                        "dataPlan": {
+                            "sourceType": "CUBE",
+                            "steps": [{"stepId": "query-1", "type": "QUERY"}],
+                            "finalStepId": "query-1",
+                        },
+                        "inputMapping": {
+                            "category": "category",
+                            "measures": ["value"],
+                        },
+                    }
+                },
+                "turn_index": 1,
+            },
+            run_id=run_id,
+            occurred_at=occurred_at,
+        ),
+        SimpleNamespace(
+            type="tool.call.completed",
+            payload={
+                "tool_invocation_id": tool_invocation_id,
+                "name": "dashboard.chart.preview",
+                "result": {
+                    "status": "success",
+                    "content": {
+                        "status": status,
+                        "componentKey": "metric-comparison",
+                        "componentConfig": {"title": "销售额对比"},
+                        "componentInput": {
+                            "fields": [
+                                {"name": "category", "type": "STRING"},
+                                {"name": "value", "type": "NUMBER"},
+                            ],
+                            "rows": rows,
+                            "bindings": {
+                                "category": "category",
+                                "measures": ["value"],
+                            },
+                        },
+                        "error": None,
+                    },
+                    "error_code": None,
+                },
+                "turn_index": 1,
+            },
+            run_id=run_id,
+            occurred_at=occurred_at,
+        ),
+    ]
+
+
+def test_chatbi_success_publishes_chart_ready_and_persists_ordered_content_parts() -> None:
+    async def scenario() -> None:
+        session = _Session("对比两个区域的销售额")
+        session.events.extend(
+            _chart_preview_events(
+                "preview-1",
+                rows=[
+                    {"category": "华东", "value": 120},
+                    {"category": "华南", "value": 98},
+                ],
+            )
+        )
+        runtime_events = _RecordingRuntimeEvents()
+        response = ModelResponse(
+            model_call_id="replaced",
+            provider="test",
+            model="test",
+            completed_output="销售额对比图已生成。",
+            deltas=("销售额对比图已生成。",),
+            usage={"output_tokens": 1},
+        )
+        harness = AgentHarness(
+            control_store=_Control(),
+            session=session,
+            model=_ScriptedModel([response]),
+            tools=_Capabilities(),
+            runtime_events=runtime_events,
+            capability_controller=RuntimeCapabilityController(_Capabilities()),
+        )
+
+        await harness.execute(_assignment())
+
+        expected_chart = {
+            "type": "chatbi_chart",
+            "componentKey": "metric-comparison",
+            "config": {"title": "销售额对比"},
+            "dataPlan": {
+                "sourceType": "CUBE",
+                "steps": [{"stepId": "query-1", "type": "QUERY"}],
+                "finalStepId": "query-1",
+            },
+            "inputMapping": {"category": "category", "measures": ["value"]},
+            "componentInput": {
+                "fields": [
+                    {"name": "category", "type": "STRING"},
+                    {"name": "value", "type": "NUMBER"},
+                ],
+                "rows": [
+                    {"category": "华东", "value": 120},
+                    {"category": "华南", "value": 98},
+                ],
+                "bindings": {"category": "category", "measures": ["value"]},
+            },
+        }
+        assert [event.type for event in runtime_events.events] == [
+            "model.output.delta",
+            "chatbi.chart.ready",
+        ]
+        assert runtime_events.events[-1].payload == expected_chart
+        assert runtime_events.events[-1].sequence == 2
+        completed = next(event for event in session.events if event.type == "run.completed")
+        assert completed.payload["content_parts"] == [
+            {"type": "text", "text": "销售额对比图已生成。"},
+            expected_chart,
+        ]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "rows"),
+    [
+        ("SUCCESS", []),
+        ("FAILED", [{"category": "华东", "value": 120}]),
+    ],
+)
+def test_chatbi_uses_latest_preview_and_ignores_empty_or_failed_result(
+    status: str, rows: list[dict[str, Any]]
+) -> None:
+    async def scenario() -> None:
+        session = _Session("对比两个区域的销售额")
+        session.events.extend(
+            _chart_preview_events("preview-old", rows=[{"category": "华东", "value": 120}])
+        )
+        session.events.extend(
+            _chart_preview_events("preview-latest", rows=rows, status=status)
+        )
+        runtime_events = _RecordingRuntimeEvents()
+        harness = AgentHarness(
+            control_store=_Control(),
+            session=session,
+            model=_ScriptedModel([_response("当前条件下没有可展示的数据。")]),
+            tools=_Capabilities(),
+            runtime_events=runtime_events,
+            capability_controller=RuntimeCapabilityController(_Capabilities()),
+        )
+
+        await harness.execute(_assignment())
+
+        assert all(event.type != "chatbi.chart.ready" for event in runtime_events.events)
+        completed = next(event for event in session.events if event.type == "run.completed")
+        assert completed.payload["content_parts"] == [
+            {"type": "text", "text": "当前条件下没有可展示的数据。"}
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_chatbi_runtime_event_failure_does_not_lose_canonical_chart_result() -> None:
+    async def scenario() -> None:
+        session = _Session("对比两个区域的销售额")
+        session.events.extend(
+            _chart_preview_events("preview-1", rows=[{"category": "华东", "value": 120}])
+        )
+        control = _Control()
+        harness = AgentHarness(
+            control_store=control,
+            session=session,
+            model=_ScriptedModel([_response("销售额对比图已生成。")]),
+            tools=_Capabilities(),
+            runtime_events=_RecordingRuntimeEvents(fail_on="chatbi.chart.ready"),
+            capability_controller=RuntimeCapabilityController(_Capabilities()),
+        )
+
+        await harness.execute(_assignment())
+
+        completed = next(event for event in session.events if event.type == "run.completed")
+        assert completed.payload["content_parts"][-1]["type"] == "chatbi_chart"
+        assert control.outcome == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_chatbi_does_not_reuse_preview_from_previous_run() -> None:
+    async def scenario() -> None:
+        session = _Session("继续分析销售额")
+        session.events.extend(
+            _chart_preview_events(
+                "preview-old",
+                rows=[{"category": "华东", "value": 120}],
+                run_id="run-old",
+            )
+        )
+        runtime_events = _RecordingRuntimeEvents()
+        harness = AgentHarness(
+            control_store=_Control(),
+            session=session,
+            model=_ScriptedModel([_response("本轮只返回文字。")]),
+            tools=_Capabilities(),
+            runtime_events=runtime_events,
+            capability_controller=RuntimeCapabilityController(_Capabilities()),
+        )
+
+        await harness.execute(_assignment())
+
+        assert all(event.type != "chatbi.chart.ready" for event in runtime_events.events)
+        completed = next(event for event in session.events if event.type == "run.completed")
+        assert completed.payload["content_parts"] == [
+            {"type": "text", "text": "本轮只返回文字。"}
+        ]
+
+    asyncio.run(scenario())
 
 
 def test_capability_loop_searches_loads_calls_and_returns_final_output() -> None:

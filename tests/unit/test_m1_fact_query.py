@@ -2,9 +2,11 @@ import asyncio
 
 import pytest
 
+from auraclaw.api.models import TaskView
 from auraclaw.contracts.commands import CommandContext
 from auraclaw.contracts.events import Actor, CanonicalEvent, NewEvent, utc_now
 from auraclaw.contracts.state import Visibility
+from auraclaw.gateways.query.reader import TaskQueryService
 from auraclaw.gateways.task.admission import AllowAllAdmissionController
 from auraclaw.infrastructure.persistence.memory_event_store import InMemoryEventStore
 from auraclaw.projection.maintenance import ProjectionMaintenanceService
@@ -74,6 +76,79 @@ def test_snapshot_restores_session_and_projection_rebuild_is_deterministic() -> 
         assert before is not None and after is not None
         for field in ("session_id", "status", "goal", "projection_version"):
             assert before[field] == after[field]
+
+    asyncio.run(scenario())
+
+
+def test_content_parts_survive_projection_and_result_api() -> None:
+    async def scenario() -> None:
+        parts = [
+            {"type": "text", "text": "图表已生成。"},
+            {"type": "chatbi_chart", "componentKey": "metric-comparison"},
+        ]
+        common = dict(
+            tenant_id="tenant-1",
+            root_session_id="ses-1",
+            session_id="ses-1",
+            run_id="run-1",
+            occurred_at=utc_now(),
+            actor=Actor(type="user", id="user-1"),
+            correlation_id="corr-1",
+            causation_id="cmd-1",
+            visibility=Visibility.USER,
+            schema_version=1,
+        )
+        projection = InMemoryTaskProjection()
+        await projection.project(
+            [
+                CanonicalEvent(
+                    event_id="evt-1",
+                    aggregate_version=1,
+                    type="session.created",
+                    payload={"goal": "build a chart", "role": "root"},
+                    **common,
+                ),
+                CanonicalEvent(
+                    event_id="evt-2",
+                    aggregate_version=2,
+                    type="run.completed",
+                    payload={"result_summary": "图表已生成。", "content_parts": parts},
+                    **common,
+                ),
+            ]
+        )
+
+        view = await projection.get_task("tenant-1", "ses-1")
+        assert view is not None
+        assert TaskView.model_validate(view).content_parts == parts
+        query = TaskQueryService(projection, object(), object())  # type: ignore[arg-type]
+        result = await query.get_result("tenant-1", "ses-1")
+        assert result["content_parts"] == parts
+
+        legacy_projection = InMemoryTaskProjection()
+        await legacy_projection.project(
+            [
+                CanonicalEvent(
+                    event_id="legacy-evt-1",
+                    aggregate_version=1,
+                    type="session.created",
+                    payload={"goal": "legacy chart", "role": "root"},
+                    **common,
+                ),
+                CanonicalEvent(
+                    event_id="legacy-evt-2",
+                    aggregate_version=2,
+                    type="run.completed",
+                    payload={"result_summary": "旧事件文字结果"},
+                    **common,
+                ),
+            ]
+        )
+        legacy_view = await legacy_projection.get_task("tenant-1", "ses-1")
+        assert legacy_view is not None
+        assert legacy_view["content_parts"] == [
+            {"type": "text", "text": "旧事件文字结果"}
+        ]
 
     asyncio.run(scenario())
 

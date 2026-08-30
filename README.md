@@ -228,7 +228,7 @@ uv run python scripts/materialize_compose_secrets.py \
 uv run python scripts/compose_preflight.py --env-file .env.prod
 docker compose --env-file .env.prod -f compose.prod.yml \
   --profile migrate run --rm migrate migrate up \
-  --target 0041 --directory /app/migrations
+  --target 0042 --directory /app/migrations
 docker compose --env-file .env.prod -f compose.prod.yml up -d --wait
 ```
 
@@ -289,6 +289,11 @@ Root Session 可以承载多个顺序执行的 Run：一轮 Run 进入 `complete
 `run_id`。Task View 分别返回 `status`（Session）和 `run_status`（最新 Run）；Result 响应的
 `status` 表示最新 Run 状态，并通过 `session_status` 返回 Session 状态。只有显式调用
 `/close` 产生 `session.closed` 后，Root Session 才拒绝新消息和 Run。
+
+Result 响应还返回有序 `content_parts`。普通结果为 `text` 块；受治理的 ChatBI 预览成功时，
+Runtime 在文字块后追加 `chatbi_chart`，同时通过 SSE 发布 `chatbi.chart.ready`。SSE 不保证送达，
+刷新与历史恢复必须以 Result API 的 `content_parts` 为准；PostgreSQL / KingBase 需应用
+`0042_chatbi_content_parts`，MySQL 需应用 `0023_chatbi_content_parts`。
 
 SSE 连接关闭或 Streaming Gateway 重启不会取消任务。客户端重连时使用公开
 `session_id:sequence` 游标；`sequence` 在同一 Session 的多个 Run 间保持单调递增。游标仍在保留窗口内时补齐事件，过期时收到 `stream.reset` 并回退
