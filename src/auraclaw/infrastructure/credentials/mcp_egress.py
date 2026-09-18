@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -16,9 +17,10 @@ from auraclaw.contracts.capabilities import (
     McpNetworkMode,
     McpServerDefinition,
 )
-from auraclaw.contracts.errors import CredentialAccessError
+from auraclaw.contracts.errors import CredentialAccessError, McpTransportError
 from auraclaw.infrastructure.connectors.mcp.wire import (
     MCP_CLIENT_CAPABILITIES_META_KEY,
+    MCP_INITIALIZE_PROTOCOL_VERSIONS,
     MCP_PROTOCOL_VERSION,
     MCP_PROTOCOL_VERSION_META_KEY,
 )
@@ -93,7 +95,9 @@ class HttpxPinnedMcpSender:
         client: httpx.AsyncClient | None = None,
         *,
         timeout_seconds: float = 30.0,
+        max_response_bytes: int = 8 * 1024 * 1024,
     ) -> None:
+        self._max_response_bytes = max_response_bytes
         self._owned = client is None
         self._client = client or httpx.AsyncClient(
             timeout=timeout_seconds,
@@ -135,11 +139,29 @@ class HttpxPinnedMcpSender:
         )
         if parsed.scheme == "https":
             request.extensions["sni_hostname"] = server_hostname.encode()
-        response = await self._client.send(request, follow_redirects=False)
+        try:
+            response = await self._client.send(request, follow_redirects=False, stream=True)
+            try:
+                chunks = bytearray()
+                async for chunk in response.aiter_bytes():
+                    chunks.extend(chunk)
+                    if len(chunks) > self._max_response_bytes:
+                        raise McpTransportError(
+                            "MCP response exceeds the configured limit",
+                            code="mcp_protocol_error",
+                            stage="protocol",
+                        )
+            finally:
+                await response.aclose()
+        except httpx.RequestError as exc:
+            raise McpTransportError(
+                "MCP egress target is unreachable",
+                code="mcp_network_error",
+            ) from exc
         return McpEgressResponse(
             status_code=response.status_code,
             headers={key.lower(): value for key, value in response.headers.items()},
-            content=response.content,
+            content=bytes(chunks),
         )
 
 
@@ -147,6 +169,15 @@ class HttpxPinnedMcpSender:
 class _CachedToken:
     value: str
     expires_at: datetime
+
+
+@dataclass
+class _McpSession:
+    headers: dict[str, str]
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+    session_id: str | None = None
+    initialized: dict[str, Any] | None = None
 
 
 class ManagedMcpEgressAdapter:
@@ -158,6 +189,7 @@ class ManagedMcpEgressAdapter:
         *,
         resolver: McpDnsResolver | None = None,
         sender: McpPinnedSender | None = None,
+        probe_only: bool = False,
         max_response_bytes: int = 8 * 1024 * 1024,
     ) -> None:
         if not server.enabled:
@@ -180,11 +212,16 @@ class ManagedMcpEgressAdapter:
                 raise ValueError("OAuth Resource Indicator must match MCP server origin")
         self._server = server
         self._resolver = resolver or SystemMcpDnsResolver()
-        self._sender = sender or HttpxPinnedMcpSender()
+        self._sender = sender or HttpxPinnedMcpSender(max_response_bytes=max_response_bytes)
+        self._admitted = True
+        self._probe_only = probe_only
         self._max_response_bytes = max_response_bytes
         self._token: _CachedToken | None = None
         self._token_lock = asyncio.Lock()
         self._discovery_complete = False
+        self._sessions: dict[str, _McpSession] = {}
+        self._sessions_lock = asyncio.Lock()
+        self._closing = False
 
     @property
     def secret_required(self) -> bool:
@@ -193,6 +230,18 @@ class ManagedMcpEgressAdapter:
     @property
     def config_revision(self) -> int | None:
         return self._server.config_revision
+
+    @property
+    def credential_ref(self) -> str | None:
+        return self._server.credential_ref
+
+    @property
+    def credential_owner_tenant(self) -> str:
+        return self._server.tenant_id or "platform"
+
+    @property
+    def credential_is_shared(self) -> bool:
+        return self._server.tenant_id is None
 
     @property
     def credential_provider(self) -> str:
@@ -205,11 +254,22 @@ class ManagedMcpEgressAdapter:
             return oauth.resource
         return _origin(self._server.endpoint)
 
+    def set_admission(self, admitted: bool) -> None:
+        self._admitted = admitted
+
     async def __call__(
         self,
         request: dict[str, Any],
         client_secret: str,
     ) -> dict[str, Any]:
+        if not self._admitted:
+            raise CredentialAccessError("MCP egress is revoked")
+        if self._probe_only and request.get("method") in {
+            "tools/call",
+            "resources/read",
+            "prompts/get",
+        }:
+            raise CredentialAccessError("MCP probe cannot execute business capabilities")
         payload = dict(request)
         if payload.keys() - {
             "id",
@@ -241,15 +301,10 @@ class ManagedMcpEgressAdapter:
         if self._server.protocol_revision == MCP_PROTOCOL_VERSION:
             raw_meta = params.get("_meta")
             meta = raw_meta if isinstance(raw_meta, dict) else {}
-            if (
-                meta.get(MCP_PROTOCOL_VERSION_META_KEY) != MCP_PROTOCOL_VERSION
-                or not isinstance(
-                    meta.get(MCP_CLIENT_CAPABILITIES_META_KEY), dict
-                )
+            if meta.get(MCP_PROTOCOL_VERSION_META_KEY) != MCP_PROTOCOL_VERSION or not isinstance(
+                meta.get(MCP_CLIENT_CAPABILITIES_META_KEY), dict
             ):
-                raise CredentialAccessError(
-                    "modern MCP request metadata is missing or invalid"
-                )
+                raise CredentialAccessError("modern MCP request metadata is missing or invalid")
         self._authorize_method(method, params)
         token = await self._access_token(client_secret)
         headers = {
@@ -267,8 +322,7 @@ class ManagedMcpEgressAdapter:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         if (
-            self._server.resolved_auth_strategy
-            is McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT
+            self._server.resolved_auth_strategy is McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT
             and isinstance(identity, dict)
         ):
             tenant_id = identity.get("tenant_id")
@@ -283,36 +337,215 @@ class ManagedMcpEgressAdapter:
                 headers["X-CT-Dept-ID"] = str(dept_id)
             if session_id:
                 headers["X-CT-Session-ID"] = str(session_id)
-        jsonrpc_body = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": payload.get("id"),
-                "method": method,
-                "params": params,
-            },
-            separators=(",", ":"),
-        ).encode()
-        response = await self._send_pinned(
-            "POST",
-            self._server.endpoint,
-            headers=headers,
-            content=jsonrpc_body,
-        )
-        result = _decode_mcp_response(response, self._max_response_bytes)
+        body: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
+        if not method.startswith("notifications/"):
+            body["id"] = payload.get("id")
+        if self._server.protocol_revision in MCP_INITIALIZE_PROTOCOL_VERSIONS:
+            result = await self._session_request(body, headers, identity or {})
+        else:
+            response = await self._post(body, headers)
+            result = self._decode(response, body)
         return dict(_redact_exact(result, token) if token else result)
 
+    async def _post(self, body: dict[str, Any], headers: dict[str, str]) -> McpEgressResponse:
+        if self._closing or not self._admitted:
+            raise CredentialAccessError("MCP egress is revoked")
+        outgoing = {key: value for key, value in headers.items() if key != "Mcp-Name"}
+        outgoing["Mcp-Method"] = body["method"]
+        name = _request_target_name(body["method"], body.get("params", {}))
+        if name is not None:
+            outgoing["Mcp-Name"] = name
+        try:
+            return await self._send_pinned(
+                "POST",
+                self._server.endpoint,
+                headers=outgoing,
+                content=json.dumps(body, separators=(",", ":")).encode(),
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            raise McpTransportError("MCP network request failed", code="mcp_network_error") from exc
+
+    def _decode(self, response: McpEgressResponse, body: dict[str, Any]) -> dict[str, Any]:
+        if "id" not in body and response.status_code in {202, 204} and not response.content:
+            return {"jsonrpc": "2.0", "id": None, "result": {}}
+        result = _decode_mcp_response(response, self._max_response_bytes)
+        if "id" not in body or result.get("id") != body["id"]:
+            raise McpTransportError(
+                "MCP response id does not match request",
+                code="mcp_protocol_error",
+                stage="protocol",
+            )
+        return result
+
+    async def _session_request(
+        self, body: dict[str, Any], headers: dict[str, str], identity: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Adapter ownership binds server/revision; identity and effective bearer bind the session.
+        key = hashlib.sha256(
+            json.dumps(
+                {
+                    "identity": {
+                        name: identity.get(name)
+                        for name in (
+                            "tenant_id",
+                            "root_session_id",
+                            "session_id",
+                            "user_id",
+                            "dept_id",
+                        )
+                    },
+                    "authorization": headers.get("Authorization", ""),
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        async with self._sessions_lock:
+            if self._closing or not self._admitted:
+                raise CredentialAccessError("MCP egress is revoked")
+            session = self._sessions.get(key)
+            if session is None:
+                if len(self._sessions) >= 128:
+                    idle = next(((k, s) for k, s in self._sessions.items() if s.users == 0), None)
+                    if idle is None:
+                        raise CredentialAccessError("MCP session capacity is busy")
+                    await self._close_session(idle[1])
+                    del self._sessions[idle[0]]
+                session = _McpSession(headers=dict(headers))
+                self._sessions[key] = session
+            session.users += 1
+        try:
+            async with session.lock:
+                if self._closing or not self._admitted:
+                    raise CredentialAccessError("MCP egress is revoked")
+                if session.initialized is None:
+                    await self._initialize_session(
+                        session, body if body["method"] == "initialize" else None
+                    )
+                if body["method"] == "initialize":
+                    return {"jsonrpc": "2.0", "id": body.get("id"), "result": session.initialized}
+                if body["method"] == "notifications/initialized":
+                    return {"jsonrpc": "2.0", "id": None, "result": {}}
+                if self._closing or not self._admitted:
+                    raise CredentialAccessError("MCP egress is revoked")
+                try:
+                    response = await self._post(body, self._session_headers(session))
+                except asyncio.CancelledError:
+                    # Cancellation is best effort; it cannot prove rollback or replay safety.
+                    cancellation = {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": body.get("id")},
+                    }
+                    try:
+                        await asyncio.wait_for(
+                            self._post(cancellation, self._session_headers(session)), timeout=1.0
+                        )
+                    except (Exception, asyncio.CancelledError):
+                        pass
+                    raise
+                if response.status_code == 404 and session.session_id is not None:
+                    session.session_id = None
+                    session.initialized = None
+                    # Repair the connection only. Never replay the business request, even a read.
+                    await self._initialize_session(session)
+                    raise McpTransportError(
+                        "MCP session expired; original execution result is unknown",
+                        code="mcp_session_expired",
+                        remote_code=404,
+                    )
+                return self._decode(response, body)
+        finally:
+            session.users -= 1
+
+    def _session_headers(self, session: _McpSession) -> dict[str, str]:
+        return {
+            **session.headers,
+            **({"Mcp-Session-Id": session.session_id} if session.session_id else {}),
+        }
+
+    async def _initialize_session(
+        self, session: _McpSession, body: dict[str, Any] | None = None
+    ) -> None:
+        if self._closing or not self._admitted:
+            raise CredentialAccessError("MCP egress is revoked")
+        # Drain a session whose initialized notification may have failed before replacing it.
+        if session.session_id is not None:
+            await self._close_session(session)
+        request = body or {
+            "jsonrpc": "2.0",
+            "id": "auraclaw-initialize",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": self._server.protocol_revision,
+                "capabilities": {},
+                "clientInfo": {"name": "auraclaw-managed-egress", "version": "1"},
+            },
+        }
+        response = await self._post(request, session.headers)
+        payload = self._decode(response, request)
+        result = payload.get("result")
+        session_id = response.headers.get("mcp-session-id")
+        if session_id is not None:
+            if (
+                not session_id
+                or len(session_id) > 4096
+                or any(not 0x21 <= ord(char) <= 0x7E for char in session_id)
+            ):
+                raise McpTransportError(
+                    "MCP session header is invalid", code="mcp_protocol_error", stage="protocol"
+                )
+            session.session_id = session_id
+        if (
+            not isinstance(result, dict)
+            or result.get("protocolVersion") != self._server.protocol_revision
+        ):
+            raise McpTransportError(
+                "MCP initialize response is incompatible",
+                code="mcp_protocol_error",
+                stage="protocol",
+            )
+        if not isinstance(result.get("capabilities"), dict):
+            raise McpTransportError(
+                "MCP initialize capabilities are invalid",
+                code="mcp_protocol_error",
+                stage="protocol",
+            )
+        if self._closing or not self._admitted:
+            raise CredentialAccessError("MCP egress is revoked")
+        notification = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        self._decode(await self._post(notification, self._session_headers(session)), notification)
+        session.initialized = result
+
+    async def _close_session(self, session: _McpSession) -> None:
+        if session.session_id is not None:
+            response = await self._send_pinned(
+                "DELETE", self._server.endpoint, headers=self._session_headers(session), content=b""
+            )
+            if response.status_code not in {200, 202, 204, 404, 405}:
+                raise McpTransportError(
+                    "MCP session termination failed",
+                    code="mcp_http_error",
+                    remote_code=response.status_code,
+                )
+        session.session_id = None
+        session.initialized = None
+
     async def aclose(self) -> None:
-        close = getattr(self._sender, "aclose", None)
-        if close is not None:
-            await close()
+        self._closing = True
+        self._admitted = False
+        async with self._sessions_lock:
+            for key, session in list(self._sessions.items()):
+                async with session.lock:
+                    await self._close_session(session)
+                    del self._sessions[key]
+            close = getattr(self._sender, "aclose", None)
+            if close is not None:
+                await close()
 
     async def _access_token(self, client_secret: str) -> str:
         if self._server.resolved_auth_strategy is McpAuthStrategy.NONE:
             return ""
-        if (
-            self._server.resolved_auth_strategy
-            is McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT
-        ):
+        if self._server.resolved_auth_strategy is McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT:
             if not client_secret:
                 raise CredentialAccessError("MCP workload credential is unavailable")
             return client_secret
@@ -391,16 +624,12 @@ class ManagedMcpEgressAdapter:
                 raise CredentialAccessError(
                     "MCP protected Resource metadata does not match resource"
                 )
-            authorization_servers = protected_payload.get(
-                "authorization_servers", []
-            )
+            authorization_servers = protected_payload.get("authorization_servers", [])
             if (
                 not isinstance(authorization_servers, list)
                 or oauth.issuer not in authorization_servers
             ):
-                raise CredentialAccessError(
-                    "MCP protected Resource metadata does not trust issuer"
-                )
+                raise CredentialAccessError("MCP protected Resource metadata does not trust issuer")
             authorization = await self._send_pinned(
                 "GET",
                 oauth.authorization_server_metadata_url,
@@ -415,17 +644,13 @@ class ManagedMcpEgressAdapter:
             if authorization_payload.get("issuer") != oauth.issuer:
                 raise CredentialAccessError("MCP OAuth issuer metadata does not match")
             if authorization_payload.get("token_endpoint") != oauth.token_endpoint:
-                raise CredentialAccessError(
-                    "MCP OAuth token endpoint metadata does not match"
-                )
+                raise CredentialAccessError("MCP OAuth token endpoint metadata does not match")
             grants = authorization_payload.get(
                 "grant_types_supported",
                 ["client_credentials"],
             )
             if not isinstance(grants, list) or "client_credentials" not in grants:
-                raise CredentialAccessError(
-                    "MCP OAuth server does not support client credentials"
-                )
+                raise CredentialAccessError("MCP OAuth server does not support client credentials")
             self._discovery_complete = True
 
     async def _send_pinned(
@@ -440,9 +665,7 @@ class ManagedMcpEgressAdapter:
         host = parsed.hostname
         if host is None:
             raise CredentialAccessError("MCP egress URL has no host")
-        addresses = await self._resolver.resolve(
-            host, parsed.port or _default_port(parsed.scheme)
-        )
+        addresses = await self._resolver.resolve(host, parsed.port or _default_port(parsed.scheme))
         if self._server.network_mode is None:
             approved = _legacy_approved_addresses(
                 addresses,
@@ -470,14 +693,16 @@ class ManagedMcpEgressAdapter:
             content=content,
         )
         if 300 <= response.status_code < 400:
-            raise CredentialAccessError("MCP egress redirects are forbidden")
+            raise McpTransportError(
+                "MCP egress redirects are forbidden", code="mcp_redirect_rejected"
+            )
         return response
 
     def _authorize_method(self, method: str, params: dict[str, Any]) -> None:
         if method == "tools/call":
-            name = str(params.get("name", ""))
-            if not _prefix_allowed(name, self._server.allowed_tool_prefixes):
-                raise CredentialAccessError("MCP Tool is outside server allowlist")
+            name = params.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise CredentialAccessError("MCP Tool name must be a non-empty string")
         elif method == "resources/read":
             parsed = urlsplit(str(params.get("uri", "")))
             if parsed.scheme not in self._server.allowed_resource_schemes:
@@ -579,17 +804,29 @@ def _decode_mcp_response(
     max_response_bytes: int,
 ) -> dict[str, Any]:
     if len(response.content) > max_response_bytes:
-        raise CredentialAccessError("MCP response exceeds the configured limit")
+        raise McpTransportError(
+            "MCP response exceeds the configured limit", code="mcp_protocol_error", stage="protocol"
+        )
     if not 200 <= response.status_code < 300:
-        raise CredentialAccessError(f"MCP server returned HTTP {response.status_code}")
+        raise McpTransportError(
+            f"MCP server returned HTTP {response.status_code}",
+            code="mcp_http_error",
+            remote_code=response.status_code,
+        )
     content_type = response.headers.get("content-type", "").split(";", 1)[0]
     try:
         if content_type == "text/event-stream":
-            events = [
-                json.loads(line.removeprefix(b"data:").strip())
-                for line in response.content.splitlines()
-                if line.startswith(b"data:")
-            ]
+            events = []
+            data: list[bytes] = []
+            for line in [*response.content.splitlines(), b""]:
+                if not line:
+                    if data:
+                        raw = b"\n".join(data)
+                        if raw.strip():
+                            events.append(json.loads(raw))
+                        data = []
+                elif line.startswith(b"data:"):
+                    data.append(line[5:].removeprefix(b" "))
             notifications = [
                 event
                 for event in events
@@ -600,11 +837,15 @@ def _decode_mcp_response(
             responses = [
                 event
                 for event in events
-                if isinstance(event, dict) and "id" in event
+                if isinstance(event, dict)
+                and "id" in event
+                and ("result" in event or "error" in event)
             ]
             if len(responses) != 1:
-                raise CredentialAccessError(
-                    "MCP event stream must contain exactly one response"
+                raise McpTransportError(
+                    "MCP event stream must contain exactly one response",
+                    code="mcp_protocol_error",
+                    stage="protocol",
                 )
             payload = dict(responses[0])
             if notifications:
@@ -612,11 +853,19 @@ def _decode_mcp_response(
         elif content_type in {"application/json", ""}:
             payload = json.loads(response.content)
         else:
-            raise CredentialAccessError("MCP response Content-Type is not supported")
-    except json.JSONDecodeError as exc:
-        raise CredentialAccessError("MCP response is not valid JSON") from exc
+            raise McpTransportError(
+                "MCP response Content-Type is not supported",
+                code="mcp_protocol_error",
+                stage="protocol",
+            )
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise McpTransportError(
+            "MCP response is not valid JSON", code="mcp_protocol_error", stage="protocol"
+        ) from exc
     if not isinstance(payload, dict):
-        raise CredentialAccessError("MCP response must contain a JSON object")
+        raise McpTransportError(
+            "MCP response must contain a JSON object", code="mcp_protocol_error", stage="protocol"
+        )
     return payload
 
 
@@ -637,9 +886,7 @@ def _oauth_metadata(
     try:
         payload = json.loads(response.content)
     except json.JSONDecodeError as exc:
-        raise CredentialAccessError(
-            f"MCP OAuth {kind} metadata is invalid"
-        ) from exc
+        raise CredentialAccessError(f"MCP OAuth {kind} metadata is invalid") from exc
     if not isinstance(payload, dict):
         raise CredentialAccessError(f"MCP OAuth {kind} metadata is not an object")
     return dict(payload)
@@ -648,8 +895,7 @@ def _oauth_metadata(
 def _contains_forbidden_key(value: Any) -> bool:
     if isinstance(value, dict):
         return any(
-            str(key).casefold() in _FORBIDDEN_REQUEST_KEYS
-            or _contains_forbidden_key(item)
+            str(key).casefold() in _FORBIDDEN_REQUEST_KEYS or _contains_forbidden_key(item)
             for key, item in value.items()
         )
     if isinstance(value, (list, tuple)):

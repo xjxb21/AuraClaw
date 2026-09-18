@@ -24,6 +24,7 @@ def _canonical_claims(assertion: LeaseAssertion) -> bytes:
         "lease_id": assertion.lease_id,
         "run_id": assertion.run_id,
         "root_session_id": assertion.root_session_id,
+        "role": assertion.role,
         "runtime_id": assertion.runtime_id,
         "session_id": assertion.session_id,
         "tenant_id": assertion.tenant_id,
@@ -32,6 +33,8 @@ def _canonical_claims(assertion: LeaseAssertion) -> bytes:
         payload["user_id"] = assertion.user_id
     if assertion.dept_id is not None:
         payload["dept_id"] = assertion.dept_id
+    if assertion.execution_claim_token is not None:
+        payload["execution_claim_token"] = assertion.execution_claim_token
     return json.dumps(
         payload,
         sort_keys=True,

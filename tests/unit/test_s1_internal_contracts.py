@@ -26,6 +26,7 @@ from auraclaw.contracts.internal import (
     CancellationResponse,
     CheckpointResponse,
     CheckpointState,
+    ContractModel,
     CredentialInvokeRequest,
     CredentialInvokeResponse,
     EventInput,
@@ -67,6 +68,14 @@ from auraclaw.runtime.ports import ToolCall
 from auraclaw.session.internal_service import SessionInternalService
 
 SIGNING_KEY = b"s1-lease-assertion-signing-key-0001"
+
+
+class _RetryRequest(ContractModel):
+    value: str
+
+
+class _RetryResponse(ContractModel):
+    value: str
 
 
 def _context(
@@ -159,6 +168,32 @@ def test_session_in_process_and_http_adapters_share_the_contract() -> None:
             assert response.api_version == INTERNAL_API_VERSION
             assert response.events[0]["causation_id"] == "causation-s1"
             assert response.events[0]["actor"] == {"type": "runtime", "id": "runtime-s1"}
+
+    asyncio.run(scenario())
+
+
+def test_http_contract_client_retries_transient_transport_failure() -> None:
+    async def scenario() -> None:
+        attempts = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectError("temporary connection failure", request=request)
+            return httpx.Response(200, json={"value": "accepted"})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://internal"
+        ) as raw:
+            response = await HttpContractClient(
+                raw,
+                retry_attempts=2,
+                retry_backoff_seconds=0,
+            ).call("/command", _RetryRequest(value="request"), _RetryResponse)
+
+        assert attempts == 2
+        assert response.value == "accepted"
 
     asyncio.run(scenario())
 
@@ -263,6 +298,40 @@ def test_task_api_can_append_user_message_and_cancel_run() -> None:
 
         assert [event["type"] for event in message.events] == ["user.message.appended"]
         assert [event["type"] for event in cancel.events] == ["run.cancelled"]
+
+    asyncio.run(scenario())
+
+
+def test_runtime_can_append_approval_events() -> None:
+    async def scenario() -> None:
+        service = SessionInternalService(
+            InMemoryEventStore(),
+            lease_verifier=_verifier(),
+        )
+        await service.append(_append_request(_assertion(token=1)))
+
+        response = await service.append(
+            _append_request(_assertion(token=2)).model_copy(
+                update={
+                    "command_id": "runtime-approval-request",
+                    "expected_version": 1,
+                    "operation": "runtime.approval.requested",
+                    "events": (
+                        EventInput(
+                            type="approval.requested",
+                            payload={
+                                "approval_id": "apr-runtime-s1",
+                                "run_id": "run-s1",
+                                "tool_name": "controlled-write",
+                                "reason": "write requires approval",
+                            },
+                        ),
+                    ),
+                }
+            )
+        )
+
+        assert [event["type"] for event in response.events] == ["approval.requested"]
 
     asyncio.run(scenario())
 
@@ -413,7 +482,8 @@ class _ApprovalReader:
         return None
 
     async def find_approved(
-        self, tenant_id: str, session_id: str, digest: str, policy_version: str
+        self, tenant_id: str, session_id: str, digest: str, policy_version: str,
+        run_id: str | None = None,
     ) -> None:
         del tenant_id, session_id, digest, policy_version
         return None
@@ -655,12 +725,61 @@ def test_policy_credential_artifact_model_and_admin_http_contracts() -> None:
                 return expected
 
             route = contract_route(type(request), type(expected), handler)
-            app = create_contract_app("contract-test", {path: route})
+            app = create_contract_app(
+                "contract-test", {path: route}, allow_unauthenticated=True
+            )
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://internal"
             ) as raw:
                 response = await HttpContractClient(raw).call(path, request, type(expected))
             assert response == expected
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("workload_identities", [None, {}])
+def test_internal_contract_authentication_defaults_to_deny(
+    workload_identities: dict[str, ServiceIdentity] | None,
+) -> None:
+    async def scenario() -> None:
+        request = AdminOperationRequest(
+            context=_context(ServiceIdentity.TASK_API),
+            operation_id="operation-denied",
+            owner_service=ServiceIdentity.PROJECTION_WORKER,
+            operation="projection.status",
+        )
+        expected = AdminOperationResponse(
+            operation_id=request.operation_id,
+            status="accepted",
+        )
+        invoked = False
+
+        async def handler(_request: AdminOperationRequest) -> AdminOperationResponse:
+            nonlocal invoked
+            invoked = True
+            return expected
+
+        app = create_contract_app(
+            "contract-auth-default",
+            {
+                "/internal/v1/admin/operations": contract_route(
+                    AdminOperationRequest,
+                    AdminOperationResponse,
+                    handler,
+                )
+            },
+            workload_identities=workload_identities,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://internal"
+        ) as client:
+            response = await client.post(
+                "/internal/v1/admin/operations",
+                json=request.model_dump(mode="json"),
+                headers={"X-AuraClaw-Contract-Version": INTERNAL_API_VERSION},
+            )
+        assert response.status_code == 401
+        assert invoked is False
 
     asyncio.run(scenario())
 

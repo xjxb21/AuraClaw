@@ -1,19 +1,47 @@
 import argparse
 import asyncio
+import base64
+import binascii
+import hashlib
+import json
 import multiprocessing
+import os
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+import httpx
 import uvicorn
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from auraclaw.action.skill_packages import (
+    DefaultSkillPackageContentScanner,
+    Ed25519SkillSignatureVerifier,
+    HmacSkillSignatureVerifier,
+    SkillPackage,
+    SkillPackageRegistry,
+    SkillSignatureVerifier,
+    skill_package_archive,
+    skill_package_digest,
+    skill_signing_payload,
+    validate_skill_test_vectors,
+)
 from auraclaw.composition.local_ingress import (
     create_local_ingress_app,
     loopback_connect_host,
 )
-from auraclaw.composition.services import SERVICE_BY_COMMAND, create_service_app, service_spec
+from auraclaw.composition.services import (
+    DATABASE_SERVICES,
+    SERVICE_BY_COMMAND,
+    create_service_app,
+    service_spec,
+)
 from auraclaw.config import Settings, get_settings
+from auraclaw.contracts.errors import SkillContentRejectedError
 from auraclaw.contracts.internal import ServiceIdentity
+from auraclaw.contracts.skills import SkillManifest
 from auraclaw.infrastructure.clients.admin import RemoteAdminClient
 from auraclaw.infrastructure.persistence.migration_runner import (
     create_migration_runner,
@@ -140,6 +168,13 @@ async def _run_migration_command(
         settings.resolved_migration_database_url,
         migration_dir,
     )
+    if action == "latest":
+        print(runner.latest_version)
+        return
+    if action == "check":
+        await runner.check(target)
+        print(f"schema ready: {runner.latest_version}")
+        return
     if action == "status":
         for item in await runner.status():
             print(f"{item.version} {item.state} {item.name} sha256={item.checksum[:12]}")
@@ -156,6 +191,308 @@ async def _run_migration_command(
     print(f"migrations applied={len(applied)}")
     for name in applied:
         print(name)
+
+
+class _ValidationArtifactWriter:
+    async def put(self, **kwargs: object) -> Any:
+        del kwargs
+        raise RuntimeError("validation must not write Artifacts")
+
+
+def _read_skill_directory(directory: str) -> tuple[Path, dict[str, bytes]]:
+    root = Path(directory).resolve()
+    if not root.is_dir():
+        raise SystemExit(f"Skill directory does not exist: {directory}")
+    files: dict[str, bytes] = {}
+    total_size = 0
+    for item in sorted(root.rglob("*")):
+        if item.is_symlink():
+            raise SystemExit(f"Skill directory contains a symlink: {item.relative_to(root)}")
+        if not item.is_file():
+            continue
+        relative = item.relative_to(root).as_posix()
+        files[relative] = item.read_bytes()
+        total_size += len(files[relative])
+        if len(files) > 512 or total_size > 16 * 1024 * 1024:
+            raise SystemExit("Skill package exceeds local validation limits")
+    return root, files
+
+
+def _load_skill_directory(directory: str) -> SkillPackage:
+    _root, files = _read_skill_directory(directory)
+    return SkillPackage.from_files(files)
+
+
+def _validate_local_skill(
+    package: SkillPackage,
+    settings: Settings,
+    *,
+    external_public_key: bytes | None = None,
+) -> SkillPackage:
+    verifier: SkillSignatureVerifier
+    if package.manifest.publisher == "platform":
+        signing_key = (
+            settings.skill_signing_key.get_secret_value().encode()
+            if settings.skill_signing_key is not None
+            else b"auraclaw-development-platform-skill-key"
+        )
+        verifier = HmacSkillSignatureVerifier(
+            {package.manifest.publisher: signing_key}
+        )
+    else:
+        key_id = package.manifest.signature_key_id
+        if external_public_key is None or key_id is None:
+            raise SystemExit(
+                "External Skill validation requires signature_key_id and public key"
+            )
+        verifier = Ed25519SkillSignatureVerifier(
+            {(package.manifest.publisher, key_id): external_public_key}
+        )
+    registry = SkillPackageRegistry(
+        artifacts=_ValidationArtifactWriter(),
+        signature_verifier=verifier,
+    )
+    validated = registry.validate(package)
+    findings = DefaultSkillPackageContentScanner().scan(validated)
+    if findings:
+        raise SkillContentRejectedError(findings[0])
+    return validated
+
+
+def _decode_ed25519_key(value: str, *, kind: str) -> bytes:
+    if not value or any(
+        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        for character in value
+    ):
+        raise SystemExit(f"Ed25519 {kind} key is not valid base64url")
+    try:
+        decoded = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (ValueError, binascii.Error) as exc:
+        raise SystemExit(f"Ed25519 {kind} key is not valid base64url") from exc
+    if len(decoded) != 32:
+        raise SystemExit(f"Ed25519 {kind} key must contain exactly 32 bytes")
+    return decoded
+
+
+def _key_from_environment(variable: str, *, kind: str) -> bytes:
+    value = os.environ.get(variable)
+    if not value:
+        raise SystemExit(f"Ed25519 {kind} key is required in {variable}")
+    return _decode_ed25519_key(value, kind=kind)
+
+
+def _sign_external_skill_directory(
+    directory: str,
+    *,
+    publisher: str,
+    key_id: str,
+    private_key: bytes,
+) -> tuple[SkillPackage, str]:
+    if publisher == "platform":
+        raise SystemExit("External signing cannot claim the platform publisher")
+    root, files = _read_skill_directory(directory)
+    manifest_content = files.get("manifest.json")
+    if manifest_content is None:
+        raise SystemExit("Skill package is missing manifest.json")
+    try:
+        raw_manifest = json.loads(manifest_content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("Skill manifest is invalid JSON") from exc
+    if not isinstance(raw_manifest, dict):
+        raise SystemExit("Skill manifest must be a JSON object")
+    if raw_manifest.get("publisher") != publisher:
+        raise SystemExit("--publisher must match manifest publisher")
+    raw_manifest["signature_payload_version"] = "v2"
+    raw_manifest["signature_key_id"] = key_id
+    raw_manifest["signature"] = "ed25519:unsigned"
+    try:
+        unsigned_manifest = SkillManifest.model_validate(raw_manifest)
+        signing_key = Ed25519PrivateKey.from_private_bytes(private_key)
+    except ValueError as exc:
+        raise SystemExit("Skill manifest or Ed25519 private key is invalid") from exc
+    unsigned = SkillPackage(manifest=unsigned_manifest, files=files)
+    signature = signing_key.sign(skill_signing_payload(unsigned))
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    signed_manifest = unsigned_manifest.model_copy(
+        update={"signature": f"ed25519:{encoded_signature}"}
+    )
+    signed_files = {
+        **files,
+        "manifest.json": signed_manifest.model_dump_json().encode(),
+    }
+    package = SkillPackage.from_files(signed_files)
+    public_key = signing_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    _validate_local_skill(
+        package,
+        Settings(_env_file=None),
+        external_public_key=public_key,
+    )
+    target = root / "manifest.json"
+    temporary = root / f".manifest.json.{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(signed_files["manifest.json"])
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    encoded_public_key = base64.urlsafe_b64encode(public_key).rstrip(b"=").decode()
+    return package, encoded_public_key
+
+
+def _identity_headers(
+    *, tenant_id: str, actor_id: str, token: str | None, command_id: str | None = None
+) -> dict[str, str]:
+    headers = {
+        "X-Tenant-ID": tenant_id,
+        "X-Actor-ID": actor_id,
+        "X-Correlation-ID": command_id or f"skill-cli-{uuid.uuid4().hex}",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if command_id:
+        headers["Idempotency-Key"] = command_id
+    return headers
+
+
+def _skill_subcommand_id(command_id: str, operation: str) -> str:
+    digest = hashlib.sha256(f"{command_id}:{operation}".encode()).hexdigest()
+    return f"skill-cli-{operation}-{digest}"
+
+
+async def _publish_skill_archive(
+    *,
+    client: httpx.AsyncClient,
+    package: SkillPackage,
+    tenant_id: str,
+    actor_id: str,
+    publisher: str,
+    activate: bool,
+    expected_revision: int,
+    command_id: str,
+    token: str | None,
+) -> dict[str, Any]:
+    if publisher != package.manifest.publisher:
+        raise SystemExit("--publisher must match manifest publisher")
+    archive = skill_package_archive(package)
+    checksum = hashlib.sha256(archive).hexdigest()
+    headers = _identity_headers(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        token=token,
+        command_id=command_id,
+    )
+    staged = await client.post(
+        "/v1/admin/skill-package-uploads",
+        headers={
+            **headers,
+            "Idempotency-Key": _skill_subcommand_id(command_id, "upload"),
+            "Content-Type": "application/vnd.auraclaw.skill-package+json",
+            "X-Upload-Name": (
+                f"{package.manifest.publisher}.{package.manifest.name}-"
+                f"{package.manifest.version}.skill.json"
+            ),
+            "X-Content-SHA256": checksum,
+        },
+        content=archive,
+    )
+    _require_cli_success(staged, "proxy staged upload")
+    artifact_ref = staged.json()["artifact_ref"]
+    published = await client.post(
+        "/v1/admin/skill-publications",
+        headers={**headers, "X-Expected-Revision": str(expected_revision)},
+        json={
+            "activate": activate,
+            "artifact_ref": artifact_ref,
+            "expected_digest": skill_package_digest(package),
+        },
+    )
+    _require_cli_success(published, "publish Skill package")
+    return dict(published.json())
+
+
+def _require_cli_success(response: httpx.Response, operation: str) -> None:
+    if response.is_error:
+        raise SystemExit(f"Unable to {operation}: HTTP {response.status_code}")
+
+
+async def _run_skills_command(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    if args.action == "sign":
+        private_key = _key_from_environment(args.private_key_env, kind="private")
+        package, public_key = _sign_external_skill_directory(
+            args.directory,
+            publisher=args.publisher,
+            key_id=args.key_id,
+            private_key=private_key,
+        )
+        print(
+            json.dumps(
+                {
+                    "publisher": package.manifest.publisher,
+                    "name": package.manifest.name,
+                    "version": package.manifest.version,
+                    "signature_key_id": package.manifest.signature_key_id,
+                    "public_key": public_key,
+                    "package_digest": skill_package_digest(package),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    package = _load_skill_directory(args.directory)
+    external_public_key = None
+    if package.manifest.publisher != "platform":
+        external_public_key = _key_from_environment(
+            args.public_key_env, kind="public"
+        )
+    package = _validate_local_skill(
+        package,
+        settings,
+        external_public_key=external_public_key,
+    )
+    if args.action == "validate":
+        print(
+            json.dumps(
+                {
+                    "publisher": package.manifest.publisher,
+                    "name": package.manifest.name,
+                    "version": package.manifest.version,
+                    "package_digest": skill_package_digest(package),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    if args.action == "test":
+        print(json.dumps({"declarative_test_vectors": validate_skill_test_vectors(package)}))
+        return
+    token = os.environ.get(args.token_env)
+    if not token:
+        raise SystemExit(f"Skill publication requires bearer token in {args.token_env}")
+    api_url = args.api_url or f"http://127.0.0.1:{settings.task_api_port}"
+    command_id = args.command_id or f"skill-publish-{uuid.uuid4().hex}"
+    async with httpx.AsyncClient(base_url=api_url, timeout=120.0) as client:
+        result = await _publish_skill_archive(
+            client=client,
+            package=package,
+            tenant_id=args.tenant,
+            actor_id=args.actor,
+            publisher=args.publisher,
+            activate=not args.staged,
+            expected_revision=args.expected_revision,
+            command_id=command_id,
+            token=token,
+        )
+    print(json.dumps(result, sort_keys=True))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -182,14 +519,42 @@ def build_parser() -> argparse.ArgumentParser:
     operations.add_argument("--queue", choices=("projection", "delivery"))
     operations.add_argument("--item-id")
     migrate = subcommands.add_parser("migrate")
-    migrate.add_argument("action", choices=("status", "up", "baseline"))
+    migrate.add_argument("action", choices=("status", "up", "baseline", "check", "latest"))
     migrate.add_argument("--target")
     migrate.add_argument(
         "--directory",
         default=None,
-        help="Migration directory (default: migrations/ or migrations/mysql/ by dialect)",
+        help="Migration directory (default: migrations/)",
     )
     migrate.add_argument("--confirm-existing-schema", action="store_true")
+    skills = subcommands.add_parser("skills")
+    skill_commands = skills.add_subparsers(dest="action", required=True)
+    for action in ("validate", "test"):
+        skill_command_parser = skill_commands.add_parser(action)
+        skill_command_parser.add_argument("directory")
+        skill_command_parser.add_argument(
+            "--public-key-env", default="AURACLAW_SKILL_PUBLIC_KEY"
+        )
+    sign = skill_commands.add_parser("sign")
+    sign.add_argument("directory")
+    sign.add_argument("--publisher", required=True)
+    sign.add_argument("--key-id", required=True)
+    sign.add_argument(
+        "--private-key-env", default="AURACLAW_SKILL_SIGNING_KEY"
+    )
+    publish = skill_commands.add_parser("publish")
+    publish.add_argument("directory")
+    publish.add_argument("--tenant", required=True)
+    publish.add_argument("--publisher", required=True)
+    publish.add_argument("--actor", default="skill-cli")
+    publish.add_argument("--api-url")
+    publish.add_argument("--token-env", default="AURACLAW_API_TOKEN")
+    publish.add_argument(
+        "--public-key-env", default="AURACLAW_SKILL_PUBLIC_KEY"
+    )
+    publish.add_argument("--command-id")
+    publish.add_argument("--expected-revision", type=int, default=0)
+    publish.add_argument("--staged", action="store_true")
     for command in SERVICE_BY_COMMAND:
         if command == "projection":
             continue
@@ -203,6 +568,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _check_service_schema(command: str, settings: Settings) -> None:
+    name = SERVICE_BY_COMMAND[command]
+    if not settings.sql_storage_enabled or name not in {*DATABASE_SERVICES, "task-api"}:
+        return
+    directory = Path(os.environ.get("AURACLAW_MIGRATIONS_DIRECTORY", "migrations"))
+    runner = create_migration_runner(settings.resolved_database_url, directory)
+    asyncio.run(runner.check())
+
+
 def _run_service_process(
     command: str,
     host: str,
@@ -211,6 +585,7 @@ def _run_service_process(
     worker_interval: float | None,
 ) -> None:
     settings = get_settings()
+    _check_service_schema(command, settings)
     app = (
         create_service_app(command, settings, worker_interval=worker_interval)
         if command == "projection" and worker_interval is not None
@@ -234,15 +609,16 @@ def _run_ingress_process(
 
 
 def _serve_topology(settings: Settings, *, host: str) -> None:
-    multiprocessing.freeze_support()
-    if (
-        settings.deployment_profile != "development"
-        and not settings.sql_storage_enabled
-        and not settings.kafka_enabled
-    ):
+    if not settings.sql_storage_enabled:
         raise ValueError(
-            "auraclaw serve requires shared SQL storage or Kafka for cross-process "
-            "runtime event streaming"
+            "auraclaw serve requires SQL storage (PostgreSQL or Kingbase) so "
+            "MCP registry, session facts and projections survive restarts. Configure "
+            "AURACLAW_STORAGE_BACKEND and DB_* credentials in .env.dev."
+        )
+    if not settings.kafka_enabled:
+        raise ValueError(
+            "auraclaw serve requires Kafka for cross-process runtime event streaming. "
+            "Configure KAFKA_HOST in .env.dev."
         )
     processes: list[multiprocessing.Process] = []
     for command in SERVICE_BY_COMMAND:
@@ -319,6 +695,7 @@ def main(
                     "compose. Use `auraclaw serve` for local development."
                 )
             spec = service_spec("projection", settings)
+            _check_service_schema("projection", settings)
             interval = (
                 args.interval
                 if args.interval is not None
@@ -373,6 +750,9 @@ def main(
             )
         )
         return
+    if args.command == "skills":
+        asyncio.run(_run_skills_command(args))
+        return
     if args.command in SERVICE_BY_COMMAND and args.command != "projection":
         settings = get_settings()
         if settings.deployment_profile != "production":
@@ -381,6 +761,7 @@ def main(
                 "compose. Use `auraclaw serve` for local development."
             )
         spec = service_spec(args.command, settings)
+        _check_service_schema(args.command, settings)
         uvicorn_runner(
             create_service_app(args.command, settings),
             host=args.host or settings.host,

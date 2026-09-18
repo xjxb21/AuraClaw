@@ -8,17 +8,7 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 SECRET_VARIABLES = {
-    "task_query_database_url": "TASK_QUERY_DATABASE_URL",
-    "session_database_url": "SESSION_DATABASE_URL",
-    "projection_database_url": "PROJECTION_DATABASE_URL",
-    "control_database_url": "CONTROL_DATABASE_URL",
-    "model_database_url": "MODEL_DATABASE_URL",
-    "hands_database_url": "HANDS_DATABASE_URL",
-    "policy_database_url": "POLICY_DATABASE_URL",
-    "credential_database_url": "CREDENTIAL_DATABASE_URL",
-    "artifact_database_url": "ARTIFACT_DATABASE_URL",
-    "streaming_database_url": "STREAMING_DATABASE_URL",
-    "delivery_database_url": "DELIVERY_DATABASE_URL",
+    "database_url": "AURACLAW_DATABASE_URL",
     "migration_database_url": "AURACLAW_MIGRATION_DATABASE_URL",
     "task_api_workload_token": "AURACLAW_TASK_API_WORKLOAD_TOKEN",
     "projection_workload_token": "AURACLAW_PROJECTION_WORKLOAD_TOKEN",
@@ -34,10 +24,15 @@ SECRET_VARIABLES = {
     "lease_signing_key": "AURACLAW_LEASE_SIGNING_KEY",
     "model_api_key": "AURACLAW_MODEL_API_KEY",
     "vault_token": "AURACLAW_CREDENTIAL_VAULT_TOKEN",
-    "seaweedfs_access_key": "SEAWEEDFS_ACCESS_KEY",
-    "seaweedfs_secret_key": "SEAWEEDFS_SECRET_KEY",
+    "vault_approle_secret_id": "AURACLAW_CREDENTIAL_VAULT_APPROLE_SECRET_ID",
+    "obs_ak": "OBS_AK",
+    "obs_sk": "OBS_SK",
     "chaintower_workload_token": "AURACLAW_CHAINTOWER_WORKLOAD_TOKEN",
     "agent_context_signing_keys_json": "AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON",
+}
+OPTIONAL_VARIABLES = {
+    "AURACLAW_CREDENTIAL_VAULT_TOKEN",
+    "AURACLAW_CREDENTIAL_VAULT_APPROLE_SECRET_ID",
 }
 
 
@@ -57,7 +52,22 @@ def main() -> int:
         variable: os.environ.get(variable) or configured.get(variable) or ""
         for variable in SECRET_VARIABLES.values()
     }
-    missing = [variable for variable, value in values.items() if not value]
+    missing = [
+        variable
+        for variable in SECRET_VARIABLES.values()
+        if variable not in OPTIONAL_VARIABLES and not values[variable]
+    ]
+    role_id = os.environ.get("AURACLAW_CREDENTIAL_VAULT_APPROLE_ROLE_ID") or configured.get(
+        "AURACLAW_CREDENTIAL_VAULT_APPROLE_ROLE_ID"
+    )
+    token = values["AURACLAW_CREDENTIAL_VAULT_TOKEN"]
+    secret_id = values["AURACLAW_CREDENTIAL_VAULT_APPROLE_SECRET_ID"]
+    if not token and not (role_id and secret_id):
+        missing.append(
+            "AURACLAW_CREDENTIAL_VAULT_TOKEN or complete Vault AppRole credentials"
+        )
+    if bool(role_id) != bool(secret_id):
+        missing.append("complete Vault AppRole role_id + secret_id pair")
     if missing:
         print("secret materialization failed")
         for variable in missing:
@@ -76,7 +86,8 @@ def main() -> int:
             0o600,
         )
         try:
-            os.write(descriptor, values[variable].encode())
+            payload = values[variable]
+            os.write(descriptor, payload.encode())
             os.fsync(descriptor)
         finally:
             os.close(descriptor)

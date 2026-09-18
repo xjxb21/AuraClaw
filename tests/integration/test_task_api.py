@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from auraclaw.composition.providers import (
     get_approval_projection,
+    get_collaboration_projection,
     get_event_store,
     get_sync_invocation_gateway,
     get_task_projection,
@@ -16,7 +17,6 @@ from auraclaw.config import get_settings
 from auraclaw.contracts.commands import CommandContext
 from auraclaw.contracts.events import Actor, NewEvent
 from auraclaw.main import create_app
-from auraclaw.projection.approval.projector import CompositeProjection
 
 
 def setup_function() -> None:
@@ -28,6 +28,7 @@ def setup_function() -> None:
     get_event_store.cache_clear()
     get_task_projection.cache_clear()
     get_approval_projection.cache_clear()
+    get_collaboration_projection.cache_clear()
     get_task_result_waiter.cache_clear()
     get_sync_invocation_gateway.cache_clear()
 
@@ -200,9 +201,7 @@ def test_human_approval_response_enters_through_task_gateway() -> None:
                 ],
                 command_result={"approval_id": "apr-api-test"},
             )
-            await CompositeProjection(
-                get_task_projection(), get_approval_projection()
-            ).project(result.events)
+            await get_task_projection().project(result.events)
 
         asyncio.run(seed_approval())
         waiting = client.get(
@@ -320,7 +319,7 @@ def test_sync_invoke_reuses_idempotent_session_and_returns_cancelled() -> None:
             created = await client.post(
                 "/v1/tasks",
                 headers={**headers, "Idempotency-Key": "sync-same-key"},
-                json={"goal": "cancel while waiting"},
+                json={"goal": "cancel while waiting", "interaction_mode": "non_streaming"},
             )
             assert created.status_code == 202
             session_id = created.json()["session_id"]
@@ -444,9 +443,7 @@ def test_result_wait_returns_conflict_when_waiting_for_human() -> None:
                 ],
                 command_result={"approval_id": "apr-sync"},
             )
-            await CompositeProjection(
-                get_task_projection(), get_approval_projection()
-            ).project(result.events)
+            await get_task_projection().project(result.events)
 
             response = await client.get(
                 f"/v1/tasks/{session_id}/result",

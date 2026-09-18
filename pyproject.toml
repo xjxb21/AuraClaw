@@ -12,13 +12,14 @@ license = { text = "MIT" }
 dependencies = [
   "aiokafka>=0.12,<1",
   "asyncpg>=0.30,<1",
+  "cryptography>=45,<50",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
-  "pymysql[rsa]>=1.1,<2",
+  "jsonschema>=4.26,<5",
   "pydantic-settings>=2.6,<3",
+  "regex>=2024.11,<2027",
   "socksio>=1.0,<2",
   "uvicorn[standard]>=0.32,<1",
-  "aiomysql>=0.2,<1",
 ]
 
 [project.optional-dependencies]
@@ -130,9 +131,15 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "Action Hands does not depend on Runtime or Control"
+name = "Action Hands business and Skill lifecycle adapters do not depend on Runtime or Control"
 type = "forbidden"
-source_modules = ["auraclaw.action"]
+source_modules = [
+  "auraclaw.action",
+  "auraclaw.infrastructure.persistence.postgres_skill_lifecycle",
+  "auraclaw.infrastructure.persistence.postgres_skill_package_records",
+  "auraclaw.infrastructure.persistence.postgres_skill_publication_records",
+  "auraclaw.infrastructure.persistence.postgres_skill_installation_records",
+]
 forbidden_modules = ["auraclaw.runtime", "auraclaw.control"]
 
 [project.scripts]

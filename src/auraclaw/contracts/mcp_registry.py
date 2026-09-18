@@ -10,7 +10,6 @@ from pydantic import Field, model_validator
 
 from auraclaw.contracts.capabilities import (
     CapabilityStatus,
-    CapabilityTrustLevel,
     McpAuthStrategy,
     McpNetworkMode,
     McpOAuthConfiguration,
@@ -43,6 +42,7 @@ class McpRegistryOperationKind(StrEnum):
     DISABLE = "disable"
     RECONCILE = "reconcile"
     RETIRE = "retire"
+    DELETE = "delete"
 
 
 class McpRegistryOperationStatus(StrEnum):
@@ -50,6 +50,8 @@ class McpRegistryOperationStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    RECONCILING = "reconciling"
+    UNKNOWN_SIDE_EFFECT = "unknown_side_effect"
 
 
 class McpServerConfig(ContractModel):
@@ -64,11 +66,9 @@ class McpServerConfig(ContractModel):
     auth_strategy: McpAuthStrategy = McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT
     credential_ref: str | None = None
     oauth: McpOAuthConfiguration | None = None
-    allowed_tool_prefixes: tuple[str, ...] = ()
     allowed_resource_schemes: tuple[str, ...] = ()
     allowed_prompt_prefixes: tuple[str, ...] = ()
     allowed_cidrs: tuple[str, ...] = ()
-    trust_level: CapabilityTrustLevel = CapabilityTrustLevel.EXTERNAL_UNTRUSTED
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -139,8 +139,6 @@ class McpServerConfig(ContractModel):
             credential_ref=credential_ref,
             oauth=self.oauth,
             auth_strategy=self.auth_strategy,
-            trust_level=self.trust_level,
-            allowed_tool_prefixes=self.allowed_tool_prefixes,
             allowed_resource_schemes=self.allowed_resource_schemes,
             allowed_prompt_prefixes=self.allowed_prompt_prefixes,
             allowed_private_hosts=private_hosts,
@@ -164,7 +162,9 @@ class McpServerRevisionRecord(ContractModel):
 
 class McpServerRuntimeRecord(ContractModel):
     server_id: str
+    instance_id: str = Field(default="legacy", min_length=1, max_length=256)
     loaded_revision: int | None = None
+    applied_generation: int | None = Field(default=None, ge=1)
     observed_state: McpObservedState = McpObservedState.PENDING
     last_test_at: datetime | None = None
     last_sync_at: datetime | None = None
@@ -185,6 +185,7 @@ class McpServerRecord(ContractModel):
     latest_config: McpServerConfig | None = None
     active_config: McpServerConfig | None = None
     runtime: McpServerRuntimeRecord | None = None
+    runtimes: tuple[McpServerRuntimeRecord, ...] = ()
 
 
 class McpServerOperationRecord(ContractModel):
@@ -231,6 +232,7 @@ class McpServerLifecycleCommand(ContractModel):
     causation_id: str = Field(min_length=1)
     expected_revision: int = Field(ge=0)
     target_revision: int | None = None
+    force_schema_update: bool = False
 
 
 def none_credential_ref(server_id: str) -> str:

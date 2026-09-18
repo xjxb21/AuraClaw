@@ -7,6 +7,7 @@ from typing import Any, Literal, Protocol
 
 from auraclaw.contracts.events import CanonicalEvent, NewEvent
 from auraclaw.contracts.hands import (
+    HandsInvocationStatusResponse,
     HandsPage,
     HandsPromptDescriptor,
     HandsPromptResult,
@@ -29,14 +30,33 @@ class ModelPolicy:
 
 
 @dataclass(frozen=True)
+class SkillResolutionOutcome:
+    status: Literal["success", "denied", "error"]
+    binding: SkillBinding | None = None
+    error_code: str | None = None
+    summary: str = ""
+
+
+@dataclass(frozen=True)
 class ModelRequest:
     model_call_id: str
     tenant_id: str
     run_id: str
     messages: tuple[dict[str, Any], ...]
+    session_id: str | None = None
     tools: tuple[dict[str, Any], ...] = ()
     policy: ModelPolicy = field(default_factory=ModelPolicy)
     max_output_tokens: int = 8192
+    run_max_cost: float | None = None
+    runtime_metrics: dict[str, float] = field(default_factory=dict)
+    prompt_cache_key: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderCancellationResult:
+    stopped: bool
+    usage: dict[str, int | float] = field(default_factory=dict)
+    usage_final: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,9 +124,7 @@ class SessionClient(Protocol):
 class RuntimeControlClient(Protocol):
     async def assert_fencing(self, resource_id: str, fencing_token: int) -> None: ...
 
-    async def is_cancelled(
-        self, tenant_id: str, session_id: str, run_id: str
-    ) -> bool: ...
+    async def is_cancelled(self, tenant_id: str, session_id: str, run_id: str) -> bool: ...
 
     async def save_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None: ...
 
@@ -115,6 +133,15 @@ class RuntimeControlClient(Protocol):
     ) -> RuntimeCheckpoint | None: ...
 
     async def finish_assignment(self, task_id: str, outcome: str) -> None: ...
+
+    async def suspend_assignment(self, task_id: str, reason: str) -> None: ...
+
+    async def suspend_with_checkpoint(
+        self,
+        task_id: str,
+        checkpoint: RuntimeCheckpoint,
+        reason: str,
+    ) -> None: ...
 
 
 class ModelClient(Protocol):
@@ -132,9 +159,7 @@ class CredentialResolver(Protocol):
 
 
 class ToolClient(Protocol):
-    async def execute(
-        self, assignment: RuntimeAssignment, call: ToolCall
-    ) -> dict[str, Any]: ...
+    async def execute(self, assignment: RuntimeAssignment, call: ToolCall) -> dict[str, Any]: ...
 
 
 class HandsClient(Protocol):
@@ -192,15 +217,17 @@ class HandsClient(Protocol):
         tool_invocation_id: str,
     ) -> bool: ...
 
+    async def get_invocation_status(
+        self,
+        assignment: RuntimeAssignment,
+        tool_invocation_id: str,
+    ) -> HandsInvocationStatusResponse: ...
+
 
 class CapabilityClient(ToolClient, Protocol):
-    async def list_tools(
-        self, assignment: RuntimeAssignment
-    ) -> list[dict[str, Any]]: ...
+    async def list_tools(self, assignment: RuntimeAssignment) -> list[dict[str, Any]]: ...
 
-    async def list_resources(
-        self, assignment: RuntimeAssignment
-    ) -> list[dict[str, Any]]: ...
+    async def list_resources(self, assignment: RuntimeAssignment) -> list[dict[str, Any]]: ...
 
     async def list_resource_templates(
         self, assignment: RuntimeAssignment
@@ -212,9 +239,7 @@ class CapabilityClient(ToolClient, Protocol):
         uri: str,
     ) -> list[dict[str, Any]]: ...
 
-    async def list_prompts(
-        self, assignment: RuntimeAssignment
-    ) -> list[dict[str, Any]]: ...
+    async def list_prompts(self, assignment: RuntimeAssignment) -> list[dict[str, Any]]: ...
 
     async def get_prompt(
         self,
@@ -251,7 +276,18 @@ class CapabilityClient(ToolClient, Protocol):
         version: str = "*",
         publisher: str | None = None,
         active_skill_names: tuple[str, ...] = (),
-    ) -> SkillBinding: ...
+    ) -> SkillResolutionOutcome: ...
+
+
+class CollaborationClient(Protocol):
+    async def execute(
+        self,
+        assignment: RuntimeAssignment,
+        *,
+        operation: str,
+        arguments: dict[str, Any],
+        command_id: str,
+    ) -> dict[str, Any]: ...
 
 
 class SkillBindingResolver(Protocol):
@@ -264,6 +300,7 @@ class SkillBindingResolver(Protocol):
         publisher: str | None = None,
         role: str,
         policy_version: str,
+        assignment_role: str | None = None,
         subject: str = "agent-runtime",
         correlation_id: str = "skill.resolve",
         active_skill_names: tuple[str, ...] = (),

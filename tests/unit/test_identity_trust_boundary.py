@@ -12,7 +12,6 @@ from auraclaw.composition.identity import build_identity_verifier
 from auraclaw.config import Settings, get_settings
 from auraclaw.contracts.capabilities import (
     CapabilityStatus,
-    CapabilityTrustLevel,
     McpAuthStrategy,
     McpServerDefinition,
 )
@@ -388,6 +387,17 @@ def test_development_header_adapter_is_explicit() -> None:
         assert isinstance(
             build_identity_verifier(production), SignedAgentContextVerifier
         )
+        uplink = Settings(
+            _env_file=None,
+            deployment_profile="production",
+            test_uplink_insecure_identity=True,
+            chaintower_workload_token=WORKLOAD,
+            agent_context_signing_keys_json='{"k1":"chaintower-agent-context-signing-key-01"}',
+        )
+        assert uplink.insecure_identity_headers_enabled is True
+        assert isinstance(
+            build_identity_verifier(uplink), DevelopmentHeaderIdentityVerifier
+        )
 
     asyncio.run(scenario())
 
@@ -401,6 +411,7 @@ def test_production_task_api_requires_signed_context() -> None:
         Settings(
             _env_file=None,
             deployment_profile="production",
+            storage_backend="memory",
             chaintower_workload_token=SecretStr(WORKLOAD),
             agent_context_signing_keys_json='{"k1":"chaintower-agent-context-signing-key-01"}',
         )
@@ -476,8 +487,6 @@ def test_mcp_workload_trusted_context_does_not_require_oauth() -> None:
         endpoint="https://mcp.chaintower.example/mcp",
         credential_ref="vault/chaintower-mcp#workload",
         auth_strategy=McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT,
-        trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
-        allowed_tool_prefixes=("order.",),
         allowed_resource_schemes=("order",),
         allowed_prompt_prefixes=("order.",),
         status=CapabilityStatus.ACTIVE,
@@ -520,8 +529,6 @@ def test_mcp_transport_rejects_argument_identity_override_and_missing_user() -> 
             endpoint="https://mcp.chaintower.example/mcp",
             credential_ref="vault/chaintower-mcp#workload",
             auth_strategy=McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT,
-            trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
-            allowed_tool_prefixes=("order.",),
             allowed_resource_schemes=("order",),
             allowed_prompt_prefixes=("order.",),
             status=CapabilityStatus.ACTIVE,

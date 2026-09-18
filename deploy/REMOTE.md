@@ -1,7 +1,7 @@
 # AuraClaw 远程部署目录说明
 
 本目录用于 `compose.prod.yml` 与 `compose.test.yml` 部署。详细步骤见仓库内
-`docs/S5 Docker Compose 生产部署与故障演练 Runbook.md`。
+`docs/operations/production-deployment.md`。
 
 ## 目录内容
 
@@ -14,7 +14,6 @@
 | `.env.test` / `.env.prod` | 部署环境变量（0600，勿提交） |
 | `.runtime/compose-secrets/` | Compose secrets 文件（0700/0600） |
 | `deploy/nginx.conf` | Ingress 配置 |
-| `deploy/mysql/roles.sql` | MySQL 角色授权 |
 | `Dockerfile` / `src/` / `migrations/` | 本地构建镜像用 |
 | `scripts/` | secrets 物化与 preflight |
 

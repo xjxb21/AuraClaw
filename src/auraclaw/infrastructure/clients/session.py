@@ -21,6 +21,12 @@ from auraclaw.contracts.internal import (
     SessionAppendResponse,
     SessionFeedRequest,
     SessionFeedResponse,
+    SessionRootFeedRequest,
+    SessionRootFeedResponse,
+    SkillActiveBindingReferenceRequest,
+    SkillActiveBindingReferenceResponse,
+    SkillBindingReferenceRequest,
+    SkillBindingReferenceResponse,
 )
 from auraclaw.contracts.state import Visibility
 from auraclaw.internal.http import HttpContractClient
@@ -75,6 +81,7 @@ class RemoteSessionEventStore:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
 
     @staticmethod
     def _unsupported(operation: str) -> NoReturn:
@@ -173,6 +180,86 @@ class RemoteSessionEventStore:
         del tenant_id
         self._unsupported("load_all")
 
+    async def has_skill_package_reference(
+        self, tenant_id: str, package_digest: str
+    ) -> bool:
+        if self._identity is not ServiceIdentity.ACTION_HANDS:
+            self._unsupported("has_skill_package_reference")
+        request_id = f"skill-binding-reference:{package_digest}"
+        response = await self._contract.call(
+            "/internal/v1/session/skill-bindings/reference",
+            SkillBindingReferenceRequest(
+                context=InternalRequestContext(
+                    tenant_id=tenant_id,
+                    service_identity=self._identity,
+                    request_id=request_id,
+                    correlation_id=request_id,
+                    causation_id=request_id,
+                ),
+                package_digest=package_digest,
+            ),
+            SkillBindingReferenceResponse,
+        )
+        return response.referenced
+
+    async def has_active_skill_reference(
+        self,
+        tenant_id: str,
+        publisher: str,
+        name: str,
+        package_digest: str | None = None,
+    ) -> bool:
+        if self._identity is not ServiceIdentity.ACTION_HANDS:
+            self._unsupported("has_active_skill_reference")
+        request_id = f"skill-active-binding-reference:{publisher}:{name}"
+        response = await self._contract.call(
+            "/internal/v1/session/skill-bindings/active-reference",
+            SkillActiveBindingReferenceRequest(
+                context=InternalRequestContext(
+                    tenant_id=tenant_id,
+                    service_identity=self._identity,
+                    request_id=request_id,
+                    correlation_id=request_id,
+                    causation_id=request_id,
+                ),
+                publisher=publisher,
+                name=name,
+                package_digest=package_digest,
+            ),
+            SkillActiveBindingReferenceResponse,
+        )
+        return response.referenced
+
+    async def load_root(
+        self,
+        tenant_id: str,
+        root_session_id: str,
+        *,
+        event_types: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> list[CanonicalEvent]:
+        response = await self._contract.call(
+            "/internal/v1/session/root-feed",
+            SessionRootFeedRequest(
+                context=InternalRequestContext(
+                    tenant_id=tenant_id,
+                    service_identity=self._identity,
+                    request_id=f"root-feed:{root_session_id}",
+                    correlation_id=f"root-feed:{root_session_id}",
+                    causation_id=f"root-feed:{root_session_id}",
+                ),
+                root_session_id=root_session_id,
+                event_types=(
+                    tuple(event_types) if event_types is not None else None
+                ),
+                limit=limit or 5000,
+            ),
+            SessionRootFeedResponse,
+        )
+        return [
+            canonical_event_from_dict(dict(event)) for event in response.events
+        ]
+
     async def get_snapshot(
         self, tenant_id: str, session_id: str
     ) -> SessionSnapshot | None:
@@ -253,6 +340,78 @@ class RemoteSessionEventStore:
             OutboxDispositionResponse,
         )
         return response.accepted
+
+
+class RemoteSkillBindingReferenceReader:
+    """Action Hands query of canonical Session Events for purge safety."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        bearer_token: str,
+        timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._client = httpx.AsyncClient(
+            base_url=base_url, timeout=timeout, transport=transport
+        )
+        self._contract = HttpContractClient(self._client, bearer_token=bearer_token)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def has_reference(
+        self,
+        *,
+        tenant_id: str,
+        package_digest: str,
+        correlation_id: str,
+    ) -> bool:
+        request_id = f"skill-binding-reference:{package_digest}"
+        response = await self._contract.call(
+            "/internal/v1/session/skill-bindings/reference",
+            SkillBindingReferenceRequest(
+                context=InternalRequestContext(
+                    tenant_id=tenant_id,
+                    service_identity=ServiceIdentity.ACTION_HANDS,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
+                    causation_id=request_id,
+                ),
+                package_digest=package_digest,
+            ),
+            SkillBindingReferenceResponse,
+        )
+        return response.referenced
+
+    async def has_active_skill_reference(
+        self,
+        *,
+        tenant_id: str,
+        publisher: str,
+        name: str,
+        correlation_id: str,
+        package_digest: str | None = None,
+    ) -> bool:
+        request_id = f"skill-active-binding-reference:{publisher}:{name}"
+        response = await self._contract.call(
+            "/internal/v1/session/skill-bindings/active-reference",
+            SkillActiveBindingReferenceRequest(
+                context=InternalRequestContext(
+                    tenant_id=tenant_id,
+                    service_identity=ServiceIdentity.ACTION_HANDS,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
+                    causation_id=request_id,
+                ),
+                publisher=publisher,
+                name=name,
+                package_digest=package_digest,
+            ),
+            SkillActiveBindingReferenceResponse,
+        )
+        return response.referenced
 
 
 class RemoteTaskProjection:

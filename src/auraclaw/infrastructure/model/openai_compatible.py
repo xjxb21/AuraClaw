@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import copy
+import asyncio
 import hashlib
 import json
 import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from typing import Any
 from urllib.parse import urlparse
 
@@ -18,13 +19,15 @@ from auraclaw.contracts.errors import (
     ModelRateLimitError,
     ModelTimeoutError,
 )
-from auraclaw.runtime.ports import ModelRequest, ModelResponse, ModelStreamChunk, ToolCall
+from auraclaw.runtime.ports import (
+    ModelRequest,
+    ModelResponse,
+    ModelStreamChunk,
+    ProviderCancellationResult,
+    ToolCall,
+)
 
 logger = logging.getLogger(__name__)
-
-_MODEL_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_MODEL_TOOL_NAME_UNSAFE_PATTERN = re.compile(r"[^A-Za-z0-9_-]")
-_MODEL_TOOL_NAME_DIGEST_LENGTH = 12
 
 
 class OpenAICompatibleProvider:
@@ -38,6 +41,7 @@ class OpenAICompatibleProvider:
         name: str = "openai_compatible",
         timeout_seconds: float = 120.0,
         thinking_enabled: bool | None = None,
+        prompt_cache_key_enabled: bool = False,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.name = name
@@ -45,8 +49,10 @@ class OpenAICompatibleProvider:
         self._endpoint = self._chat_completions_endpoint(base_url)
         self._timeout = timeout_seconds
         self._thinking_enabled = thinking_enabled
+        self._prompt_cache_key_enabled = prompt_cache_key_enabled
         self._client = client
         self._owns_client = client is None
+        self._active_tasks: dict[str, asyncio.Task[object]] = {}
 
     async def aclose(self) -> None:
         if self._client is not None and self._owns_client:
@@ -83,7 +89,10 @@ class OpenAICompatibleProvider:
 
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
+            self._client = httpx.AsyncClient(
+                timeout=self._timeout,
+                trust_env=False,
+            )
             self._owns_client = True
         return self._client
 
@@ -105,84 +114,130 @@ class OpenAICompatibleProvider:
     async def generate_stream(
         self, request: ModelRequest, *, credential: str
     ) -> AsyncIterator[ModelStreamChunk]:
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_tasks[request.model_call_id] = task
+        try:
+            async for chunk in self._generate_stream(request, credential=credential):
+                yield chunk
+        finally:
+            if self._active_tasks.get(request.model_call_id) is task:
+                self._active_tasks.pop(request.model_call_id, None)
+
+    async def cancel(self, model_call_id: str) -> ProviderCancellationResult:
+        task = self._active_tasks.get(model_call_id)
+        if task is None or task.done():
+            return ProviderCancellationResult(stopped=False)
+        task.cancel()
+        # Chat Completions does not provide authoritative partial usage when an
+        # HTTP stream is interrupted. The caller must reconcile accounting.
+        return ProviderCancellationResult(stopped=True, usage_final=False)
+
+    async def _generate_stream(
+        self, request: ModelRequest, *, credential: str
+    ) -> AsyncIterator[ModelStreamChunk]:
         model = request.policy.preferred_model or self._model
-        tool_name_aliases: dict[str, str] = {}
-        model_tools: list[dict[str, Any]] | None = None
-        if request.tools:
-            model_tools, tool_name_aliases = self._model_tools(request.tools)
+        tool_aliases = self._tool_aliases(request.tools)
         payload: dict[str, Any] = {
             "model": model,
-            "messages": self._model_messages(
-                request.messages,
-                tool_name_aliases=tool_name_aliases,
-            ),
+            "messages": self._provider_messages(request.messages, tool_aliases),
             "max_tokens": request.max_output_tokens,
             "stream": True,
-            "stream_options": {"include_usage": True},
         }
-        if model_tools is not None:
-            payload["tools"] = model_tools
+        if request.tools:
+            payload["tools"] = self._provider_tools(request.tools, tool_aliases)
         if self._thinking_enabled is not None:
             payload["thinking"] = {
                 "type": "enabled" if self._thinking_enabled else "disabled",
             }
+        if self._prompt_cache_key_enabled and request.prompt_cache_key is not None:
+            payload["prompt_cache_key"] = request.prompt_cache_key
 
         started = time.perf_counter()
         first_delta_logged = False
         deltas: list[str] = []
+        reasoning: list[str] = []
         usage: dict[str, int | float] = {}
         finish_reason = "stop"
         tool_fragments: dict[int, dict[str, str]] = {}
         client = self._ensure_client()
-        try:
-            async with client.stream(
-                "POST",
-                self._endpoint,
-                headers={
-                    "Authorization": f"Bearer {credential}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            ) as response:
-                if response.is_error:
-                    await response.aread()
-                self._raise_for_status(response)
-                async for data in self._stream_data(response):
-                    provider_usage = data.get("usage")
-                    if isinstance(provider_usage, dict):
-                        usage = self._normalize_usage(provider_usage)
-                    choices = data.get("choices", [])
-                    if not isinstance(choices, list):
-                        continue
-                    for choice in choices:
-                        if not isinstance(choice, dict):
+        retried_empty_read = False
+        while True:
+            try:
+                async with client.stream(
+                    "POST",
+                    self._endpoint,
+                    headers={
+                        "Authorization": f"Bearer {credential}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                ) as response:
+                    if response.is_error:
+                        await response.aread()
+                    self._raise_for_status(response)
+                    async for data in self._stream_data(response):
+                        provider_usage = data.get("usage")
+                        if isinstance(provider_usage, dict):
+                            usage = self._normalize_usage(provider_usage)
+                        choices = data.get("choices", [])
+                        if not isinstance(choices, list):
                             continue
-                        reason = choice.get("finish_reason")
-                        if reason:
-                            finish_reason = str(reason)
-                        delta = choice.get("delta", {})
-                        if not isinstance(delta, dict):
-                            continue
-                        content = delta.get("content")
-                        if content is not None:
-                            text = str(content)
-                            deltas.append(text)
-                            if not first_delta_logged:
-                                first_delta_logged = True
-                                logger.info(
-                                    "provider_ttft_ms=%.2f provider=%s model=%s "
-                                    "model_call=%s",
-                                    (time.perf_counter() - started) * 1_000,
-                                    self.name,
-                                    model,
-                                    request.model_call_id,
-                                )
-                            yield ModelStreamChunk(kind="delta", delta=text)
-                        self._merge_tool_calls(tool_fragments, delta.get("tool_calls"))
-        except httpx.TimeoutException as exc:
-            raise ModelTimeoutError("model provider request timed out") from exc
-        except httpx.HTTPError as exc:
-            raise ModelProviderError("model provider request failed") from exc
+                        for choice in choices:
+                            if not isinstance(choice, dict):
+                                continue
+                            reason = choice.get("finish_reason")
+                            if reason:
+                                finish_reason = str(reason)
+                            delta = choice.get("delta", {})
+                            if not isinstance(delta, dict):
+                                continue
+                            thought = self._reasoning_text(delta)
+                            if thought:
+                                reasoning.append(thought)
+                            text = self._visible_text(delta)
+                            if text:
+                                deltas.append(text)
+                                if not first_delta_logged:
+                                    first_delta_logged = True
+                                    logger.info(
+                                        "provider_ttft_ms=%.2f provider=%s model=%s model_call=%s",
+                                        (time.perf_counter() - started) * 1_000,
+                                        self.name,
+                                        model,
+                                        request.model_call_id,
+                                    )
+                                yield ModelStreamChunk(kind="delta", delta=text)
+                            self._merge_tool_calls(tool_fragments, delta.get("tool_calls"))
+            except httpx.TimeoutException as exc:
+                raise ModelTimeoutError("model provider request timed out") from exc
+            except httpx.ReadError as exc:
+                if deltas or reasoning or tool_fragments:
+                    logger.warning(
+                        "model stream truncated after partial output provider=%s model=%s "
+                        "model_call=%s error=%s",
+                        self.name,
+                        model,
+                        request.model_call_id,
+                        type(exc).__name__,
+                    )
+                    if finish_reason == "stop":
+                        finish_reason = "length"
+                    break
+                if not retried_empty_read:
+                    retried_empty_read = True
+                    logger.warning(
+                        "model stream read error before output; retrying once provider=%s "
+                        "model=%s model_call=%s",
+                        self.name,
+                        model,
+                        request.model_call_id,
+                    )
+                    continue
+                raise ModelProviderError("model provider request failed") from exc
+            except httpx.HTTPError as exc:
+                raise ModelProviderError("model provider request failed") from exc
+            break
 
         duration_ms = (time.perf_counter() - started) * 1_000
         logger.info(
@@ -194,19 +249,16 @@ class OpenAICompatibleProvider:
             duration_ms,
             usage,
         )
+        output = "".join(deltas) or "".join(reasoning)
         yield ModelStreamChunk(
             kind="completed",
             response=ModelResponse(
                 model_call_id=request.model_call_id,
                 provider=self.name,
                 model=model,
-                completed_output="".join(deltas),
+                completed_output=output,
                 deltas=tuple(deltas),
-                tool_calls=self._tool_calls(
-                    request,
-                    tool_fragments,
-                    tool_name_aliases=tool_name_aliases,
-                ),
+                tool_calls=self._tool_calls(request, tool_fragments, tool_aliases),
                 finish_reason=finish_reason,
                 usage=usage,
             ),
@@ -227,9 +279,7 @@ class OpenAICompatibleProvider:
             raise ModelRateLimitError("model provider rate limit or quota was exhausted")
         if response.is_error:
             detail = OpenAICompatibleProvider._error_detail(response)
-            raise ModelProviderError(
-                f"model provider returned HTTP {response.status_code}{detail}"
-            )
+            raise ModelProviderError(f"model provider returned HTTP {response.status_code}{detail}")
 
     @staticmethod
     def _error_detail(response: httpx.Response) -> str:
@@ -274,19 +324,87 @@ class OpenAICompatibleProvider:
         normalized: dict[str, int | float] = {}
         aliases = {
             "prompt_tokens": "input_tokens",
+            "input_tokens": "input_tokens",
             "completion_tokens": "output_tokens",
+            "output_tokens": "output_tokens",
             "total_tokens": "total_tokens",
         }
         for key, target in aliases.items():
             value = usage.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 normalized[target] = value
+        prompt_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = usage.get("input_tokens_details")
+        if isinstance(prompt_details, dict):
+            detail_aliases = {
+                "cached_tokens": "cached_input_tokens",
+                "cache_write_tokens": "cache_write_input_tokens",
+            }
+            for key, target in detail_aliases.items():
+                value = prompt_details.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    normalized[target] = value
         return normalized
 
     @staticmethod
-    def _merge_tool_calls(
-        fragments: dict[int, dict[str, str]], raw_calls: Any
-    ) -> None:
+    def _tool_aliases(tools: tuple[dict[str, Any], ...]) -> dict[str, str]:
+        """Map internal dotted names to provider-compatible function names."""
+        aliases: dict[str, str] = {}
+        used: set[str] = set()
+        for tool in tools:
+            function = tool.get("function")
+            if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+                continue
+            name = function["name"]
+            alias = re.sub(r"[^a-zA-Z0-9_-]", "_", name).strip("_") or "tool"
+            alias = alias[:64]
+            if alias in used:
+                suffix = hashlib.sha256(name.encode()).hexdigest()[:8]
+                alias = f"{alias[:55]}_{suffix}"
+            aliases[name] = alias
+            used.add(alias)
+        return aliases
+
+    @staticmethod
+    def _provider_tools(tools: tuple[dict[str, Any], ...], aliases: dict[str, str]) -> list[dict[str, Any]]:
+        provider_tools = deepcopy(list(tools))
+        for tool in provider_tools:
+            function = tool.get("function")
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                function["name"] = aliases.get(function["name"], function["name"])
+        return provider_tools
+
+    @staticmethod
+    def _provider_messages(messages: tuple[dict[str, Any], ...], aliases: dict[str, str]) -> list[dict[str, Any]]:
+        provider_messages = deepcopy(list(messages))
+        for message in provider_messages:
+            calls = message.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                function = call.get("function") if isinstance(call, dict) else None
+                if isinstance(function, dict) and isinstance(function.get("name"), str):
+                    function["name"] = aliases.get(function["name"], function["name"])
+        return provider_messages
+
+    @staticmethod
+    def _visible_text(delta: dict[str, Any]) -> str:
+        content = delta.get("content")
+        if content is None:
+            return ""
+        return str(content)
+
+    @staticmethod
+    def _reasoning_text(delta: dict[str, Any]) -> str:
+        for key in ("reasoning_content", "reasoning"):
+            value = delta.get(key)
+            if value is not None and str(value):
+                return str(value)
+        return ""
+
+    @staticmethod
+    def _merge_tool_calls(fragments: dict[int, dict[str, str]], raw_calls: Any) -> None:
         if not isinstance(raw_calls, list):
             return
         for raw in raw_calls:
@@ -304,100 +422,16 @@ class OpenAICompatibleProvider:
                     target["arguments"] += str(function["arguments"])
 
     @staticmethod
-    def _model_tools(
-        tools: tuple[dict[str, Any], ...],
-    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-        """Return provider-safe tools and an alias-to-canonical name map."""
-        canonical_names: list[str] = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                raise ModelProviderError("model tool must be an object")
-            if tool.get("type") != "function":
-                continue
-            function = tool.get("function")
-            if not isinstance(function, dict):
-                raise ModelProviderError("model function tool must define function")
-            name = function.get("name")
-            if not isinstance(name, str) or not name:
-                raise ModelProviderError("model function tool name must be a non-empty string")
-            canonical_names.append(name)
-
-        aliases_by_name = {
-            name: name for name in canonical_names if _MODEL_TOOL_NAME_PATTERN.fullmatch(name)
-        }
-        aliases_in_use = set(aliases_by_name.values())
-        for name in dict.fromkeys(canonical_names):
-            if name in aliases_by_name:
-                continue
-            stem = _MODEL_TOOL_NAME_UNSAFE_PATTERN.sub("_", name).strip("_") or "tool"
-            candidate = stem[:64]
-            if candidate in aliases_in_use or len(stem) > 64:
-                digest = hashlib.sha256(name.encode()).hexdigest()[:_MODEL_TOOL_NAME_DIGEST_LENGTH]
-                stem_limit = 64 - _MODEL_TOOL_NAME_DIGEST_LENGTH - 1
-                candidate = f"{stem[:stem_limit]}_{digest}"
-            if candidate in aliases_in_use:
-                raise ModelProviderError("model tool name aliases collide")
-            aliases_by_name[name] = candidate
-            aliases_in_use.add(candidate)
-
-        prepared: list[dict[str, Any]] = []
-        aliases_to_names: dict[str, str] = {}
-        for tool in tools:
-            model_tool = copy.deepcopy(tool)
-            if model_tool.get("type") == "function":
-                function = model_tool["function"]
-                canonical_name = str(function["name"])
-                alias = aliases_by_name[canonical_name]
-                function["name"] = alias
-                aliases_to_names[alias] = canonical_name
-            prepared.append(model_tool)
-        return prepared, aliases_to_names
-
-    @staticmethod
-    def _model_messages(
-        messages: tuple[dict[str, Any], ...],
-        *,
-        tool_name_aliases: dict[str, str],
-    ) -> list[dict[str, Any]]:
-        """Keep provider-visible tool history consistent with declared aliases."""
-        names_to_aliases = {
-            canonical_name: alias
-            for alias, canonical_name in tool_name_aliases.items()
-        }
-        prepared = copy.deepcopy(list(messages))
-        for message in prepared:
-            calls = message.get("tool_calls")
-            if isinstance(calls, list):
-                for call in calls:
-                    if not isinstance(call, dict):
-                        continue
-                    function = call.get("function")
-                    if not isinstance(function, dict):
-                        continue
-                    name = function.get("name")
-                    if isinstance(name, str):
-                        function["name"] = names_to_aliases.get(name, name)
-            function_call = message.get("function_call")
-            if isinstance(function_call, dict):
-                name = function_call.get("name")
-                if isinstance(name, str):
-                    function_call["name"] = names_to_aliases.get(name, name)
-            name = message.get("name")
-            if isinstance(name, str):
-                message["name"] = names_to_aliases.get(name, name)
-        return prepared
-
-    @staticmethod
     def _tool_calls(
-        request: ModelRequest,
-        fragments: dict[int, dict[str, str]],
-        *,
-        tool_name_aliases: dict[str, str] | None = None,
+        request: ModelRequest, fragments: dict[int, dict[str, str]], aliases: dict[str, str]
     ) -> tuple[ToolCall, ...]:
-        aliases = tool_name_aliases or {}
         calls: list[ToolCall] = []
         for index, fragment in sorted(fragments.items()):
-            raw_arguments = fragment["arguments"] or "{}"
+            raw_arguments = fragment["arguments"]
+            if not raw_arguments.strip():
+                raise ModelProviderError(
+                    "model provider omitted tool arguments; expected a JSON object"
+                )
             try:
                 arguments = json.loads(raw_arguments)
             except json.JSONDecodeError as exc:
@@ -407,7 +441,9 @@ class OpenAICompatibleProvider:
             calls.append(
                 ToolCall(
                     tool_invocation_id=fragment["id"] or f"tool_{request.run_id}_{index}",
-                    name=aliases.get(fragment["name"], fragment["name"]),
+                    name={alias: original for original, alias in aliases.items()}.get(
+                        fragment["name"], fragment["name"]
+                    ),
                     arguments=arguments,
                 )
             )

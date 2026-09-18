@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -18,17 +20,19 @@ class CapabilityKind(StrEnum):
     SKILL = "skill"
 
 
-class CapabilityTrustLevel(StrEnum):
-    PLATFORM = "platform"
-    TENANT_VERIFIED = "tenant_verified"
-    EXTERNAL_UNTRUSTED = "external_untrusted"
-
-
 class CapabilityStatus(StrEnum):
     ACTIVE = "active"
     DEGRADED = "degraded"
     QUARANTINED = "quarantined"
     RETIRED = "retired"
+
+
+class RequiredCapabilityRef(ContractModel):
+    """Immutable capability identity supplied by Agent/Role/Assignment admission."""
+
+    capability_id: str = Field(min_length=1, max_length=256)
+    version: str | None = Field(default=None, min_length=1, max_length=128)
+    content_digest: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class McpAuthStrategy(StrEnum):
@@ -62,8 +66,6 @@ class McpServerDefinition(ContractModel):
     credential_ref: str | None = None
     oauth: McpOAuthConfiguration | None = None
     auth_strategy: McpAuthStrategy | None = None
-    trust_level: CapabilityTrustLevel = CapabilityTrustLevel.EXTERNAL_UNTRUSTED
-    allowed_tool_prefixes: tuple[str, ...] = ()
     allowed_resource_schemes: tuple[str, ...] = ()
     allowed_prompt_prefixes: tuple[str, ...] = ()
     allowed_private_hosts: tuple[str, ...] = ()
@@ -184,7 +186,6 @@ class JavaApiServerDefinition(ContractModel):
     title: str = Field(min_length=1, max_length=256)
     base_url: str = Field(min_length=1, pattern=r"^https://")
     credential_ref: str | None = None
-    trust_level: CapabilityTrustLevel = CapabilityTrustLevel.TENANT_VERIFIED
     operations: tuple[JavaApiOperationDefinition, ...] = ()
     allowed_private_hosts: tuple[str, ...] = ()
     status: CapabilityStatus = CapabilityStatus.QUARANTINED
@@ -213,7 +214,6 @@ class CapabilityDescriptor(ContractModel):
     description: str = ""
     tags: tuple[str, ...] = ()
     tenant_id: str | None = None
-    trust_level: CapabilityTrustLevel = CapabilityTrustLevel.EXTERNAL_UNTRUSTED
     classification: str = "internal"
     permission: str | None = None
     risk_level: str | None = None
@@ -224,7 +224,7 @@ class CapabilityDescriptor(ContractModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def as_search_result(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "capability_id": self.capability_id,
             "kind": self.kind.value,
             "canonical_name": self.canonical_name,
@@ -233,7 +233,6 @@ class CapabilityDescriptor(ContractModel):
             "title": self.title,
             "description": self.description,
             "tags": list(self.tags),
-            "trust_level": self.trust_level.value,
             "classification": self.classification,
             "permission": self.permission,
             "risk_level": self.risk_level,
@@ -241,6 +240,13 @@ class CapabilityDescriptor(ContractModel):
             "server_id": self.server_id,
             "source_revision": self.source_revision,
         }
+        generation = self.metadata.get("catalog_generation")
+        if isinstance(generation, int):
+            result["catalog_generation"] = generation
+        source_type = self.metadata.get("source_type")
+        if isinstance(source_type, str):
+            result["source"] = source_type
+        return result
 
 
 def _validate_mcp_endpoint(
@@ -266,3 +272,29 @@ def _validate_mcp_endpoint(
         raise ValueError("HTTP MCP endpoints require an allowlisted private host")
     if parsed.scheme == "http" and network_mode is McpNetworkMode.PUBLIC:
         raise ValueError("public MCP endpoints require HTTPS")
+
+
+class CapabilityInvocationRef(ContractModel):
+    """Immutable execution target; its alias crosses existing ToolCall/Hands DTOs."""
+
+    capability_id: str
+    server_id: str
+    version: str
+    content_digest: str
+    tenant_id: str | None = None
+    config_revision: int = 0
+
+    @property
+    def model_name(self) -> str:
+        encoded = json.dumps(self.model_dump(mode="json"), sort_keys=True,
+                             separators=(",", ":")).encode()
+        return "mcp_" + hashlib.sha256(encoded).hexdigest()[:48]
+
+    @classmethod
+    def from_descriptor(cls, descriptor: CapabilityDescriptor) -> CapabilityInvocationRef:
+        return cls(
+            capability_id=descriptor.capability_id, server_id=descriptor.server_id,
+            version=descriptor.version, content_digest=descriptor.content_digest,
+            tenant_id=descriptor.tenant_id,
+            config_revision=int(descriptor.metadata.get("config_revision", 0)),
+        )

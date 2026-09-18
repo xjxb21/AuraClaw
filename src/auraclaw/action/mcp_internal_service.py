@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
 
 from auraclaw.action.mcp_registry import McpServerRegistryService
+from auraclaw.contracts.errors import InvalidTransitionError
 from auraclaw.contracts.internal import (
+    McpCapabilityTestRequest,
+    McpCapabilityTestResponse,
     McpRegistryAdminRequest,
     McpRegistryAdminResponse,
     McpRegistrySnapshotRequest,
@@ -17,9 +20,35 @@ from auraclaw.contracts.mcp_registry import (
 )
 
 
+class McpCapabilityTester(Protocol):
+    async def test_capability(self, **kwargs: Any) -> dict[str, Any]: ...
+
+
 class McpRegistryInternalService:
-    def __init__(self, registry: McpServerRegistryService) -> None:
+    def __init__(
+        self,
+        registry: McpServerRegistryService,
+        *,
+        capability_tester: McpCapabilityTester | None = None,
+    ) -> None:
         self._registry = registry
+        self._capability_tester = capability_tester
+
+    async def test_capability(
+        self, request: McpCapabilityTestRequest
+    ) -> McpCapabilityTestResponse:
+        if self._capability_tester is None:
+            raise InvalidTransitionError("MCP capability testing is unavailable")
+        result = await self._capability_tester.test_capability(
+            tenant_id=request.context.tenant_id,
+            actor_id=request.actor_id,
+            dept_id=request.dept_id,
+            server_id=request.server_id,
+            capability_id=request.capability_id,
+            input_payload=dict(request.input),
+            expected_output=request.expected_output,
+        )
+        return McpCapabilityTestResponse.model_validate(result)
 
     async def command(
         self, request: McpRegistryAdminRequest
@@ -54,6 +83,7 @@ class McpRegistryInternalService:
                 causation_id=request.context.causation_id,
                 expected_revision=request.expected_revision,
                 target_revision=request.target_revision,
+                force_schema_update=request.force_schema_update,
             )
             handler = {
                 McpRegistryOperationKind.TEST: self._registry.test,
@@ -61,6 +91,7 @@ class McpRegistryInternalService:
                 McpRegistryOperationKind.DISABLE: self._registry.disable,
                 McpRegistryOperationKind.RECONCILE: self._registry.reconcile,
                 McpRegistryOperationKind.RETIRE: self._registry.retire,
+                McpRegistryOperationKind.DELETE: self._registry.delete,
             }[kind]
             record = await handler(request.server_id, lifecycle)
         return McpRegistryAdminResponse(

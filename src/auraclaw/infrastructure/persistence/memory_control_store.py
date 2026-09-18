@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from auraclaw.contracts.errors import FencingTokenError, LeaseConflictError
 from auraclaw.control.ports import (
+    AGENT_RUNTIME_POOL,
     ClaimedAssignment,
     ClaimedRunnable,
     RunnableItem,
@@ -31,6 +32,7 @@ class InMemoryControlStateStore:
     def __init__(self) -> None:
         self._queue: dict[str, tuple[RunnableItem, str, str | None]] = {}
         self._queue_claims: dict[str, tuple[str, datetime]] = {}
+        self._queue_available_at: dict[str, datetime] = {}
         self._leases: dict[str, RuntimeLease] = {}
         self._lease_counters: dict[str, int] = {}
         self._assignments: dict[str, tuple[RuntimeAssignment, str]] = {}
@@ -43,6 +45,8 @@ class InMemoryControlStateStore:
         # Match PostgresControlStateStore reclaim windows.
         self.orphan_running_grace = timedelta(seconds=5)
         self.stale_heartbeat_after = timedelta(seconds=30)
+        self.execution_claim_ttl = timedelta(seconds=30)
+        self.assignment_lease_ttl = timedelta(seconds=30)
 
     async def enqueue(self, item: RunnableItem) -> bool:
         async with self._lock:
@@ -65,6 +69,7 @@ class InMemoryControlStateStore:
                 item
                 for item, status, _ in self._queue.values()
                 if status == "queued"
+                and self._queue_available_at.get(item.task_id, now) <= now
                 or (
                     status == "claimed"
                     and self._queue_claims.get(
@@ -96,6 +101,7 @@ class InMemoryControlStateStore:
         *,
         worker_id: str | None = None,
         claim_token: str | None = None,
+        delay: timedelta = timedelta(0),
     ) -> None:
         async with self._lock:
             queued = self._queue.get(task_id)
@@ -110,6 +116,7 @@ class InMemoryControlStateStore:
                     ):
                         return
                 self._queue[task_id] = (queued[0], "queued", None)
+                self._queue_available_at[task_id] = _now() + delay
                 self._queue_claims.pop(task_id, None)
             assignment = self._assignments.get(task_id)
             if assignment is not None:
@@ -190,7 +197,14 @@ class InMemoryControlStateStore:
             ):
                 return False
             current = self._assignments.get(task_id)
-            if current is not None and current[1] not in {"expired", "completed", "failed"}:
+            if current is not None and current[1] not in {
+                "expired",
+                "completed",
+                "failed",
+                "waiting_children",
+                "waiting_for_human",
+                "waiting_for_tool",
+            }:
                 return False
             self._assignments[task_id] = (assignment, "assigned")
             if task_id in self._queue:
@@ -208,7 +222,13 @@ class InMemoryControlStateStore:
         async with self._lock:
             candidates: list[tuple[int, RuntimeInstance]] = []
             for runtime, heartbeat_at in self._runtimes.values():
-                if runtime.role != item.role or heartbeat_at <= _now() - timedelta(seconds=30):
+                if (
+                    runtime.role not in {AGENT_RUNTIME_POOL, item.role}
+                    or heartbeat_at <= _now() - timedelta(seconds=30)
+                ):
+                    continue
+                if (item.budget.policy_version == "2"
+                        and runtime.capabilities.get("runtime_governance_v2") is not True):
                     continue
                 if any(
                     runtime.capabilities.get(key) != value
@@ -226,25 +246,49 @@ class InMemoryControlStateStore:
             return min(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
 
     async def claim_assignments(
-        self, runtime_id: str, role: str, *, limit: int = 1
+        self,
+        runtime_id: str,
+        role: str,
+        *,
+        registration_id: str = "legacy",
+        limit: int = 1,
     ) -> list[ClaimedAssignment]:
         async with self._lock:
+            runtime_entry = self._runtimes.get(runtime_id)
+            if (
+                runtime_entry is None
+                or runtime_entry[0].role != role
+                or runtime_entry[0].registration_id != registration_id
+            ):
+                return []
             now = _now()
             claimed: list[ClaimedAssignment] = []
             for task_id, (assignment, status) in self._assignments.items():
-                if assignment.runtime_id != runtime_id or assignment.role != role:
+                if assignment.runtime_id != runtime_id:
                     continue
-                if status == "assigned":
-                    pass
-                elif status == "running":
-                    started_at = self._assignment_started_at.get(task_id)
-                    if (
-                        started_at is None
-                        or started_at > now - self.orphan_running_grace
-                    ):
-                        continue
-                else:
+                if status != "assigned":
                     continue
+                if (assignment.budget.policy_version == "2"
+                        and runtime_entry[0].capabilities.get("runtime_governance_v2") is not True):
+                    continue
+                resource_id = f"session:{assignment.tenant_id}:{assignment.session_id}"
+                lease = self._leases.get(resource_id)
+                if (
+                    lease is None
+                    or lease.expires_at <= now
+                    or lease.fencing_token != assignment.fencing_token
+                ):
+                    continue
+                assignment.execution_claim_token = uuid4().hex
+                assignment.execution_claim_expires_at = now + self.execution_claim_ttl
+                renewed_lease = replace(
+                    lease,
+                    expires_at=min(
+                        lease.expires_at, now + self.assignment_lease_ttl
+                    ),
+                )
+                self._leases[resource_id] = renewed_lease
+                assignment.lease_expires_at = renewed_lease.expires_at
                 self._assignments[task_id] = (assignment, "running")
                 self._assignment_started_at.setdefault(task_id, now)
                 claimed.append(
@@ -254,13 +298,107 @@ class InMemoryControlStateStore:
                     break
             return claimed
 
+    async def renew_assignment_claim(
+        self,
+        task_id: str,
+        *,
+        runtime_id: str,
+        registration_id: str,
+        execution_claim_token: str,
+        lease_id: str,
+        fencing_token: int,
+    ) -> RuntimeAssignment:
+        async with self._lock:
+            now = _now()
+            entry = self._assignments.get(task_id)
+            runtime = self._runtimes.get(runtime_id)
+            if entry is None or runtime is None:
+                raise LeaseConflictError("execution claim is unavailable")
+            assignment, status = entry
+            resource_id = f"session:{assignment.tenant_id}:{assignment.session_id}"
+            lease = self._leases.get(resource_id)
+            if (
+                status != "running"
+                or runtime[0].registration_id != registration_id
+                or assignment.runtime_id != runtime_id
+                or assignment.execution_claim_token != execution_claim_token
+                or assignment.execution_claim_expires_at is None
+                or assignment.execution_claim_expires_at <= now
+                or assignment.lease_id != lease_id
+                or assignment.fencing_token != fencing_token
+                or lease is None
+                or lease.lease_id != lease_id
+                or lease.fencing_token != fencing_token
+                or lease.expires_at <= now
+            ):
+                raise LeaseConflictError("execution claim is no longer owned")
+            expires_at = now + self.assignment_lease_ttl
+            self._leases[resource_id] = replace(lease, expires_at=expires_at)
+            assignment.lease_expires_at = expires_at
+            assignment.execution_claim_expires_at = now + self.execution_claim_ttl
+            self._assignments[task_id] = (assignment, status)
+            self._runtimes[runtime_id] = (runtime[0], now)
+            return assignment
+
+    async def abandon_stale_assignment(
+        self,
+        task_id: str,
+        *,
+        runtime_id: str,
+        lease_id: str,
+        fencing_token: int,
+    ) -> bool:
+        async with self._lock:
+            entry = self._assignments.get(task_id)
+            queued = self._queue.get(task_id)
+            if entry is None:
+                return False
+            assignment, status = entry
+            if (
+                assignment.runtime_id != runtime_id
+                or assignment.lease_id != lease_id
+                or assignment.fencing_token != fencing_token
+            ):
+                return False
+            if status in {
+                "expired",
+                "completed",
+                "failed",
+                "cancelled",
+                "waiting_children",
+                "waiting_for_human",
+                "waiting_for_tool",
+            }:
+                return True
+            resource_id = f"session:{assignment.tenant_id}:{assignment.session_id}"
+            lease = self._leases.get(resource_id)
+            if (
+                lease is not None
+                and lease.expires_at > _now()
+                and lease.fencing_token == fencing_token
+            ):
+                return False
+            self._assignments[task_id] = (assignment, "expired")
+            self._assignment_started_at.pop(task_id, None)
+            if queued is not None:
+                self._queue[task_id] = (queued[0], "queued", None)
+                self._queue_claims.pop(task_id, None)
+            return True
+
     async def finish_assignment(self, task_id: str, outcome: str) -> None:
         async with self._lock:
             entry = self._assignments.get(task_id)
             if entry is not None:
                 assignment = entry[0]
                 self._assignments[task_id] = (assignment, outcome)
-                if outcome in {"completed", "failed", "cancelled"}:
+                if outcome in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "waiting_children",
+                    "waiting_for_human",
+                    "waiting_for_tool",
+                }:
                     self._assignment_started_at.pop(task_id, None)
                     resource_id = f"session:{assignment.tenant_id}:{assignment.session_id}"
                     lease = self._leases.get(resource_id)
@@ -270,15 +408,95 @@ class InMemoryControlStateStore:
             if queued is not None:
                 self._queue[task_id] = (queued[0], "acked", queued[2])
 
+    async def suspend_assignment(self, task_id: str, reason: str) -> None:
+        if reason not in {"waiting_children", "waiting_for_human", "waiting_for_tool"}:
+            raise ValueError(f"unsupported assignment suspension: {reason}")
+        await self.finish_assignment(task_id, reason)
+
+    async def suspend_with_checkpoint(
+        self,
+        task_id: str,
+        checkpoint: RuntimeCheckpoint,
+        reason: str,
+    ) -> None:
+        if reason not in {"waiting_children", "waiting_for_human", "waiting_for_tool"}:
+            raise ValueError(f"unsupported assignment suspension: {reason}")
+        async with self._lock:
+            entry = self._assignments.get(task_id)
+            resource_id = f"session:{checkpoint.tenant_id}:{checkpoint.session_id}"
+            lease = self._leases.get(resource_id)
+            if (
+                entry is None
+                or entry[0].run_id != checkpoint.run_id
+                or lease is None
+                or lease.expires_at <= _now()
+                or lease.fencing_token != checkpoint.fencing_token
+            ):
+                raise FencingTokenError("checkpoint suspension rejected for stale Runtime")
+            key = (checkpoint.tenant_id, checkpoint.session_id, checkpoint.run_id)
+            previous = self._checkpoints.get(key)
+            if previous is not None and previous.fencing_token > checkpoint.fencing_token:
+                raise FencingTokenError("checkpoint suspension rejected for stale Runtime")
+            self._checkpoints[key] = checkpoint
+            assignment = entry[0]
+            self._assignments[task_id] = (assignment, reason)
+            self._assignment_started_at.pop(task_id, None)
+            del self._leases[resource_id]
+            queued = self._queue.get(task_id)
+            if queued is not None:
+                self._queue[task_id] = (queued[0], "acked", queued[2])
+
+    async def wake_assignment(self, task_id: str) -> bool:
+        async with self._lock:
+            entry = self._assignments.get(task_id)
+            queued = self._queue.get(task_id)
+            if (
+                entry is None
+                or entry[1] not in {"waiting_children", "waiting_for_human", "waiting_for_tool"}
+                or queued is None or queued[1] != "acked"
+            ):
+                return False
+            self._queue[task_id] = (queued[0], "queued", None)
+            self._queue_claims.pop(task_id, None)
+            return True
+
+    async def list_waiting_assignments(
+        self, *, limit: int = 100, status: str = "waiting_children"
+    ) -> tuple[RuntimeAssignment, ...]:
+        async with self._lock:
+            return tuple(
+                assignment
+                for task_id, (assignment, current_status) in self._assignments.items()
+                if current_status == status
+                and self._queue.get(task_id, (None, "", None))[1] == "acked"
+            )[: max(0, limit)]
+
     async def register_runtime(self, instance: RuntimeInstance) -> None:
         async with self._lock:
+            current = self._runtimes.get(instance.runtime_id)
+            if (
+                current is not None
+                and current[0].registration_id != instance.registration_id
+                and current[1] > _now() - self.stale_heartbeat_after
+            ):
+                raise LeaseConflictError(
+                    f"runtime id is already registered: {instance.runtime_id}"
+                )
             self._runtimes[instance.runtime_id] = (instance, _now())
 
-    async def heartbeat(self, runtime_id: str, fencing_token: int | None = None) -> None:
+    async def heartbeat(
+        self,
+        runtime_id: str,
+        fencing_token: int | None = None,
+        *,
+        registration_id: str = "legacy",
+    ) -> None:
         async with self._lock:
             entry = self._runtimes.get(runtime_id)
             if entry is None:
                 raise LeaseConflictError(f"unknown runtime: {runtime_id}")
+            if entry[0].registration_id != registration_id:
+                raise LeaseConflictError(f"runtime registration is stale: {runtime_id}")
             if fencing_token is not None:
                 assignment = next(
                     (
@@ -345,6 +563,13 @@ class InMemoryControlStateStore:
                 if status not in {"assigned", "running"}:
                     continue
                 resource_id = f"session:{assignment.tenant_id}:{assignment.session_id}"
+                if (
+                    status == "running"
+                    and assignment.execution_claim_expires_at is not None
+                    and assignment.execution_claim_expires_at <= now
+                ):
+                    expired_resources.add(resource_id)
+                    continue
                 runtime_entry = self._runtimes.get(assignment.runtime_id)
                 if runtime_entry is None:
                     expired_resources.add(resource_id)

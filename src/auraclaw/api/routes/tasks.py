@@ -12,6 +12,7 @@ from auraclaw.api.dependencies import (
     request_identity,
 )
 from auraclaw.api.models import (
+    ActivityPageResponse,
     AppendMessageRequest,
     ApprovalCommandResponse,
     ApprovalResponseRequest,
@@ -19,6 +20,7 @@ from auraclaw.api.models import (
     CloseSessionRequest,
     CommandResponse,
     CreateTaskRequest,
+    RequestRunRequest,
     SyncCreateTaskRequest,
     TaskAcceptedResponse,
     TaskListResponse,
@@ -34,9 +36,7 @@ Identity = Annotated[RequestIdentity, Depends(request_identity)]
 TaskCommandDependency = Annotated[TaskCommandGateway, Depends(get_task_command_gateway)]
 TaskQueryDependency = Annotated[TaskQueryService, Depends(get_task_query_service)]
 TaskWaiterDependency = Annotated[TaskResultWaiter, Depends(get_task_result_waiter)]
-SyncInvocationDependency = Annotated[
-    SyncInvocationGateway, Depends(get_sync_invocation_gateway)
-]
+SyncInvocationDependency = Annotated[SyncInvocationGateway, Depends(get_sync_invocation_gateway)]
 
 
 def _apply_wait_outcome(
@@ -51,6 +51,16 @@ def _apply_wait_outcome(
     else:
         response.status_code = status.HTTP_200_OK
     return body
+
+
+@router.get("/approval-modes")
+async def approval_modes(identity: Identity) -> dict[str, Any]:
+    del identity
+    return {
+        "version": 1,
+        "modes": ["request_approval", "auto_review", "full_access"],
+        "defaults": {"streaming": "request_approval", "non_streaming": "full_access"},
+    }
 
 
 @router.post("/tasks", response_model=TaskAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -69,9 +79,12 @@ async def create_task(
     return await service.create_task(
         goal=request.goal,
         context=context,
+        read_refresh=[grant.model_dump() for grant in request.read_refresh],
         source=request.source,
         schedule_id=request.schedule_id,
         occurrence_id=request.occurrence_id,
+        interaction_mode=request.interaction_mode,
+        approval_mode=request.approval_mode,
     )
 
 
@@ -93,6 +106,7 @@ async def sync_invoke_task(
         goal=request.goal,
         context=context,
         timeout_seconds=request.timeout_seconds,
+        approval_mode=request.approval_mode,
     )
     return _apply_wait_outcome(response, waited, str(accepted["session_id"]))
 
@@ -190,6 +204,26 @@ async def get_transcript(
     return await query.get_transcript(tenant_id=identity.tenant_id, session_id=session_id)
 
 
+@router.get("/tasks/{session_id}/activity", response_model=ActivityPageResponse)
+async def get_activity(
+    session_id: str,
+    response: Response,
+    identity: Identity,
+    query: TaskQueryDependency,
+    after_version: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=200),
+) -> dict[str, Any]:
+    activity = await query.get_activity(
+        tenant_id=identity.tenant_id,
+        session_id=session_id,
+        after_version=after_version,
+        limit=limit,
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Activity-Version"] = str(activity["source_version"])
+    return activity
+
+
 @router.post(
     "/sessions/{session_id}/messages",
     response_model=CommandResponse,
@@ -225,6 +259,7 @@ async def request_run(
     service: TaskCommandDependency,
     idempotency_key: str = Header(alias="Idempotency-Key", min_length=1),
     expected_version: int = Header(alias="X-Expected-Version"),
+    request: RequestRunRequest | None = None,
 ) -> dict[str, Any]:
     context = command_context(
         identity=identity,
@@ -232,7 +267,12 @@ async def request_run(
         expected_version=expected_version,
         operation="request_run",
     )
-    return await service.request_run(session_id=session_id, context=context)
+    return await service.request_run(
+        session_id=session_id,
+        context=context,
+        approval_mode=request.approval_mode if request else None,
+        read_refresh=[grant.model_dump() for grant in request.read_refresh] if request else [],
+    )
 
 
 @router.post(

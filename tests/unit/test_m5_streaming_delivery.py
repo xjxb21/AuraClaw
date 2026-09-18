@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import hmac
 import json
-from datetime import timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from time import perf_counter
 
 import httpx
 import pytest
@@ -10,7 +12,7 @@ import pytest
 from auraclaw.contracts.commands import CommandContext
 from auraclaw.contracts.delivery import DeliveryJob, ResultSinkConfig, SinkResponse
 from auraclaw.contracts.errors import NotFoundError
-from auraclaw.contracts.events import Actor, NewEvent
+from auraclaw.contracts.events import Actor, CanonicalEvent, NewEvent
 from auraclaw.contracts.state import Visibility
 from auraclaw.delivery.worker import CircuitBreaker, ResultDeliveryWorker
 from auraclaw.gateways.streaming.gateway import StreamingGateway
@@ -29,6 +31,7 @@ from auraclaw.infrastructure.kafka.runtime_events import (
 from auraclaw.infrastructure.persistence.memory_event_store import InMemoryEventStore
 from auraclaw.projection.relay import OutboxRelay
 from auraclaw.projection.task.projector import InMemoryTaskProjection
+from auraclaw.runtime.ports import RuntimeEvent
 from auraclaw.session.task_service import TaskService
 
 
@@ -42,6 +45,155 @@ class RecordingSink:
     async def deliver(self, job: DeliveryJob, config: ResultSinkConfig) -> SinkResponse:
         self.calls.append(job.delivery_id)
         return self.responses.pop(0)
+
+
+class _SlowRecordingSink(RecordingSink):
+    def __init__(self, delay: float) -> None:
+        super().__init__([SinkResponse(True, summary="slow success")])
+        self.delay = delay
+        self.started = asyncio.Event()
+
+    async def deliver(self, job: DeliveryJob, config: ResultSinkConfig) -> SinkResponse:
+        self.started.set()
+        await asyncio.sleep(self.delay)
+        return await super().deliver(job, config)
+
+
+class _LeaseLosingStore(InMemoryDeliveryJobStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.renewals = 0
+
+    async def renew_claim(
+        self, job: DeliveryJob, *, claim_ttl: timedelta
+    ) -> bool:
+        self.renewals += 1
+        if self.renewals > 1:
+            return False
+        return await super().renew_claim(job, claim_ttl=claim_ttl)
+
+
+def _delivery_event(suffix: str) -> CanonicalEvent:
+    return CanonicalEvent(
+        event_id=f"event-{suffix}",
+        tenant_id="tenant-lease",
+        root_session_id=f"session-{suffix}",
+        session_id=f"session-{suffix}",
+        run_id=f"run-{suffix}",
+        aggregate_version=1,
+        type="run.completed",
+        occurred_at=datetime.now(UTC),
+        actor=Actor(type="runtime", id="runtime"),
+        correlation_id=suffix,
+        causation_id=suffix,
+        visibility=Visibility.USER,
+        schema_version=1,
+        payload={"result_summary": "done"},
+    )
+
+
+def test_delivery_worker_renews_slow_claim_and_blocks_takeover() -> None:
+    async def scenario() -> None:
+        event_store = InMemoryEventStore()
+        projection = InMemoryTaskProjection()
+        relay = OutboxRelay(event_store, projection)
+        store = InMemoryDeliveryJobStore()
+        sink = ResultSinkConfig(
+            sink_id="slow-sink",
+            tenant_id="tenant-lease",
+            session_id="session-slow",
+            sink_type="recording",
+            target_ref="managed://slow",
+        )
+        await store.register_sink(sink)
+        await store.create_job(_delivery_event("slow"), sink)
+        adapter = _SlowRecordingSink(0.09)
+        worker = ResultDeliveryWorker(
+            outbox=event_store,
+            event_store=event_store,
+            relay=relay,
+            store=store,
+            adapters=[adapter],
+            worker_id="worker-a",
+            claim_ttl=timedelta(seconds=0.03),
+        )
+        running = asyncio.create_task(worker.run_once())
+        await adapter.started.wait()
+        await asyncio.sleep(0.05)
+        assert await store.claim_due(
+            worker_id="worker-b",
+            claim_ttl=timedelta(seconds=0.03),
+            limit=1,
+        ) == []
+        assert await running == 1
+        job = (await store.list_jobs("tenant-lease", "session-slow"))[0]
+        assert job.status.value == "succeeded"
+
+    asyncio.run(scenario())
+
+
+def test_delivery_worker_reconciles_when_lease_is_lost_after_side_effect() -> None:
+    async def scenario() -> None:
+        event_store = InMemoryEventStore()
+        relay = OutboxRelay(event_store, InMemoryTaskProjection())
+        store = _LeaseLosingStore()
+        sink = ResultSinkConfig(
+            sink_id="uncertain-sink",
+            tenant_id="tenant-lease",
+            session_id="session-uncertain",
+            sink_type="recording",
+            target_ref="managed://uncertain",
+        )
+        await store.register_sink(sink)
+        await store.create_job(_delivery_event("uncertain"), sink)
+        worker = ResultDeliveryWorker(
+            outbox=event_store,
+            event_store=event_store,
+            relay=relay,
+            store=store,
+            adapters=[_SlowRecordingSink(0.1)],
+            claim_ttl=timedelta(seconds=0.03),
+        )
+        assert await worker.run_once() == 1
+        job = (await store.list_jobs("tenant-lease", "session-uncertain"))[0]
+        assert job.status.value == "reconciling"
+        assert job.reconciliation_reason == "lease_lost"
+        assert await store.claim_due(
+            worker_id="worker-b",
+            claim_ttl=timedelta(seconds=0.03),
+            limit=1,
+        ) == []
+
+    asyncio.run(scenario())
+
+
+def test_delivery_claim_reserves_capacity_across_tenants() -> None:
+    async def scenario() -> None:
+        store = InMemoryDeliveryJobStore()
+        for suffix, tenant in (
+            ("a-1", "tenant-a"),
+            ("a-2", "tenant-a"),
+            ("b", "tenant-b"),
+        ):
+            event = replace(_delivery_event(suffix), tenant_id=tenant)
+            sink = ResultSinkConfig(
+                sink_id=f"sink-{suffix}",
+                tenant_id=tenant,
+                session_id=event.session_id,
+                sink_type="recording",
+                target_ref=f"managed://{suffix}",
+            )
+            await store.register_sink(sink)
+            await store.create_job(event, sink)
+        claimed = await store.claim_due(
+            worker_id="fair-worker",
+            claim_ttl=timedelta(seconds=30),
+            limit=2,
+            max_per_tenant=1,
+        )
+        assert {job.tenant_id for job in claimed} == {"tenant-a", "tenant-b"}
+
+    asyncio.run(scenario())
 
 
 def test_runtime_producer_sequences_coalesces_redacts_and_limits_events() -> None:
@@ -101,6 +253,263 @@ def test_runtime_producer_sequences_coalesces_redacts_and_limits_events() -> Non
                 payload={"value": "x" * 2_000},
                 visibility="user",
             )
+
+    asyncio.run(scenario())
+
+
+def test_runtime_event_slow_session_does_not_block_another_session() -> None:
+    class SessionPublisher:
+        def __init__(self) -> None:
+            self.slow_started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.events: list[RuntimeEvent] = []
+
+        async def publish(self, event: RuntimeEvent) -> None:
+            if event.session_id == "session-slow":
+                self.slow_started.set()
+                await self.release.wait()
+            self.events.append(event)
+
+    async def scenario() -> None:
+        target = SessionPublisher()
+        producer = RuntimeEventProducerSDK(target, max_concurrent=2)
+        slow = asyncio.create_task(
+            producer.publish(
+                tenant_id="tenant-m5",
+                root_session_id="session-slow",
+                session_id="session-slow",
+                run_id="run-slow",
+                event_type="runtime.progress",
+                payload={"step": "slow"},
+            )
+        )
+        await asyncio.wait_for(target.slow_started.wait(), timeout=1)
+        fast = await asyncio.wait_for(
+            producer.publish(
+                tenant_id="tenant-m5",
+                root_session_id="session-fast",
+                session_id="session-fast",
+                run_id="run-fast",
+                event_type="runtime.progress",
+                payload={"step": "fast"},
+            ),
+            timeout=1,
+        )
+        assert fast is not None and fast.session_id == "session-fast"
+        target.release.set()
+        assert (await slow) is not None
+
+    asyncio.run(scenario())
+
+
+def test_runtime_event_same_session_preserves_send_order() -> None:
+    class OrderedPublisher:
+        def __init__(self) -> None:
+            self.first_started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.sequences: list[int] = []
+
+        async def publish(self, event: RuntimeEvent) -> None:
+            if not self.sequences:
+                self.first_started.set()
+                await self.release.wait()
+            self.sequences.append(event.sequence)
+
+    async def scenario() -> None:
+        target = OrderedPublisher()
+        producer = RuntimeEventProducerSDK(target, max_concurrent=2)
+        common = {
+            "tenant_id": "tenant-m5",
+            "root_session_id": "session-ordered",
+            "session_id": "session-ordered",
+            "run_id": "run-ordered",
+            "event_type": "runtime.progress",
+            "visibility": "user",
+        }
+        first = asyncio.create_task(producer.publish(**common, payload={"step": 1}))
+        await asyncio.wait_for(target.first_started.wait(), timeout=1)
+        second = asyncio.create_task(producer.publish(**common, payload={"step": 2}))
+        await asyncio.sleep(0.02)
+        assert not second.done()
+        target.release.set()
+        results = await asyncio.gather(first, second)
+        assert [result.sequence for result in results if result is not None] == [1, 2]
+        assert target.sequences == [1, 2]
+
+    asyncio.run(scenario())
+
+
+def test_runtime_event_timeout_releases_keyed_state() -> None:
+    class TimeoutOncePublisher:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def publish(self, event: RuntimeEvent) -> None:
+            del event
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(60)
+
+    async def scenario() -> None:
+        target = TimeoutOncePublisher()
+        producer = RuntimeEventProducerSDK(
+            target,
+            publish_timeout_seconds=0.05,
+            queue_timeout_seconds=0.2,
+        )
+        common = {
+            "tenant_id": "tenant-m5",
+            "root_session_id": "session-timeout",
+            "session_id": "session-timeout",
+            "run_id": "run-timeout",
+            "event_type": "runtime.progress",
+            "visibility": "user",
+        }
+        with pytest.raises(RuntimeEventRejectedError, match="publish timed out"):
+            await producer.publish(**common, payload={"step": 1})
+        recovered = await producer.publish(**common, payload={"step": 2})
+        assert recovered is not None and recovered.sequence == 2
+        assert producer._locks._entries == {}  # type: ignore[attr-defined]
+
+    asyncio.run(scenario())
+
+
+def test_runtime_event_same_session_queue_wait_is_bounded() -> None:
+    class BlockingPublisher:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def publish(self, event: RuntimeEvent) -> None:
+            del event
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+
+    async def scenario() -> None:
+        target = BlockingPublisher()
+        producer = RuntimeEventProducerSDK(
+            target,
+            max_concurrent=2,
+            max_queued=2,
+            queue_timeout_seconds=0.05,
+            publish_timeout_seconds=2,
+        )
+        common = {
+            "tenant_id": "tenant-m5",
+            "root_session_id": "session-queue-timeout",
+            "session_id": "session-queue-timeout",
+            "run_id": "run-queue-timeout",
+            "event_type": "runtime.progress",
+            "visibility": "user",
+        }
+        owner = asyncio.create_task(producer.publish(**common, payload={"step": 1}))
+        await asyncio.wait_for(target.started.wait(), timeout=1)
+        with pytest.raises(RuntimeEventRejectedError, match="queue wait timed out"):
+            await producer.publish(**common, payload={"step": 2})
+        assert target.calls == 1
+        target.release.set()
+        assert (await owner) is not None
+        assert producer._locks._entries == {}  # type: ignore[attr-defined]
+
+    asyncio.run(scenario())
+
+
+def test_runtime_event_cancellation_releases_session_key() -> None:
+    class CancelOncePublisher:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.calls = 0
+
+        async def publish(self, event: RuntimeEvent) -> None:
+            del event
+            self.calls += 1
+            if self.calls == 1:
+                self.started.set()
+                await asyncio.sleep(60)
+
+    async def scenario() -> None:
+        target = CancelOncePublisher()
+        producer = RuntimeEventProducerSDK(target)
+        common = {
+            "tenant_id": "tenant-m5",
+            "root_session_id": "session-cancel",
+            "session_id": "session-cancel",
+            "run_id": "run-cancel",
+            "event_type": "runtime.progress",
+            "visibility": "user",
+        }
+        cancelled = asyncio.create_task(
+            producer.publish(**common, payload={"step": 1})
+        )
+        await asyncio.wait_for(target.started.wait(), timeout=1)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        recovered = await producer.publish(**common, payload={"step": 2})
+        assert recovered is not None and recovered.sequence == 2
+        assert producer._locks._entries == {}  # type: ignore[attr-defined]
+
+    asyncio.run(scenario())
+
+
+def test_runtime_delta_publish_and_flush_do_not_cross_runs_or_lose_data() -> None:
+    async def scenario() -> None:
+        bus = ReplayRuntimeEventBus()
+        producer = RuntimeEventProducerSDK(bus, delta_flush_bytes=100)
+        common = {
+            "tenant_id": "tenant-m5",
+            "root_session_id": "session-delta-race",
+            "session_id": "session-delta-race",
+            "visibility": "user",
+        }
+        await producer.publish(
+            **common,
+            run_id="run-a",
+            event_type="model.output.delta",
+            payload={"delta": "a1"},
+        )
+        publish_a2 = asyncio.create_task(
+            producer.publish(
+                **common,
+                run_id="run-a",
+                event_type="model.output.delta",
+                payload={"delta": "a2"},
+            )
+        )
+        flush_a = asyncio.create_task(
+            producer.flush(
+                tenant_id="tenant-m5",
+                root_session_id="session-delta-race",
+                session_id="session-delta-race",
+                run_id="run-a",
+            )
+        )
+        flush_b = asyncio.create_task(
+            producer.flush(
+                tenant_id="tenant-m5",
+                root_session_id="session-delta-race",
+                session_id="session-delta-race",
+                run_id="run-b",
+            )
+        )
+        await publish_a2
+        emitted_a = await flush_a
+        emitted_b = await flush_b
+        trailing = await producer.flush(
+            tenant_id="tenant-m5",
+            root_session_id="session-delta-race",
+            session_id="session-delta-race",
+            run_id="run-a",
+        )
+        deltas = [
+            event.payload["delta"]
+            for event in (emitted_a, trailing)
+            if event is not None
+        ]
+        assert "".join(deltas) == "a1a2"
+        assert emitted_b is None
 
     asyncio.run(scenario())
 
@@ -192,6 +601,70 @@ def test_streaming_gateway_authorizes_replays_and_signals_expired_cursor() -> No
         await slow_events.aclose()
         with pytest.raises(NotFoundError, match="Session not found"):
             await gateway.authorize(tenant_id="foreign", session_id=session_id)
+
+    asyncio.run(scenario())
+
+
+def test_streaming_gateway_paces_consecutive_model_deltas() -> None:
+    class Reader:
+        async def get_task(self, tenant_id: str, session_id: str) -> dict[str, str]:
+            return {"tenant_id": tenant_id, "session_id": session_id}
+
+    class Subscription:
+        initial: list[RuntimeEvent] = []
+        replay_missed = False
+
+        async def events(self):  # type: ignore[no-untyped-def]
+            for sequence in range(1, 4):
+                yield RuntimeEvent(
+                    event_id=f"event-{sequence}",
+                    tenant_id="tenant-m5",
+                    root_session_id="session-m5",
+                    session_id="session-m5",
+                    run_id="run-m5",
+                    sequence=sequence,
+                    type="model.output.delta",
+                    timestamp=datetime.now(UTC),
+                    payload={"delta": str(sequence)},
+                    visibility="user",
+                )
+
+    class Bus:
+        async def subscribe(
+            self,
+            tenant_id: str,
+            session_id: str,
+            *,
+            after_sequence: int | None = None,
+        ) -> Subscription:
+            del tenant_id, session_id, after_sequence
+            return Subscription()
+
+    async def scenario() -> None:
+        interval = 0.02
+        gateway = StreamingGateway(
+            reader=Reader(),  # type: ignore[arg-type]
+            bus=Bus(),  # type: ignore[arg-type]
+            delta_min_interval=interval,
+        )
+        stream = gateway.sse(
+            tenant_id="tenant-m5",
+            session_id="session-m5",
+            last_event_id=None,
+        )
+        emitted_at: list[float] = []
+        try:
+            for _ in range(3):
+                await anext(stream)
+                emitted_at.append(perf_counter())
+        finally:
+            await stream.aclose()
+
+        gaps = [
+            later - earlier
+            for earlier, later in zip(emitted_at, emitted_at[1:], strict=False)
+        ]
+        assert all(gap >= interval * 0.8 for gap in gaps)
 
     asyncio.run(scenario())
 
@@ -401,6 +874,88 @@ def test_delivery_worker_recovers_retries_and_deduplicates_business_delivery() -
             event.type for event in await event_store.load("tenant-m5", session_id)
         ]
         assert canonical_types.count("delivery.succeeded") == 2
+
+    asyncio.run(scenario())
+
+
+def test_delivery_sink_circuit_is_shared_and_allows_one_half_open_probe() -> None:
+    async def scenario() -> None:
+        store = InMemoryDeliveryJobStore()
+        sink = ResultSinkConfig(
+            sink_id="shared-circuit",
+            tenant_id="tenant-circuit",
+            session_id="session-circuit",
+            sink_type="recording",
+            target_ref="managed://shared-circuit",
+        )
+        await store.register_sink(sink)
+        failed = SinkResponse(False, True, "HTTP 503")
+        permit = await store.acquire_sink_circuit(
+            sink.tenant_id,
+            sink.sink_id,
+            worker_id="worker-a",
+            failure_threshold=2,
+            reset_after=timedelta(0),
+            probe_ttl=timedelta(seconds=10),
+        )
+        assert permit.allowed
+        await store.record_sink_circuit_result(
+            sink.tenant_id,
+            sink.sink_id,
+            failed,
+            failure_threshold=2,
+            reset_after=timedelta(0),
+            probe_token=permit.probe_token,
+        )
+        permit = await store.acquire_sink_circuit(
+            sink.tenant_id,
+            sink.sink_id,
+            worker_id="worker-b",
+            failure_threshold=2,
+            reset_after=timedelta(0),
+            probe_ttl=timedelta(seconds=10),
+        )
+        assert permit.allowed
+        opened = await store.record_sink_circuit_result(
+            sink.tenant_id,
+            sink.sink_id,
+            failed,
+            failure_threshold=2,
+            reset_after=timedelta(0),
+            probe_token=permit.probe_token,
+        )
+        assert opened.state == "open" and opened.failure_count == 2
+
+        permits = await asyncio.gather(
+            *(
+                store.acquire_sink_circuit(
+                    sink.tenant_id,
+                    sink.sink_id,
+                    worker_id=worker_id,
+                    failure_threshold=2,
+                    reset_after=timedelta(0),
+                    probe_ttl=timedelta(seconds=10),
+                )
+                for worker_id in ("worker-a", "worker-b")
+            )
+        )
+        probes = [item for item in permits if item.allowed]
+        assert len(probes) == 1
+        assert probes[0].state == "half_open" and probes[0].probe_token
+        assert (await store.get_sink_circuit(sink.tenant_id, sink.sink_id)).probe_owner in {
+            "worker-a",
+            "worker-b",
+        }
+
+        closed = await store.record_sink_circuit_result(
+            sink.tenant_id,
+            sink.sink_id,
+            SinkResponse(True, summary="HTTP 204"),
+            failure_threshold=2,
+            reset_after=timedelta(0),
+            probe_token=probes[0].probe_token,
+        )
+        assert closed.state == "closed" and closed.failure_count == 0
 
     asyncio.run(scenario())
 

@@ -7,11 +7,16 @@ import asyncpg
 import pytest
 
 from auraclaw.action.tool_gateway import ToolRegistry
-from auraclaw.admin.internal_service import OwnerAdminService
+from auraclaw.admin.internal_service import (
+    OwnerAdminService,
+    admin_operation_request_digest,
+)
 from auraclaw.artifact.internal_service import PendingUpload
 from auraclaw.config import get_settings
+from auraclaw.contracts.errors import VersionConflictError
 from auraclaw.contracts.internal import (
     AdminOperationRequest,
+    ApprovalCommandRequest,
     InternalRequestContext,
     PolicyEvaluateRequest,
     PolicyEvaluateResponse,
@@ -25,6 +30,7 @@ from auraclaw.contracts.tools import (
     ToolResultStatus,
 )
 from auraclaw.infrastructure.persistence.postgres_admin_store import (
+    AdminSchema,
     PostgresAdminOperationStore,
 )
 from auraclaw.infrastructure.persistence.postgres_artifact_repository import (
@@ -52,9 +58,287 @@ MIGRATION = "\n".join(
     for path in (
         "migrations/0009_s3_owner_boundaries.sql",
         "migrations/0013_s4_artifact_lifecycle.sql",
+        "migrations/0043_admin_operation_claims.sql",
+        "migrations/0044_hands_invocation_claims.sql",
+        "migrations/0052_policy_approval_cas.sql",
     )
 )
 pytestmark = pytest.mark.skipif(DATABASE_URL is None, reason="PostgreSQL test URL not configured")
+
+
+def _approval_command(
+    *,
+    tenant_id: str,
+    approval_id: str,
+    operation: str,
+    request_id: str,
+    expires_at: datetime | None,
+    decision: str | None = None,
+    action_digest: str = "approval-action-digest",
+) -> ApprovalCommandRequest:
+    return ApprovalCommandRequest(
+        context=InternalRequestContext(
+            tenant_id=tenant_id,
+            service_identity=(
+                ServiceIdentity.TASK_API
+                if operation == "record_human_response"
+                else ServiceIdentity.ACTION_HANDS
+            ),
+            request_id=request_id,
+            correlation_id="approval-run",
+            causation_id=approval_id,
+        ),
+        operation=operation,
+        approval_id=approval_id,
+        session_id="approval-session",
+        run_id="approval-run",
+        action_digest=action_digest,
+        policy_version="approval-policy-v1",
+        decision=decision,
+        actor_id="approver-a" if decision is not None else None,
+        expires_at=expires_at,
+    )
+
+
+def test_postgres_approval_transitions_are_atomic_monotonic_and_audited() -> None:
+    async def scenario() -> None:
+        assert DATABASE_URL is not None
+        connection = await asyncpg.connect(DATABASE_URL)
+        await connection.execute(MIGRATION)
+        suffix = uuid4().hex
+        tenant_id = f"tenant-approval-cas-{suffix}"
+        approval_id = f"approval-cas-{suffix}"
+        expiry = datetime.now(UTC) + timedelta(minutes=5)
+        first = PostgresPolicyStateStore(DATABASE_URL)
+        second = PostgresPolicyStateStore(DATABASE_URL)
+        try:
+            requested = await first.command_approval(
+                _approval_command(
+                    tenant_id=tenant_id,
+                    approval_id=approval_id,
+                    operation="request",
+                    request_id=f"request-{suffix}",
+                    expires_at=expiry,
+                )
+            )
+            assert requested.status == "waiting"
+            replayed = await second.command_approval(
+                _approval_command(
+                    tenant_id=tenant_id,
+                    approval_id=approval_id,
+                    operation="request",
+                    request_id=f"request-replay-{suffix}",
+                    expires_at=expiry,
+                )
+            )
+            assert replayed.status == "waiting"
+            conflicting_request = await second.command_approval(
+                _approval_command(
+                    tenant_id=tenant_id,
+                    approval_id=approval_id,
+                    operation="request",
+                    request_id=f"request-conflict-{suffix}",
+                    expires_at=expiry,
+                    action_digest="different-action",
+                )
+            )
+            assert conflicting_request.status == "conflict"
+
+            approve, reject = await asyncio.gather(
+                first.command_approval(
+                    _approval_command(
+                        tenant_id=tenant_id,
+                        approval_id=approval_id,
+                        operation="record_human_response",
+                        request_id=f"approve-{suffix}",
+                        expires_at=expiry,
+                        decision="approve",
+                    )
+                ),
+                second.command_approval(
+                    _approval_command(
+                        tenant_id=tenant_id,
+                        approval_id=approval_id,
+                        operation="record_human_response",
+                        request_id=f"reject-{suffix}",
+                        expires_at=expiry,
+                        decision="reject",
+                    )
+                ),
+            )
+            assert sorted((approve.status, reject.status)) in (
+                ["approved", "conflict"],
+                ["conflict", "rejected"],
+            )
+            winner_decision = "approve" if approve.status == "approved" else "reject"
+            final_status = "approved" if winner_decision == "approve" else "rejected"
+            retry = await second.command_approval(
+                _approval_command(
+                    tenant_id=tenant_id,
+                    approval_id=approval_id,
+                    operation="record_human_response",
+                    request_id=f"winner-retry-{suffix}",
+                    expires_at=expiry,
+                    decision=winner_decision,
+                )
+            )
+            assert retry.status == final_status
+            for operation in ("cancel", "expire"):
+                blocked = await second.command_approval(
+                    _approval_command(
+                        tenant_id=tenant_id,
+                        approval_id=approval_id,
+                        operation=operation,
+                        request_id=f"{operation}-{suffix}",
+                        expires_at=expiry,
+                    )
+                )
+                assert blocked.status == "conflict"
+            row = await connection.fetchrow(
+                """SELECT status,decision,decided_by,request_digest
+                FROM policy.approval WHERE tenant_id=$1 AND approval_id=$2""",
+                tenant_id,
+                approval_id,
+            )
+            assert row is not None
+            assert row["status"] == final_status
+            assert row["decision"] == winner_decision
+            assert row["decided_by"] == "approver-a"
+            assert row["request_digest"]
+            validated = await first.command_approval(
+                _approval_command(
+                    tenant_id=tenant_id,
+                    approval_id=approval_id,
+                    operation="validate",
+                    request_id=f"validate-{suffix}",
+                    expires_at=expiry,
+                )
+            )
+            assert validated.valid is (final_status == "approved")
+            mismatched_validation = await first.command_approval(
+                _approval_command(
+                    tenant_id=tenant_id,
+                    approval_id=approval_id,
+                    operation="validate",
+                    request_id=f"validate-mismatch-{suffix}",
+                    expires_at=expiry,
+                    action_digest="different-action",
+                )
+            )
+            assert not mismatched_validation.valid
+            assert mismatched_validation.status == "conflict"
+            audits = await connection.fetch(
+                """SELECT outcome,actor_id,correlation_id,causation_id
+                FROM policy.approval_transition_audit
+                WHERE tenant_id=$1 AND approval_id=$2""",
+                tenant_id,
+                approval_id,
+            )
+            assert {item["outcome"] for item in audits} >= {
+                "winner",
+                "idempotent",
+                "conflict",
+            }
+            assert any(item["actor_id"] == "approver-a" for item in audits)
+            assert all(item["correlation_id"] == "approval-run" for item in audits)
+            assert all(item["causation_id"] == approval_id for item in audits)
+
+            cancel_race_id = f"approval-cancel-race-{suffix}"
+            await first.command_approval(
+                _approval_command(
+                    tenant_id=tenant_id,
+                    approval_id=cancel_race_id,
+                    operation="request",
+                    request_id=f"cancel-race-request-{suffix}",
+                    expires_at=expiry,
+                )
+            )
+            approval_result, cancel_result = await asyncio.gather(
+                first.command_approval(
+                    _approval_command(
+                        tenant_id=tenant_id,
+                        approval_id=cancel_race_id,
+                        operation="record_human_response",
+                        request_id=f"cancel-race-approve-{suffix}",
+                        expires_at=expiry,
+                        decision="approve",
+                    )
+                ),
+                second.command_approval(
+                    _approval_command(
+                        tenant_id=tenant_id,
+                        approval_id=cancel_race_id,
+                        operation="cancel",
+                        request_id=f"cancel-race-cancel-{suffix}",
+                        expires_at=expiry,
+                    )
+                ),
+            )
+            assert sorted((approval_result.status, cancel_result.status)) in (
+                ["approved", "conflict"],
+                ["cancelled", "conflict"],
+            )
+
+            expire_race_id = f"approval-expire-race-{suffix}"
+            await first.command_approval(
+                _approval_command(
+                    tenant_id=tenant_id,
+                    approval_id=expire_race_id,
+                    operation="request",
+                    request_id=f"expire-race-request-{suffix}",
+                    expires_at=expiry,
+                )
+            )
+            await connection.execute(
+                """UPDATE policy.approval SET expires_at=now()-interval '1 second'
+                WHERE tenant_id=$1 AND approval_id=$2""",
+                tenant_id,
+                expire_race_id,
+            )
+            late_approval, expiration = await asyncio.gather(
+                first.command_approval(
+                    _approval_command(
+                        tenant_id=tenant_id,
+                        approval_id=expire_race_id,
+                        operation="record_human_response",
+                        request_id=f"expire-race-approve-{suffix}",
+                        expires_at=expiry,
+                        decision="approve",
+                    )
+                ),
+                second.command_approval(
+                    _approval_command(
+                        tenant_id=tenant_id,
+                        approval_id=expire_race_id,
+                        operation="expire",
+                        request_id=f"expire-race-expire-{suffix}",
+                        expires_at=expiry,
+                    )
+                ),
+            )
+            assert {late_approval.status, expiration.status} <= {
+                "expired",
+                "conflict",
+            }
+            assert await connection.fetchval(
+                """SELECT status FROM policy.approval
+                WHERE tenant_id=$1 AND approval_id=$2""",
+                tenant_id,
+                expire_race_id,
+            ) == "expired"
+        finally:
+            await first.close()
+            await second.close()
+            await connection.execute(
+                "DELETE FROM policy.approval_transition_audit WHERE tenant_id=$1",
+                tenant_id,
+            )
+            await connection.execute(
+                "DELETE FROM policy.approval WHERE tenant_id=$1", tenant_id
+            )
+            await connection.close()
+
+    asyncio.run(scenario())
 
 
 def test_s3_owner_state_survives_process_local_clients() -> None:
@@ -73,6 +357,7 @@ def test_s3_owner_state_survives_process_local_clients() -> None:
         credential_store = PostgresCredentialRegistry(DATABASE_URL)
         artifact_store = PostgresArtifactRepository(DATABASE_URL)
         admin_store = PostgresAdminOperationStore(DATABASE_URL, schema="projection")
+        admin_store_b = PostgresAdminOperationStore(DATABASE_URL, schema="projection")
         tool_registry_store = PostgresToolRegistryStore(DATABASE_URL)
         try:
             invocation = ToolInvocation(
@@ -90,16 +375,39 @@ def test_s3_owner_state_survives_process_local_clients() -> None:
                 fencing_token=1,
                 actor_id="runtime-s3",
             )
-            assert not (await invocation_store.begin(invocation, "digest-a")).conflict
+            started = await invocation_store.begin(
+                invocation,
+                "digest-a",
+                owner="hands-a",
+                claim_token="claim-a",
+                claim_ttl=timedelta(seconds=30),
+            )
+            assert started.acquired
             result = ToolResult(
                 status=ToolResultStatus.SUCCESS,
                 content={"accepted": True},
                 side_effect_status="completed",
             )
-            await invocation_store.complete(invocation, result)
-            cached = await invocation_store.begin(invocation, "digest-a")
+            assert await invocation_store.complete(
+                invocation, result, claim_token="claim-a"
+            )
+            cached = await invocation_store.begin(
+                invocation,
+                "digest-a",
+                owner="hands-b",
+                claim_token="claim-b",
+                claim_ttl=timedelta(seconds=30),
+            )
             assert cached.cached_result == result
-            assert (await invocation_store.begin(invocation, "digest-b")).conflict
+            assert (
+                await invocation_store.begin(
+                    invocation,
+                    "digest-b",
+                    owner="hands-b",
+                    claim_token="claim-b",
+                    claim_ttl=timedelta(seconds=30),
+                )
+            ).conflict
             interrupted = ToolInvocation(
                 **{
                     **invocation.__dict__,
@@ -107,8 +415,29 @@ def test_s3_owner_state_survives_process_local_clients() -> None:
                     "idempotency_key": f"interrupted-idem-{suffix}",
                 }
             )
-            await invocation_store.begin(interrupted, "digest-interrupted")
-            recovered = await invocation_store.begin(interrupted, "digest-interrupted")
+            await invocation_store.begin(
+                interrupted,
+                "digest-interrupted",
+                owner="hands-a",
+                claim_token="claim-interrupted",
+                claim_ttl=timedelta(seconds=30),
+            )
+            assert await invocation_store.mark_executing(
+                interrupted, claim_token="claim-interrupted"
+            )
+            await connection.execute(
+                """UPDATE hands.invocation SET execution_claim_expires_at=now()-interval '1 second'
+                WHERE tenant_id=$1 AND tool_invocation_id=$2""",
+                tenant_id,
+                interrupted.tool_invocation_id,
+            )
+            recovered = await invocation_store.begin(
+                interrupted,
+                "digest-interrupted",
+                owner="hands-b",
+                claim_token="claim-recovery",
+                claim_ttl=timedelta(seconds=30),
+            )
             assert recovered.cached_result.status is ToolResultStatus.UNKNOWN
 
             context = InternalRequestContext(
@@ -174,7 +503,12 @@ def test_s3_owner_state_survives_process_local_clients() -> None:
             )
             await artifact_store.save_pending(pending)
             await artifact_store.mark_ready(pending, 1)
-            assert await artifact_store.get_ready(tenant_id, artifact_id, 1) == pending
+            ready = await artifact_store.get_ready(tenant_id, artifact_id, 1)
+            assert ready is not None
+            assert ready.artifact_id == pending.artifact_id
+            assert ready.object_key == pending.object_key
+            assert ready.lifecycle_status == "ready"
+            assert ready.scan_status == "clean"
 
             await connection.execute(
                 """INSERT INTO hands.tool_capability
@@ -189,10 +523,14 @@ def test_s3_owner_state_survives_process_local_clients() -> None:
             assert registry.get(f"tool-{suffix}", "1").owner == "integration"
 
             calls = 0
+            handler_started = asyncio.Event()
+            release_handler = asyncio.Event()
 
             async def admin_handler(parameters: dict[str, object]) -> dict[str, object]:
                 nonlocal calls
                 calls += 1
+                handler_started.set()
+                await release_handler.wait()
                 return parameters
 
             admin_request = AdminOperationRequest(
@@ -212,14 +550,45 @@ def test_s3_owner_state_survives_process_local_clients() -> None:
                 ServiceIdentity.PROJECTION_WORKER,
                 {"status": admin_handler},
                 store=admin_store,
+                instance_id="projection-a",
             )
-            await first_admin.execute(admin_request)
             restarted_admin = OwnerAdminService(
                 ServiceIdentity.PROJECTION_WORKER,
                 {"status": admin_handler},
-                store=admin_store,
+                store=admin_store_b,
+                instance_id="projection-b",
             )
-            await restarted_admin.execute(admin_request)
+            executing = asyncio.create_task(first_admin.execute(admin_request))
+            await handler_started.wait()
+            concurrent = await restarted_admin.execute(admin_request)
+            assert concurrent.status == "running"
+            release_handler.set()
+            completed = await executing
+            assert completed.status == "completed"
+            replayed = await restarted_admin.execute(admin_request)
+            assert replayed == completed
+            assert calls == 1
+            with pytest.raises(VersionConflictError):
+                await restarted_admin.execute(
+                    admin_request.model_copy(
+                        update={"parameters": {"tenant_id": "different"}}
+                    )
+                )
+
+            abandoned_request = admin_request.model_copy(
+                update={"operation_id": f"admin-abandoned-{suffix}"}
+            )
+            await admin_store.claim(
+                abandoned_request,
+                request_digest=admin_operation_request_digest(abandoned_request),
+                claimed_by="projection-crashed",
+                claim_token="abandoned-claim",
+                claim_ttl=timedelta(microseconds=1),
+            )
+            await asyncio.sleep(0.01)
+            recovery = await restarted_admin.execute(abandoned_request)
+            assert recovery.status == "failed"
+            assert recovery.result["error_code"] == "unknown_side_effect"
             assert calls == 1
 
             assert not await connection.fetchval(
@@ -231,6 +600,7 @@ def test_s3_owner_state_survives_process_local_clients() -> None:
             await credential_store.close()
             await artifact_store.close()
             await admin_store.close()
+            await admin_store_b.close()
             await tool_registry_store.close()
             await connection.execute(
                 "DELETE FROM hands.invocation WHERE tenant_id=$1", tenant_id
@@ -249,8 +619,90 @@ def test_s3_owner_state_survives_process_local_clients() -> None:
                 f"admin-{suffix}",
             )
             await connection.execute(
+                "DELETE FROM projection.admin_operation WHERE operation_id=$1",
+                f"admin-abandoned-{suffix}",
+            )
+            await connection.execute(
                 "DELETE FROM hands.tool_capability WHERE tool_name=$1",
                 f"tool-{suffix}",
+            )
+            await connection.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("schema", "owner"),
+    [
+        ("projection", ServiceIdentity.PROJECTION_WORKER),
+        ("delivery", ServiceIdentity.DELIVERY_WORKER),
+        ("artifact", ServiceIdentity.ARTIFACT_SERVICE),
+    ],
+)
+def test_admin_operation_claim_is_atomic_for_each_owner_schema(
+    schema: AdminSchema,
+    owner: ServiceIdentity,
+) -> None:
+    async def scenario() -> None:
+        assert DATABASE_URL is not None
+        connection = await asyncpg.connect(DATABASE_URL)
+        await connection.execute(MIGRATION)
+        suffix = uuid4().hex
+        operation_id = f"admin-claim-{suffix}"
+        store_a = PostgresAdminOperationStore(DATABASE_URL, schema=schema)
+        store_b = PostgresAdminOperationStore(DATABASE_URL, schema=schema)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def handler(parameters: dict[str, object]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return parameters
+
+        request = AdminOperationRequest(
+            context=InternalRequestContext(
+                tenant_id=f"tenant-admin-{suffix}",
+                service_identity=ServiceIdentity.TASK_API,
+                request_id=operation_id,
+                correlation_id=operation_id,
+                causation_id=operation_id,
+            ),
+            operation_id=operation_id,
+            owner_service=owner,
+            operation="maintenance",
+            parameters={"scope": suffix},
+        )
+        service_a = OwnerAdminService(
+            owner,
+            {"maintenance": handler},
+            store=store_a,
+            instance_id=f"{schema}-a",
+        )
+        service_b = OwnerAdminService(
+            owner,
+            {"maintenance": handler},
+            store=store_b,
+            instance_id=f"{schema}-b",
+        )
+        try:
+            executing = asyncio.create_task(service_a.execute(request))
+            await started.wait()
+            assert (await service_b.execute(request)).status == "running"
+            release.set()
+            completed = await executing
+            assert completed.status == "completed"
+            assert await service_b.execute(request) == completed
+            assert calls == 1
+        finally:
+            release.set()
+            await store_a.close()
+            await store_b.close()
+            await connection.execute(
+                f"DELETE FROM {schema}.admin_operation WHERE operation_id=$1",
+                operation_id,
             )
             await connection.close()
 

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import uuid
 
 import httpx
 
 from auraclaw.action.ports import PolicyEvaluation
 from auraclaw.contracts.commands import CommandContext
-from auraclaw.contracts.errors import PolicyDeniedError
+from auraclaw.contracts.errors import ApprovalValidationError, PolicyDeniedError
 from auraclaw.contracts.internal import (
     ApprovalCommandRequest,
     ApprovalValidationResponse,
@@ -20,7 +19,9 @@ from auraclaw.contracts.internal import (
     ServiceIdentity,
 )
 from auraclaw.contracts.tools import ApprovalRecord, PolicyDecision, ToolCapability, ToolInvocation
+from auraclaw.domain.approval import invocation_action_digest
 from auraclaw.internal.http import HttpContractClient
+from auraclaw.observability.redaction import redact_sensitive
 
 
 class RemotePolicyClient:
@@ -34,7 +35,7 @@ class RemotePolicyClient:
     ) -> None:
         self.version = "remote"
         self._identity = service_identity
-        self._client = httpx.AsyncClient(base_url=base_url, transport=transport)
+        self._client = httpx.AsyncClient(base_url=base_url, transport=transport, timeout=30.0)
         self._contract = HttpContractClient(self._client, bearer_token=bearer_token)
 
     async def aclose(self) -> None:
@@ -47,15 +48,11 @@ class RemotePolicyClient:
     ) -> PolicyEvaluation:
         if invocation is None:
             raise ValueError("remote policy evaluation requires invocation context")
-        encoded = json.dumps(
-            invocation.arguments,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode()
         response = await self._contract.call(
             "/internal/v1/policy/evaluate",
             PolicyEvaluateRequest(
+                session_id=invocation.session_id,
+                run_id=invocation.run_id,
                 context=InternalRequestContext(
                     tenant_id=invocation.tenant_id,
                     service_identity=self._identity,
@@ -67,12 +64,19 @@ class RemotePolicyClient:
                 subject=invocation.actor_id,
                 action=invocation.expected_side_effect,
                 resource=capability.name,
-                input_digest=hashlib.sha256(encoded).hexdigest(),
+                input_digest=invocation_action_digest(invocation),
                 attributes={
+                    "action_kind": "tool",
+                    "arguments": redact_sensitive(invocation.arguments),
+                    "description": capability.description,
                     "tool_version": capability.version,
                     "permission": capability.permission.value,
                     "risk_level": capability.risk_level.value,
                     "runtime_location": capability.runtime_location,
+                    "trusted_user_id": invocation.user_id,
+                    "trusted_dept_id": invocation.dept_id,
+                    "capability_ref": (invocation.capability_ref.model_dump(mode="json")
+                                       if invocation.capability_ref else None),
                 },
             ),
             PolicyEvaluateResponse,
@@ -82,6 +86,7 @@ class RemotePolicyClient:
             decision=PolicyDecision(response.decision),
             decision_id=response.decision_id,
             policy_version=response.policy_version,
+            constraints=dict(response.constraints),
         )
 
     async def evaluate_action(
@@ -99,6 +104,8 @@ class RemotePolicyClient:
         response = await self._contract.call(
             "/internal/v1/policy/evaluate",
             PolicyEvaluateRequest(
+                session_id=str(attributes["session_id"]) if attributes.get("session_id") else None,
+                run_id=str(attributes["run_id"]) if attributes.get("run_id") else None,
                 context=InternalRequestContext(
                     tenant_id=tenant_id,
                     service_identity=self._identity,
@@ -118,6 +125,7 @@ class RemotePolicyClient:
             decision=PolicyDecision(response.decision),
             decision_id=response.decision_id,
             policy_version=response.policy_version,
+            constraints=dict(response.constraints),
         )
 
     async def validate_decision(
@@ -148,7 +156,9 @@ class RemotePolicyClient:
         return response.valid
 
     async def request_approval(self, record: ApprovalRecord) -> None:
-        await self._approval_command(record, operation="request")
+        response = await self._approval_command(record, operation="request")
+        if response.status == "conflict":
+            raise ApprovalValidationError("approval id is already bound to a different request")
 
     async def validate_approval(
         self,
@@ -183,14 +193,23 @@ class RemotePolicyClient:
         return response.valid
 
     async def record_human_response(
-        self, record: ApprovalRecord, *, decision: str, feedback: str | None
+        self,
+        record: ApprovalRecord,
+        *,
+        decision: str,
+        feedback: str | None,
+        actor_id: str | None = None,
     ) -> None:
-        await self._approval_command(
+        expected_status = "approved" if decision == "approved" else "rejected"
+        response = await self._approval_command(
             record,
             operation="record_human_response",
-            decision="approve" if decision == "approved" else "reject",
+            decision="approve" if expected_status == "approved" else "reject",
             feedback=feedback,
+            actor_id=actor_id,
         )
+        if response.status != expected_status:
+            raise ApprovalValidationError(f"approval decision was not committed: {response.status}")
 
     async def _approval_command(
         self,
@@ -199,6 +218,7 @@ class RemotePolicyClient:
         operation: str,
         decision: str | None = None,
         feedback: str | None = None,
+        actor_id: str | None = None,
     ) -> ApprovalValidationResponse:
         request_id = str(uuid.uuid4())
         return await self._contract.call(
@@ -219,6 +239,7 @@ class RemotePolicyClient:
                 policy_version=record.policy_version,
                 decision=decision,
                 feedback=feedback,
+                actor_id=actor_id,
                 expires_at=record.expires_at,
             ),
             ApprovalValidationResponse,

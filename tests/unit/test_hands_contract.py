@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -23,6 +24,7 @@ from auraclaw.action.mcp_primitives import (
 )
 from auraclaw.action.policy import PolicyEngine
 from auraclaw.action.tool_gateway import ToolGateway, ToolRegistry
+from auraclaw.contracts.errors import AuraClawError
 from auraclaw.contracts.hands import (
     HANDS_CONTRACT_VERSION,
     HANDS_MAX_REQUEST_BYTES,
@@ -64,7 +66,12 @@ class _ApprovalReader:
         return None
 
     async def find_approved(
-        self, tenant_id: str, session_id: str, digest: str, policy_version: str
+        self,
+        tenant_id: str,
+        session_id: str,
+        digest: str,
+        policy_version: str,
+        run_id: str | None = None,
     ) -> None:
         del tenant_id, session_id, digest, policy_version
         return None
@@ -88,11 +95,20 @@ class _DenyPolicy(PolicyEngine):
         return PolicyDecision.DENY
 
 
+class _RequireApprovalPolicy(PolicyEngine):
+    def evaluate(self, capability: ToolCapability, invocation: object = None) -> Any:
+        del capability, invocation
+        from auraclaw.contracts.tools import PolicyDecision
+
+        return PolicyDecision.REQUIRE_APPROVAL
+
+
 def _assignment(
     *,
     tenant_id: str = "tenant-a",
     runtime_id: str = "runtime-a",
     user_id: str | None = "user-101",
+    dept_id: str | None = "dept-9",
 ) -> RuntimeAssignment:
     return RuntimeAssignment(
         tenant_id=tenant_id,
@@ -106,6 +122,7 @@ def _assignment(
         resource_profile={},
         deadline=datetime.now(UTC) + timedelta(minutes=1),
         user_id=user_id,
+        dept_id=dept_id,
     )
 
 
@@ -120,6 +137,7 @@ def _trusted(assignment: RuntimeAssignment) -> HandsTrustedContext:
         fencing_token=assignment.fencing_token,
         deadline=assignment.deadline,
         user_id=assignment.user_id,
+        dept_id=assignment.dept_id,
     )
 
 
@@ -128,6 +146,7 @@ def _gateway(
     hands: Any | None = None,
     policy: PolicyEngine | None = None,
     permission: ToolPermission = ToolPermission.READ_ONLY,
+    runtime_location: str = "hands",
 ) -> tuple[HandsGateway, _RecordingHands]:
     capability = ToolCapability(
         name="lookup",
@@ -137,6 +156,7 @@ def _gateway(
         output_schema={"type": "object"},
         permission=permission,
         risk_level=RiskLevel.LOW,
+        runtime_location=runtime_location,
     )
     registry = ToolRegistry((capability,))
     recorder = hands or _RecordingHands()
@@ -193,9 +213,7 @@ def _gateway(
                         HandsPromptMessage(
                             role="user",
                             content={
-                                "text": (
-                                    f"Review {arguments['target']} for {trusted.tenant_id}"
-                                )
+                                "text": (f"Review {arguments['target']} for {trusted.tenant_id}")
                             },
                         ),
                     )
@@ -260,8 +278,12 @@ def test_hands_list_call_resource_prompt_and_idempotency(kind: str) -> None:
                 ),
             )
             assert first.status == "success"
+            status = await client.get_invocation_status(assignment, "tool-stable-1")
+            assert status.found
+            assert status.status == "success"
             assert recorder.invocations[0].tenant_id == "tenant-a"
             assert recorder.invocations[0].user_id == "user-101"
+            assert recorder.invocations[0].dept_id == "dept-9"
             repeated = await client.call_tool(
                 assignment,
                 HandsToolCall(
@@ -286,9 +308,7 @@ def test_hands_list_call_resource_prompt_and_idempotency(kind: str) -> None:
             prompt = await client.get_prompt(
                 assignment, "review", arguments={"target": "pull request"}
             )
-            assert prompt.messages[0].content["text"] == (
-                "Review pull request for tenant-a"
-            )
+            assert prompt.messages[0].content["text"] == ("Review pull request for tenant-a")
             other = _assignment(tenant_id="tenant-b", runtime_id="runtime-b")
             if kind == "in-process":
                 visible = await client.list_resources(other)
@@ -312,9 +332,7 @@ def test_hands_policy_deny_and_approval_required(kind: str) -> None:
             assert denied.status == "denied"
             assert denied.error_code == "policy_denied"
 
-        approval_gateway, _approval = _gateway(
-            permission=ToolPermission.WRITE_WITH_APPROVAL
-        )
+        approval_gateway, _approval = _gateway(permission=ToolPermission.WRITE_WITH_APPROVAL)
         async for client in _call_with_client(kind, approval_gateway, assignment):
             pending = await client.call_tool(
                 assignment,
@@ -331,15 +349,39 @@ def test_hands_policy_deny_and_approval_required(kind: str) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("kind", ["in-process", "http"])
+def test_explicit_approval_policy_also_applies_to_read_only_mcp(kind: str) -> None:
+    async def scenario() -> None:
+        gateway, recorder = _gateway(
+            policy=_RequireApprovalPolicy(),
+            permission=ToolPermission.READ_ONLY,
+            runtime_location="remote-mcp",
+        )
+        assignment = _assignment()
+        async for client in _call_with_client(kind, gateway, assignment):
+            result = await client.call_tool(
+                assignment,
+                HandsToolCall(
+                    tool_invocation_id="read-mcp-1",
+                    name="lookup",
+                    arguments={},
+                    expected_side_effect="read",
+                ),
+            )
+            assert result.status == "denied"
+            assert result.error_code == "approval_required"
+            assert len(recorder.invocations) == 0
+
+    asyncio.run(scenario())
+
+
 def test_http_hands_rejects_auth_version_size_and_schema_errors() -> None:
     async def scenario() -> None:
         gateway, _recorder = _gateway()
         assignment = _assignment()
         app = create_hands_http_app(
             gateway,
-            authenticator=StaticHandsAuthenticator(
-                {"runtime-token": _trusted(assignment)}
-            ),
+            authenticator=StaticHandsAuthenticator({"runtime-token": _trusted(assignment)}),
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
@@ -379,15 +421,93 @@ def test_http_hands_rejects_auth_version_size_and_schema_errors() -> None:
             )
             assert oversized.status_code == 413
 
-            client = HttpHandsClient(
-                raw, bearer_tokens={assignment.runtime_id: "runtime-token"}
-            )
+            client = HttpHandsClient(raw, bearer_tokens={assignment.runtime_id: "runtime-token"})
             adapter = HandsRuntimeAdapter(client)
             result = await adapter.execute(
                 assignment,
                 ToolCall(tool_invocation_id="http-1", name="lookup", arguments={}),
             )
             assert result["status"] == "success"
+
+    asyncio.run(scenario())
+
+
+def test_http_hands_retries_transient_connection_failures() -> None:
+    async def scenario() -> None:
+        assignment = _assignment()
+        attempts = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise httpx.ConnectError("temporary refusal", request=request)
+            return httpx.Response(
+                200,
+                json={"status": "success", "content": {"value": "ready"}},
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://hands",
+        ) as raw:
+            client = HttpHandsClient(
+                raw,
+                bearer_tokens={assignment.runtime_id: "runtime-token"},
+                connect_retry_delay_seconds=0,
+            )
+            result = await client.call_tool(
+                assignment,
+                HandsToolCall(
+                    tool_invocation_id="retry-connect-1",
+                    name="lookup",
+                    idempotency_key="retry-connect-1",
+                ),
+            )
+
+        assert result.status == "success"
+        assert result.content == {"value": "ready"}
+        assert attempts == 3
+
+    asyncio.run(scenario())
+
+
+def test_http_hands_reports_exhausted_connection_retries() -> None:
+    async def scenario() -> None:
+        assignment = _assignment()
+        attempts = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ConnectError("connection refused", request=request)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://hands",
+        ) as raw:
+            client = HttpHandsClient(
+                raw,
+                bearer_tokens={assignment.runtime_id: "runtime-token"},
+                connect_attempts=2,
+                connect_retry_delay_seconds=0,
+            )
+            with pytest.raises(
+                AuraClawError,
+                match="Action Hands is unavailable after 2 connection attempts",
+            ) as raised:
+                await client.call_tool(
+                    assignment,
+                    HandsToolCall(
+                        tool_invocation_id="retry-connect-2",
+                        name="lookup",
+                        idempotency_key="retry-connect-2",
+                    ),
+                )
+
+        assert raised.value.detail == ("transport=ConnectError; path=/internal/v1/hands/tools/call")
+        assert isinstance(raised.value.__cause__, httpx.ConnectError)
+        assert attempts == 2
 
     asyncio.run(scenario())
 
@@ -410,12 +530,8 @@ def test_http_hands_replicas_share_gateway_without_sticky_sessions() -> None:
                 base_url="http://hands-b",
             ) as raw_b,
         ):
-            client_a = HttpHandsClient(
-                raw_a, bearer_tokens={assignment.runtime_id: token}
-            )
-            client_b = HttpHandsClient(
-                raw_b, bearer_tokens={assignment.runtime_id: token}
-            )
+            client_a = HttpHandsClient(raw_a, bearer_tokens={assignment.runtime_id: token})
+            client_b = HttpHandsClient(raw_b, bearer_tokens={assignment.runtime_id: token})
             first = await client_a.call_tool(
                 assignment,
                 HandsToolCall(
@@ -600,9 +716,7 @@ def test_hands_large_result_returns_artifact_reference() -> None:
             ),
             max_inline_bytes=64,
         )
-        client = InProcessHandsClient(
-            HandsGateway(registry=registry, gateway=gateway)
-        )
+        client = InProcessHandsClient(HandsGateway(registry=registry, gateway=gateway))
         result = await client.call_tool(
             _assignment(),
             HandsToolCall(tool_invocation_id="large-1", name="lookup", arguments={}),
@@ -610,5 +724,51 @@ def test_hands_large_result_returns_artifact_reference() -> None:
         assert result.status == "success"
         assert isinstance(result.content, dict)
         assert "artifact_ref" in result.content
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("changed", [{"user_id": "other"}, {"dept_id": "other"}, {"dept_id": None}])
+def test_hands_replay_is_bound_to_trusted_identity(changed: dict[str, Any]) -> None:
+    async def scenario() -> None:
+        gateway, recorder = _gateway()
+        assignment = _assignment()
+        client = InProcessHandsClient(gateway)
+        call = HandsToolCall(tool_invocation_id="identity-replay", name="lookup")
+        assert (await client.call_tool(assignment, call)).status == "success"
+        rejected = await client.call_tool(replace(assignment, **changed), call)
+        assert rejected.status == "denied"
+        assert rejected.error_code == "idempotency_conflict"
+        assert len(recorder.invocations) == 1
+        recovered = await client.call_tool(replace(assignment, runtime_id="replica-b"), call)
+        assert recovered.status == "success"
+        assert len(recorder.invocations) == 1
+
+    asyncio.run(scenario())
+
+
+def test_invocation_result_query_is_read_only_and_scoped_to_original_run() -> None:
+    async def scenario() -> None:
+        gateway, recorder = _gateway()
+        trusted = _trusted(_assignment())
+        call = HandsToolCall(
+            tool_invocation_id="status-result",
+            name="lookup",
+            version="1",
+            arguments={},
+            expected_side_effect="read",
+            idempotency_key="receipt",
+        )
+        assert (await gateway.call_tool(trusted, call)).status == "success"
+        result = await gateway.get_invocation_status(trusted, "status-result")
+        assert result.found and result.result is not None
+        assert result.result.content == {"ok": True, "tenant": trusted.tenant_id}
+        for key in ("tenant_id", "root_session_id", "session_id", "run_id"):
+            assert not (
+                await gateway.get_invocation_status(
+                    trusted.model_copy(update={key: "another"}), "status-result"
+                )
+            ).found
+        assert len(recorder.invocations) == 1
 
     asyncio.run(scenario())

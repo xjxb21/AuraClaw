@@ -232,10 +232,29 @@ def test_runtime_recovers_at_all_required_failure_injection_points(
         event_types = [event.type for event in events]
         assert event_types.count("runtime.failed") == 1
         assert event_types.count("runtime.reprovisioned") == 1
+        assert event_types.count("model.input.prepared") == 1
         assert event_types.count("model.output.completed") == 1
         assert event_types.count("tool.call.requested") == 1
         assert event_types.count("tool.call.completed") == 1
         assert event_types.count("run.completed") == 1
+        golden_types = {
+            "run.scheduled",
+            "run.started",
+            "model.input.prepared",
+            "model.output.completed",
+            "tool.call.requested",
+            "tool.call.completed",
+            "run.completed",
+        }
+        assert [item for item in event_types if item in golden_types] == [
+            "run.scheduled",
+            "run.started",
+            "model.input.prepared",
+            "model.output.completed",
+            "tool.call.requested",
+            "tool.call.completed",
+            "run.completed",
+        ]
         assert provider.calls == 1
         assert tool_delegate.calls == 1
         serialized_events = repr([event.as_dict() for event in events])
@@ -359,7 +378,7 @@ def test_runtime_worker_renews_lease_during_slow_model_calls() -> None:
     asyncio.run(scenario())
 
 
-def test_claim_reclaims_orphan_running_assignment_after_grace() -> None:
+def test_claim_does_not_reclaim_a_running_assignment_by_elapsed_time() -> None:
     async def scenario() -> None:
         control = InMemoryControlStateStore()
         control.orphan_running_grace = timedelta(0)
@@ -384,14 +403,22 @@ def test_claim_reclaims_orphan_running_assignment_after_grace() -> None:
             resource_profile={},
         )
         task_id = "tenant-m2:ses_1:run_1"
+        resource_id = "session:tenant-m2:ses_1"
+        async with control._lock:
+            control._leases[resource_id] = RuntimeLease(
+                resource_id=resource_id,
+                lease_id="lea_1",
+                owner="orch",
+                fencing_token=1,
+                expires_at=datetime.now(UTC) + timedelta(seconds=30),
+            )
         control._assignments[task_id] = (assignment, "running")
         control._assignment_started_at[task_id] = datetime.now(UTC) - timedelta(
             seconds=1
         )
 
         claimed = await control.claim_assignments(runtime.runtime_id, "root", limit=1)
-        assert len(claimed) == 1
-        assert claimed[0].task_id == task_id
+        assert claimed == []
 
     asyncio.run(scenario())
 

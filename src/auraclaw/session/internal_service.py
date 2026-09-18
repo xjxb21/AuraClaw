@@ -17,6 +17,12 @@ from auraclaw.contracts.internal import (
     SessionAppendResponse,
     SessionFeedRequest,
     SessionFeedResponse,
+    SessionRootFeedRequest,
+    SessionRootFeedResponse,
+    SkillActiveBindingReferenceRequest,
+    SkillActiveBindingReferenceResponse,
+    SkillBindingReferenceRequest,
+    SkillBindingReferenceResponse,
 )
 from auraclaw.contracts.state import Visibility
 from auraclaw.infrastructure.persistence.memory_event_store import (
@@ -45,6 +51,7 @@ DEFAULT_EVENT_ALLOWLIST: Mapping[ServiceIdentity, tuple[str, ...]] = {
         "context.",
         "child.",
         "runtime.",
+        "approval.",
     ),
     ServiceIdentity.DELIVERY_WORKER: ("delivery.",),
     ServiceIdentity.POLICY: ("approval.", "policy."),
@@ -96,8 +103,39 @@ class SessionInternalService:
         self._actor_allowlist = actor_allowlist
         self._outbox_wake = outbox_wake
 
+    async def skill_binding_reference(
+        self, request: SkillBindingReferenceRequest
+    ) -> SkillBindingReferenceResponse:
+        if request.context.service_identity is not ServiceIdentity.ACTION_HANDS:
+            raise AuthorizationError("workload may not query Skill binding references")
+        return SkillBindingReferenceResponse(
+            referenced=await self._event_store.has_skill_package_reference(
+                request.context.tenant_id,
+                request.package_digest,
+            )
+        )
+
+    async def skill_active_binding_reference(
+        self, request: SkillActiveBindingReferenceRequest
+    ) -> SkillActiveBindingReferenceResponse:
+        if request.context.service_identity is not ServiceIdentity.ACTION_HANDS:
+            raise AuthorizationError("workload may not query active Skill bindings")
+        return SkillActiveBindingReferenceResponse(
+            referenced=await self._event_store.has_active_skill_reference(
+                request.context.tenant_id,
+                request.publisher,
+                request.name,
+                request.package_digest,
+            )
+        )
+
     async def append(self, request: SessionAppendRequest) -> SessionAppendResponse:
         identity = request.context.service_identity
+        if identity is ServiceIdentity.AGENT_RUNTIME and any(
+            "approval" in event.payload or event.type in {"approval.approved", "approval.rejected"}
+            for event in request.events
+        ):
+            raise AuthorizationError("Runtime cannot grant approval or set approval configuration")
         allowed_events = self._event_allowlist.get(identity, ())
         if not request.events or any(
             not _allowed(event.type, allowed_events) for event in request.events
@@ -173,24 +211,32 @@ class SessionInternalService:
             next_version=next_version,
         )
 
+    async def root_feed(self, request: SessionRootFeedRequest) -> SessionRootFeedResponse:
+        if request.context.service_identity not in {
+            ServiceIdentity.ORCHESTRATOR,
+            ServiceIdentity.PROJECTION_WORKER,
+        }:
+            raise AuthorizationError("root feed is restricted to control and projection")
+        events = await self._event_store.load_root(
+            request.context.tenant_id,
+            request.root_session_id,
+            event_types=request.event_types,
+            limit=request.limit,
+        )
+        return SessionRootFeedResponse(events=tuple(event.as_dict() for event in events))
+
     @staticmethod
-    def _require_outbox_identity(
-        identity: ServiceIdentity, destination: str
-    ) -> None:
+    def _require_outbox_identity(identity: ServiceIdentity, destination: str) -> None:
         expected = {
             "projection": ServiceIdentity.PROJECTION_WORKER,
             "delivery": ServiceIdentity.DELIVERY_WORKER,
             "control": ServiceIdentity.ORCHESTRATOR,
         }[destination]
         if identity is not expected:
-            raise AuthorizationError(
-                f"{destination} outbox is restricted to {expected.value}"
-            )
+            raise AuthorizationError(f"{destination} outbox is restricted to {expected.value}")
 
     async def claim_outbox(self, request: OutboxClaimRequest) -> OutboxClaimResponse:
-        self._require_outbox_identity(
-            request.context.service_identity, request.destination
-        )
+        self._require_outbox_identity(request.context.service_identity, request.destination)
         records = await self._event_store.claim_outbox(
             request.destination,
             request.worker_id,
@@ -214,9 +260,7 @@ class SessionInternalService:
     async def disposition_outbox(
         self, request: OutboxDispositionRequest
     ) -> OutboxDispositionResponse:
-        self._require_outbox_identity(
-            request.context.service_identity, request.destination
-        )
+        self._require_outbox_identity(request.context.service_identity, request.destination)
         accepted = await self._event_store.disposition_outbox(
             request.destination,
             request.worker_id,

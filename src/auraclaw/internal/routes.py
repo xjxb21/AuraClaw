@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from auraclaw.action.mcp_internal_service import McpRegistryInternalService
+from auraclaw.action.skill_internal_service import SkillPublicationInternalService
 from auraclaw.admin.internal_service import OwnerAdminService
 from auraclaw.artifact.internal_service import ArtifactInternalService
 from auraclaw.contracts.internal import (
@@ -9,23 +10,41 @@ from auraclaw.contracts.internal import (
     ApprovalCommandRequest,
     ApprovalValidationResponse,
     ArtifactCreateUploadRequest,
+    ArtifactDeleteRequest,
+    ArtifactDeleteResponse,
     ArtifactDownloadRequest,
     ArtifactDownloadResponse,
     ArtifactFinalizeRequest,
     ArtifactFinalizeResponse,
+    ArtifactSkillOrphanClaimRequest,
+    ArtifactSkillOrphanClaimResponse,
+    ArtifactSkillOrphanResolveRequest,
+    ArtifactSkillOrphanResolveResponse,
+    ArtifactSkillPublicationBindRequest,
+    ArtifactSkillPublicationBindResponse,
+    ArtifactSkillPublicationClaimRequest,
+    ArtifactSkillPublicationClaimResponse,
     ArtifactUploadResponse,
+    AssignmentAbandonRequest,
+    AssignmentAbandonResponse,
     AssignmentClaimRequest,
     AssignmentClaimResponse,
     AssignmentDispositionRequest,
     AssignmentDispositionResponse,
+    AssignmentRenewRequest,
+    AssignmentRenewResponse,
     CancellationRequest,
     CancellationResponse,
     CheckpointResponse,
+    CollaborationCommandRequest,
+    CollaborationCommandResponse,
     CredentialInvokeRequest,
     CredentialInvokeResponse,
     CredentialResourceRequest,
     CredentialResourceResponse,
     LoadCheckpointRequest,
+    McpCapabilityTestRequest,
+    McpCapabilityTestResponse,
     McpEgressCommandRequest,
     McpEgressCommandResponse,
     McpRegistryAdminRequest,
@@ -53,6 +72,39 @@ from auraclaw.contracts.internal import (
     SessionAppendResponse,
     SessionFeedRequest,
     SessionFeedResponse,
+    SessionRootFeedRequest,
+    SessionRootFeedResponse,
+    SkillActiveBindingReferenceRequest,
+    SkillActiveBindingReferenceResponse,
+    SkillAdminSnapshotInternalRequest,
+    SkillAdminSnapshotInternalResponse,
+    SkillAdmissionListInternalRequest,
+    SkillAdmissionListInternalResponse,
+    SkillAdmissionMetricsInternalRequest,
+    SkillAdmissionMetricsInternalResponse,
+    SkillBindingReferenceRequest,
+    SkillBindingReferenceResponse,
+    SkillInstallationInternalRequest,
+    SkillInstallationInternalResponse,
+    SkillPackageStateInternalRequest,
+    SkillPackageStateInternalResponse,
+    SkillPublishArtifactInternalRequest,
+    SkillPublisherInternalResponse,
+    SkillPublisherRegisterInternalRequest,
+    SkillPublisherRevokeKeyInternalRequest,
+    SkillPublisherRotateKeyInternalRequest,
+    SkillPublisherStateInternalRequest,
+    SkillPublisherStatusInternalRequest,
+    SkillPublishInternalRequest,
+    SkillPublishInternalResponse,
+    SkillPurgeInternalRequest,
+    SkillPurgeInternalResponse,
+    SkillRestoreInternalRequest,
+    SkillRestoreInternalResponse,
+    SkillRevokeInternalRequest,
+    SkillRevokeInternalResponse,
+    SkillStateInternalRequest,
+    SkillStateInternalResponse,
     ValidateLeaseRequest,
     ValidateLeaseResponse,
 )
@@ -66,6 +118,7 @@ from auraclaw.internal.http import (
 )
 from auraclaw.model_gateway.internal_service import ModelGatewayInternalService
 from auraclaw.policy.internal_service import PolicyInternalService
+from auraclaw.session.collaboration_internal_service import CollaborationInternalService
 from auraclaw.session.internal_service import SessionInternalService
 
 
@@ -77,6 +130,19 @@ def session_routes(service: SessionInternalService) -> dict[str, ContractRoute]:
         "/internal/v1/session/feed": contract_route(
             SessionFeedRequest, SessionFeedResponse, service.feed
         ),
+        "/internal/v1/session/root-feed": contract_route(
+            SessionRootFeedRequest, SessionRootFeedResponse, service.root_feed
+        ),
+        "/internal/v1/session/skill-bindings/reference": contract_route(
+            SkillBindingReferenceRequest,
+            SkillBindingReferenceResponse,
+            service.skill_binding_reference,
+        ),
+        "/internal/v1/session/skill-bindings/active-reference": contract_route(
+            SkillActiveBindingReferenceRequest,
+            SkillActiveBindingReferenceResponse,
+            service.skill_active_binding_reference,
+        ),
         "/internal/v1/session/outbox/claim": contract_route(
             OutboxClaimRequest, OutboxClaimResponse, service.claim_outbox
         ),
@@ -85,6 +151,18 @@ def session_routes(service: SessionInternalService) -> dict[str, ContractRoute]:
             OutboxDispositionResponse,
             service.disposition_outbox,
         ),
+    }
+
+
+def collaboration_routes(
+    service: CollaborationInternalService,
+) -> dict[str, ContractRoute]:
+    return {
+        "/internal/v1/collaboration/command": contract_route(
+            CollaborationCommandRequest,
+            CollaborationCommandResponse,
+            service.command,
+        )
     }
 
 
@@ -109,6 +187,16 @@ def control_routes(service: ControlInternalService) -> dict[str, ContractRoute]:
             AssignmentDispositionRequest,
             AssignmentDispositionResponse,
             service.disposition_assignment,
+        ),
+        "/internal/v1/control/assignments/renew": contract_route(
+            AssignmentRenewRequest,
+            AssignmentRenewResponse,
+            service.renew_assignment,
+        ),
+        "/internal/v1/control/assignments/abandon": contract_route(
+            AssignmentAbandonRequest,
+            AssignmentAbandonResponse,
+            service.abandon_assignment,
         ),
         "/internal/v1/control/checkpoints/save": contract_route(
             SaveCheckpointRequest, CheckpointResponse, service.save_checkpoint
@@ -191,6 +279,11 @@ def mcp_registry_routes(
         "/snapshot": contract_route(
             McpRegistrySnapshotRequest, McpRegistrySnapshotResponse, service.snapshot
         ),
+        "/capability-test": contract_route(
+            McpCapabilityTestRequest,
+            McpCapabilityTestResponse,
+            service.test_capability,
+        ),
     }
 
 
@@ -204,6 +297,116 @@ def artifact_routes(service: ArtifactInternalService) -> dict[str, ContractRoute
         ),
         "/internal/v1/artifacts/download": contract_route(
             ArtifactDownloadRequest, ArtifactDownloadResponse, service.download
+        ),
+        "/internal/v1/artifacts/delete": contract_route(
+            ArtifactDeleteRequest, ArtifactDeleteResponse, service.delete
+        ),
+        "/internal/v1/artifacts/skills/claim-publication": contract_route(
+            ArtifactSkillPublicationClaimRequest,
+            ArtifactSkillPublicationClaimResponse,
+            service.claim_skill_publication,
+        ),
+        "/internal/v1/artifacts/skills/bind-publication": contract_route(
+            ArtifactSkillPublicationBindRequest,
+            ArtifactSkillPublicationBindResponse,
+            service.bind_skill_publication,
+        ),
+        "/internal/v1/artifacts/skills/orphans/claim": contract_route(
+            ArtifactSkillOrphanClaimRequest,
+            ArtifactSkillOrphanClaimResponse,
+            service.claim_skill_orphans,
+        ),
+        "/internal/v1/artifacts/skills/orphans/resolve": contract_route(
+            ArtifactSkillOrphanResolveRequest,
+            ArtifactSkillOrphanResolveResponse,
+            service.resolve_skill_orphan,
+        ),
+    }
+
+
+def skill_publication_routes(
+    service: SkillPublicationInternalService,
+) -> dict[str, ContractRoute]:
+    return {
+        "/admissions": contract_route(
+            SkillAdmissionListInternalRequest,
+            SkillAdmissionListInternalResponse,
+            service.list_admissions,
+        ),
+        "/admission-metrics": contract_route(
+            SkillAdmissionMetricsInternalRequest,
+            SkillAdmissionMetricsInternalResponse,
+            service.admission_metrics,
+        ),
+        "/publish": contract_route(
+            SkillPublishInternalRequest,
+            SkillPublishInternalResponse,
+            service.publish,
+        ),
+        "/publish-artifact": contract_route(
+            SkillPublishArtifactInternalRequest,
+            SkillPublishInternalResponse,
+            service.publish_artifact,
+        ),
+        "/installation": contract_route(
+            SkillInstallationInternalRequest,
+            SkillInstallationInternalResponse,
+            service.change_installation,
+        ),
+        "/revoke": contract_route(
+            SkillRevokeInternalRequest,
+            SkillRevokeInternalResponse,
+            service.revoke,
+        ),
+        "/restore": contract_route(
+            SkillRestoreInternalRequest,
+            SkillRestoreInternalResponse,
+            service.restore,
+        ),
+        "/package": contract_route(
+            SkillPackageStateInternalRequest,
+            SkillPackageStateInternalResponse,
+            service.package_state,
+        ),
+        "/purge": contract_route(
+            SkillPurgeInternalRequest,
+            SkillPurgeInternalResponse,
+            service.purge,
+        ),
+        "/state": contract_route(
+            SkillStateInternalRequest,
+            SkillStateInternalResponse,
+            service.state,
+        ),
+        "/publishers/register": contract_route(
+            SkillPublisherRegisterInternalRequest,
+            SkillPublisherInternalResponse,
+            service.register_publisher,
+        ),
+        "/publishers/rotate-key": contract_route(
+            SkillPublisherRotateKeyInternalRequest,
+            SkillPublisherInternalResponse,
+            service.rotate_publisher_key,
+        ),
+        "/publishers/revoke-key": contract_route(
+            SkillPublisherRevokeKeyInternalRequest,
+            SkillPublisherInternalResponse,
+            service.revoke_publisher_key,
+        ),
+        "/publishers/status": contract_route(
+            SkillPublisherStatusInternalRequest,
+            SkillPublisherInternalResponse,
+            service.change_publisher_status,
+        ),
+        "/publishers/state": contract_route(
+            SkillPublisherStateInternalRequest,
+            SkillPublisherInternalResponse,
+            service.publisher_state,
+        ),
+        "/admin-snapshot": contract_route(
+            SkillAdminSnapshotInternalRequest,
+            SkillAdminSnapshotInternalResponse,
+            service.admin_snapshot,
         ),
     }
 

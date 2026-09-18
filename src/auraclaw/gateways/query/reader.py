@@ -1,7 +1,13 @@
 from typing import Any, Protocol
 
+from auraclaw.contracts.approval_mode import ApprovalConfiguration
 from auraclaw.contracts.errors import NotFoundError
 from auraclaw.contracts.events import CanonicalEvent
+from auraclaw.gateways.query.activity import (
+    ACTIVITY_EVENT_TYPES,
+    build_activity,
+    page_activity,
+)
 from auraclaw.gateways.query.transcript import TRANSCRIPT_EVENT_TYPES, build_transcript
 from auraclaw.projection.ports import CollaborationReader, TaskReader
 
@@ -65,6 +71,10 @@ class TaskQueryService:
     async def get_result(self, tenant_id: str, session_id: str) -> dict[str, Any]:
         task = await self.get_task(tenant_id, session_id)
         return {
+            **{
+                key: task.get(key, value)
+                for key, value in ApprovalConfiguration().public_dict().items()
+            },
             "session_id": session_id,
             "run_id": task["run_id"],
             "status": task["run_status"],
@@ -89,10 +99,44 @@ class TaskQueryService:
         )
         transcript = build_transcript(events)
         return {
+            **{
+                key: task.get(key, value)
+                for key, value in ApprovalConfiguration().public_dict().items()
+            },
             "session_id": session_id,
             "projection_version": task["projection_version"],
             "status": task["status"],
             "run_status": task["run_status"],
             "messages": transcript["messages"],
             "pending_approval": transcript["pending_approval"],
+        }
+
+    async def get_activity(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        after_version: int = 0,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        task = await self.get_task(tenant_id, session_id)
+        events = await self._events.load(
+            tenant_id,
+            session_id,
+            event_types=tuple(sorted(ACTIVITY_EVENT_TYPES)),
+        )
+        source_version = max(
+            (event.aggregate_version for event in events),
+            default=int(task["projection_version"]),
+        )
+        page = page_activity(build_activity(events), after_version=after_version, limit=limit)
+        return {
+            **{
+                key: task.get(key, value)
+                for key, value in ApprovalConfiguration().public_dict().items()
+            },
+            "session_id": session_id,
+            "projection_version": int(task["projection_version"]),
+            "source_version": source_version,
+            **page,
         }

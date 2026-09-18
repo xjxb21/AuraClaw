@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -8,6 +9,7 @@ from auraclaw.contracts.collaboration import (
     ChildSpec,
     CollaborationLimits,
     CollaborationRole,
+    OutputContract,
     ReviewResult,
 )
 from auraclaw.contracts.commands import CommandContext
@@ -15,6 +17,7 @@ from auraclaw.contracts.errors import AuthorizationError, CollaborationValidatio
 from auraclaw.contracts.events import NewEvent
 from auraclaw.contracts.state import Visibility
 from auraclaw.domain.collaboration import CollaborationAggregate, CollaborationNode
+from auraclaw.domain.session import SessionAggregate
 from auraclaw.session.ports import EventStore, OutboxRelayPort
 
 
@@ -33,7 +36,7 @@ class CollaborationService:
         self._limits = limits or CollaborationLimits()
 
     async def graph(self, tenant_id: str, root_session_id: str) -> CollaborationAggregate:
-        events = await self._events.load_all(tenant_id)
+        events = await self._events.load_root(tenant_id, root_session_id)
         return CollaborationAggregate.from_events(tenant_id, root_session_id, events)
 
     async def create_child(
@@ -56,6 +59,7 @@ class CollaborationService:
                 or existing.output_contract != spec.output_contract
                 or existing.dependency_ids != spec.dependency_ids
                 or existing.budget != spec.budget
+                or not _same_child_budget(existing.runtime_budget, spec.runtime_budget)
             ):
                 raise CollaborationValidationError(
                     "existing child task_key was reused with a different specification"
@@ -73,8 +77,15 @@ class CollaborationService:
             spec=spec,
             limits=self._limits,
         )
+        parent = SessionAggregate.from_events(
+            await self._events.load(context.tenant_id, parent_session_id)
+        )
+        inherited = parent.approval.model_copy(
+            update={"approval_mode_source": "inherited"}
+        ).public_dict()
         target_session_id = spec.metadata.get("target_session_id")
         payload = {
+            "approval": inherited,
             "task_key": spec.task_key,
             "root_session_id": root_session_id,
             "parent_session_id": parent_session_id,
@@ -85,6 +96,7 @@ class CollaborationService:
             "dependency_ids": list(spec.dependency_ids),
             "tool_permissions": list(spec.tool_permissions),
             "budget": spec.budget,
+            "runtime_budget": dict(spec.runtime_budget),
             "target_session_id": target_session_id,
             "metadata": dict(spec.metadata),
         }
@@ -105,7 +117,7 @@ class CollaborationService:
                 NewEvent(
                     type="run.requested",
                     visibility=Visibility.INTERNAL,
-                    payload={"run_id": f"run_{child_session_id[4:]}"},
+                    payload={"run_id": f"run_{child_session_id[4:]}", "approval": inherited},
                 ),
             ],
             command_result=response,
@@ -208,10 +220,21 @@ class CollaborationService:
             graph=graph,
             session_id=child_session_id,
             context=context,
-            event=NewEvent(
-                type="child.result_published",
-                visibility=Visibility.USER,
-                payload=payload,
+            event=(
+                NewEvent(
+                    type="child.result_published",
+                    visibility=Visibility.USER,
+                    payload=payload,
+                ),
+                NewEvent(
+                    type="run.completed",
+                    visibility=Visibility.USER,
+                    payload={
+                        "run_id": node.run_id,
+                        "result_summary": child_result.summary,
+                        "result_ref": child_result.result_ref,
+                    },
+                ),
             ),
             response={"session_id": child_session_id, "status": "completed", **payload},
         )
@@ -247,8 +270,77 @@ class CollaborationService:
             graph=graph,
             session_id=review_session_id,
             context=context,
-            event=NewEvent(type="review.completed", visibility=Visibility.USER, payload=payload),
+            event=(
+                NewEvent(
+                    type="review.completed",
+                    visibility=Visibility.USER,
+                    payload=payload,
+                ),
+                NewEvent(
+                    type="run.completed",
+                    visibility=Visibility.USER,
+                    payload={
+                        "run_id": node.run_id,
+                        "result_summary": review.decision.value,
+                    },
+                ),
+            ),
             response={"session_id": review_session_id, "status": "completed", **payload},
+        )
+
+    async def request_review(
+        self,
+        *,
+        root_session_id: str,
+        parent_session_id: str,
+        task_key: str,
+        target_session_id: str,
+        goal: str,
+        budget: float,
+        runtime_budget: dict[str, int | float | None],
+        context: CommandContext,
+    ) -> dict[str, Any]:
+        graph = await self.graph(context.tenant_id, root_session_id)
+        self._require_child(graph, target_session_id)
+        return await self.create_child(
+            root_session_id=root_session_id,
+            parent_session_id=parent_session_id,
+            spec=ChildSpec(
+                task_key=task_key,
+                role=CollaborationRole.REVIEWER,
+                goal=goal,
+                output_contract=OutputContract(required_fields=()),
+                dependency_ids=(target_session_id,),
+                budget=budget,
+                runtime_budget=runtime_budget,
+                metadata={"target_session_id": target_session_id},
+            ),
+            context=context,
+        )
+
+    async def cancel_child(
+        self,
+        *,
+        root_session_id: str,
+        child_session_id: str,
+        reason: str,
+        context: CommandContext,
+    ) -> dict[str, Any]:
+        self._require_coordinator(context)
+        graph = await self.graph(context.tenant_id, root_session_id)
+        node = self._require_child(graph, child_session_id)
+        if node.status in {"completed", "cancelled"}:
+            return {"session_id": child_session_id, "status": node.status}
+        return await self._append(
+            graph=graph,
+            session_id=child_session_id,
+            context=context,
+            event=NewEvent(
+                type="run.cancelled",
+                visibility=Visibility.USER,
+                payload={"run_id": node.run_id, "reason": reason},
+            ),
+            response={"session_id": child_session_id, "status": "cancelled"},
         )
 
     async def join(
@@ -308,7 +400,7 @@ class CollaborationService:
         result = await self._events.append(
             root_session_id=root_session_id,
             session_id=root_session_id,
-            run_id=None,
+            run_id=graph.nodes[root_session_id].run_id,
             context=context,
             events=[
                 NewEvent(
@@ -321,9 +413,7 @@ class CollaborationService:
                     payload={
                         "result_summary": result_summary,
                         "result_ref": result_ref,
-                        "artifact_refs": [
-                            item["artifact_ref"] for item in artifact_lineage
-                        ],
+                        "artifact_refs": [item["artifact_ref"] for item in artifact_lineage],
                         "lineage": lineage,
                     },
                 ),
@@ -339,16 +429,16 @@ class CollaborationService:
         graph: CollaborationAggregate,
         session_id: str,
         context: CommandContext,
-        event: NewEvent,
+        event: NewEvent | Sequence[NewEvent],
         response: dict[str, Any],
     ) -> dict[str, Any]:
-        current = await self._events.load(context.tenant_id, session_id)
+        events = [event] if isinstance(event, NewEvent) else list(event)
         result = await self._events.append(
             root_session_id=graph.root_session_id,
             session_id=session_id,
-            run_id=current[-1].run_id if current else None,
+            run_id=graph.nodes[session_id].run_id,
             context=context,
-            events=[event],
+            events=events,
             command_result=response,
         )
         await self._relay.relay_once()
@@ -365,9 +455,7 @@ class CollaborationService:
             raise AuthorizationError("only a Coordinator can change the Task DAG")
 
     @staticmethod
-    def _require_child(
-        graph: CollaborationAggregate, child_session_id: str
-    ) -> CollaborationNode:
+    def _require_child(graph: CollaborationAggregate, child_session_id: str) -> CollaborationNode:
         node = graph.nodes.get(child_session_id)
         if node is None or node.role is CollaborationRole.ROOT:
             raise CollaborationValidationError("Child must belong to the same Root and tenant")
@@ -399,3 +487,11 @@ class ReviewerRole:
 
     async def publish(self, **kwargs: Any) -> dict[str, Any]:
         return await self._service.publish_review(**kwargs)
+
+
+def _same_child_budget(stored: dict[str, Any], requested: dict[str, Any]) -> bool:
+    if stored.get("policy_version") != "2":
+        return stored == requested
+    expected = {"max_steps": 48, "max_output_tokens": 8192, **requested}
+    actual = {k: v for k, v in stored.items() if k not in {"policy_version", "scope_id"}}
+    return actual == expected

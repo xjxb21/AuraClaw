@@ -7,7 +7,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
-java_mcp_study/
+
 # Virtual environments and package output
 .venv/
 venv/
@@ -29,13 +29,16 @@ logs/
 !.vscode/launch.json
 !.vscode/tasks.json
 .history/
-.claude/
+
 # Secrets
 .env
 .env.*
 !.env.dev.example
 !.env.test.example
 !.env.prod.example
+.postgresql.env
+.postgresql.local.env
+!.postgresql.env.example
 .host.env
 .chaintower
 .eng.debug

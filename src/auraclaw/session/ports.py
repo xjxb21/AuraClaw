@@ -48,6 +48,27 @@ class EventStore(Protocol):
 
     async def load_all(self, tenant_id: str | None = None) -> list[CanonicalEvent]: ...
 
+    async def has_skill_package_reference(
+        self, tenant_id: str, package_digest: str
+    ) -> bool: ...
+
+    async def has_active_skill_reference(
+        self,
+        tenant_id: str,
+        publisher: str,
+        name: str,
+        package_digest: str | None = None,
+    ) -> bool: ...
+
+    async def load_root(
+        self,
+        tenant_id: str,
+        root_session_id: str,
+        *,
+        event_types: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> list[CanonicalEvent]: ...
+
     async def get_snapshot(self, tenant_id: str, session_id: str) -> SessionSnapshot | None: ...
 
     async def save_snapshot(self, snapshot: SessionSnapshot) -> None: ...
@@ -94,5 +115,10 @@ class AdmissionController(Protocol):
 
 class HumanApprovalNotifier(Protocol):
     async def record_human_response(
-        self, record: ApprovalRecord, *, decision: str, feedback: str | None
+        self,
+        record: ApprovalRecord,
+        *,
+        decision: str,
+        feedback: str | None,
+        actor_id: str | None = None,
     ) -> None: ...

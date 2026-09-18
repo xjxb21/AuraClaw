@@ -11,20 +11,24 @@ from auraclaw.action.capability_catalog import (
     InMemoryCapabilityCatalogStore,
 )
 from auraclaw.action.hands import HandsGateway
-from auraclaw.action.mcp_primitives import McpResourceRegistry
+from auraclaw.action.mcp_primitives import (
+    McpResourceRegistry,
+    RegisteredResource,
+)
 from auraclaw.action.ports import PolicyEvaluation
 from auraclaw.action.skill_packages import (
     HmacSkillSignatureVerifier,
     SkillPackage,
     SkillPackageRegistry,
     SkillResolver,
+    skill_capability_descriptor,
+    skill_signing_payload,
 )
 from auraclaw.action.tool_gateway import ToolRegistry
 from auraclaw.contracts.capabilities import (
     CapabilityDescriptor,
     CapabilityKind,
     CapabilityStatus,
-    CapabilityTrustLevel,
     McpServerDefinition,
 )
 from auraclaw.contracts.errors import (
@@ -32,6 +36,7 @@ from auraclaw.contracts.errors import (
     SchemaValidationError,
     VersionConflictError,
 )
+from auraclaw.contracts.hands import HandsResourceContent, HandsResourceDescriptor
 from auraclaw.contracts.skills import (
     SkillManifest,
     SkillRequirement,
@@ -125,6 +130,12 @@ def _package(
     )
 
 
+def test_legacy_hmac_signing_payload_omits_empty_key_identity() -> None:
+    verifier = HmacSkillSignatureVerifier({"platform": _PUBLISHER_KEY})
+    payload = json.loads(skill_signing_payload(_package(verifier)))
+    assert "signature_key_id" not in payload["manifest"]
+
+
 def _descriptor(
     capability_id: str,
     kind: CapabilityKind,
@@ -141,7 +152,6 @@ def _descriptor(
         version=version,
         content_digest=f"sha256:{capability_id.encode().hex().ljust(64, '0')[:64]}",
         title=canonical_name,
-        trust_level=CapabilityTrustLevel.PLATFORM,
         status=CapabilityStatus.ACTIVE,
         updated_at=datetime.now(UTC),
         metadata=metadata or {},
@@ -165,9 +175,7 @@ def _dependency_package(
         signature=f"hmac-sha256:{'0' * 64}",
     )
     files = {"SKILL.md": f"# {name}".encode()}
-    manifest = unsigned.model_copy(
-        update={"signature": verifier.sign(unsigned, files)}
-    )
+    manifest = unsigned.model_copy(update={"signature": verifier.sign(unsigned, files)})
     return SkillPackage(
         manifest=manifest,
         files={
@@ -188,8 +196,17 @@ def test_skill_package_publish_is_signed_immutable_and_progressively_loadable() 
         )
         package = _package(verifier)
         publication = await registry.publish("tenant-a", package)
+        model_contract = skill_capability_descriptor(publication).metadata[
+            "model_contract"
+        ]
 
         assert publication.package_digest.startswith("sha256:")
+        assert model_contract["required_tools"] == [
+            {"name": "github.pull_request.get", "version": ">=2,<3"}
+        ]
+        assert model_contract["required_resources"] == [
+            {"uri_template": "repo://{repo}/release-policy"}
+        ]
         assert publication.artifact_ref.media_type == (
             "application/vnd.auraclaw.skill-package+json"
         )
@@ -264,6 +281,66 @@ def test_skill_package_publish_is_signed_immutable_and_progressively_loadable() 
     asyncio.run(scenario())
 
 
+def test_same_skill_coordinates_are_isolated_by_tenant() -> None:
+    async def scenario() -> None:
+        verifier = HmacSkillSignatureVerifier({"platform": _PUBLISHER_KEY})
+        resources = McpResourceRegistry()
+        registry = SkillPackageRegistry(
+            artifacts=_artifacts(),
+            signature_verifier=verifier,
+            resources=resources,
+        )
+        uri = "skill://platform/release.prepare/1.4.0/SKILL.md"
+
+        await registry.publish(
+            "tenant-a",
+            _package(verifier, instructions="# Tenant A"),
+        )
+        await registry.publish(
+            "tenant-b",
+            _package(verifier, instructions="# Tenant B"),
+        )
+
+        assert resources.read("tenant-a", uri)[0].text == "# Tenant A"
+        assert resources.read("tenant-b", uri)[0].text == "# Tenant B"
+
+        registry.forget_package("tenant-a", "platform", "release.prepare", "1.4.0")
+
+        with pytest.raises(KeyError, match="Resource not found"):
+            resources.read("tenant-a", uri)
+        assert resources.read("tenant-b", uri)[0].text == "# Tenant B"
+
+    asyncio.run(scenario())
+
+
+def test_resource_registration_failure_does_not_publish_partial_state() -> None:
+    async def scenario() -> None:
+        verifier = HmacSkillSignatureVerifier({"platform": _PUBLISHER_KEY})
+        resources = McpResourceRegistry()
+        uri = "skill://platform/release.prepare/1.4.0/SKILL.md"
+        resources.register_resource(
+            RegisteredResource(
+                descriptor=HandsResourceDescriptor(uri=uri, name="existing"),
+                contents=(HandsResourceContent(uri=uri, text="existing"),),
+                tenant_ids=("tenant-a",),
+            )
+        )
+        registry = SkillPackageRegistry(
+            artifacts=_artifacts(),
+            signature_verifier=verifier,
+            resources=resources,
+        )
+
+        with pytest.raises(ValueError, match="Resource already registered"):
+            await registry.publish("tenant-a", _package(verifier))
+
+        assert registry.list_publications("tenant-a") == ()
+        assert registry.candidates("tenant-a", "release.prepare") == ()
+        assert resources.read("tenant-a", uri)[0].text == "existing"
+
+    asyncio.run(scenario())
+
+
 def test_skill_package_rejects_invalid_signature_and_unsafe_paths() -> None:
     async def scenario() -> None:
         verifier = HmacSkillSignatureVerifier({"platform": _PUBLISHER_KEY})
@@ -305,7 +382,6 @@ def test_skill_resolver_pins_highest_compatible_dependencies() -> None:
                 server_id="server-platform",
                 title="Platform capabilities",
                 endpoint="https://platform.example/mcp",
-                trust_level=CapabilityTrustLevel.PLATFORM,
                 status=CapabilityStatus.ACTIVE,
                 enabled=True,
             )
@@ -349,7 +425,7 @@ def test_skill_resolver_pins_highest_compatible_dependencies() -> None:
             tenant_id="tenant-a",
             name="release.prepare",
             version=">=1.4,<2",
-            role="worker",
+            role="repair",
             policy_version="policy-42",
             subject="runtime-1",
             correlation_id="run-1",
@@ -361,9 +437,10 @@ def test_skill_resolver_pins_highest_compatible_dependencies() -> None:
         assert binding.resolved_resources[0].capability_id == "cap-resource"
         assert binding.policy_version == "policy-43"
         assert binding.policy_decision_id == "skill-policy-1"
-        assert skill_policy.attributes["active_skill_names"] == [
-            "audit.prepare"
-        ]
+        assert skill_policy.attributes["active_skill_names"] == ["audit.prepare"]
+        assert skill_policy.attributes["role"] == "worker"
+        assert skill_policy.attributes["assignment_role"] == "repair"
+        assert skill_policy.attributes["effective_skill_role"] == "worker"
 
         denied_package = _package(verifier, version="2.0.0")
         denied_manifest = denied_package.manifest.model_copy(
@@ -393,7 +470,7 @@ def test_skill_resolver_pins_highest_compatible_dependencies() -> None:
                 tenant_id="tenant-a",
                 name="release.prepare",
                 version="2.0.0",
-                role="worker",
+                role="reviewer",
                 policy_version="policy-42",
             )
 
@@ -410,9 +487,7 @@ def test_skill_resolver_flattens_child_skills_and_rejects_cycles() -> None:
         child = _dependency_package(
             verifier,
             name="data.validate",
-            required_tools=(
-                SkillToolRequirement(name="data.scope.profile", version="1.0.0"),
-            ),
+            required_tools=(SkillToolRequirement(name="data.scope.profile", version="1.0.0"),),
         )
         parent = _dependency_package(
             verifier,
@@ -434,7 +509,6 @@ def test_skill_resolver_flattens_child_skills_and_rejects_cycles() -> None:
                 server_id="server-platform",
                 title="Platform capabilities",
                 endpoint="https://platform.example/mcp",
-                trust_level=CapabilityTrustLevel.PLATFORM,
                 status=CapabilityStatus.ACTIVE,
                 enabled=True,
             )
@@ -453,15 +527,11 @@ def test_skill_resolver_flattens_child_skills_and_rejects_cycles() -> None:
         binding = await SkillResolver(registry, store).resolve(
             tenant_id="tenant-a",
             name="scenario.analyze",
-            role="worker",
+            role="repair",
             policy_version="policy-1",
         )
-        assert [item.skill_name for item in binding.resolved_skills] == [
-            "data.validate"
-        ]
-        assert [item.canonical_name for item in binding.resolved_tools] == [
-            "data.scope.profile"
-        ]
+        assert [item.skill_name for item in binding.resolved_skills] == ["data.validate"]
+        assert [item.canonical_name for item in binding.resolved_tools] == ["data.scope.profile"]
 
         cycle_a = _dependency_package(
             verifier,

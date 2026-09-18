@@ -2,20 +2,28 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
 
 import httpx
 
 from auraclaw.contracts.errors import VersionConflictError
 from auraclaw.contracts.events import CanonicalEvent, NewEvent
 from auraclaw.contracts.internal import (
+    AssignmentAbandonRequest,
+    AssignmentAbandonResponse,
     AssignmentClaimRequest,
     AssignmentClaimResponse,
     AssignmentDispositionRequest,
     AssignmentDispositionResponse,
+    AssignmentRenewRequest,
+    AssignmentRenewResponse,
     CancellationRequest,
     CancellationResponse,
     CheckpointResponse,
     CheckpointState,
+    CollaborationCommandRequest,
+    CollaborationCommandResponse,
     EventInput,
     InternalRequestContext,
     LoadCheckpointRequest,
@@ -124,7 +132,6 @@ class RemoteRuntimeSessionClient:
             SessionFeedResponse,
         )
         return [canonical_event_from_dict(event) for event in response.events]
-
     async def append(
         self,
         assignment: RuntimeAssignment,
@@ -199,6 +206,51 @@ class RemoteRuntimeSessionClient:
             SessionAppendResponse,
         )
         return [canonical_event_from_dict(event) for event in response.events]
+
+
+class RemoteCollaborationClient:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        bearer_token: str,
+        timeout: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._client = httpx.AsyncClient(
+            base_url=base_url, timeout=timeout, transport=transport
+        )
+        self._contract = HttpContractClient(self._client, bearer_token=bearer_token)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def execute(
+        self,
+        assignment: RuntimeAssignment,
+        *,
+        operation: str,
+        arguments: dict[str, Any],
+        command_id: str,
+    ) -> dict[str, Any]:
+        if assignment.lease_assertion is None:
+            raise RuntimeError("Runtime assignment has no signed lease assertion")
+        response = await self._contract.call(
+            "/internal/v1/collaboration/command",
+            CollaborationCommandRequest(
+                context=_context(
+                    assignment.tenant_id, command_id, assignment.run_id
+                ),
+                lease_assertion=assignment.lease_assertion,
+                root_session_id=assignment.root_session_id,
+                session_id=assignment.session_id,
+                command_id=command_id,
+                operation=operation,
+                arguments=dict(arguments),
+            ),
+            CollaborationCommandResponse,
+        )
+        return dict(response.result)
 
 
 class RemoteOrchestratorSessionClient:
@@ -329,6 +381,7 @@ class RemoteRuntimeControlClient:
         role: str,
         node_id: str,
         capacity: int,
+        registration_id: str | None = None,
         timeout: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -336,6 +389,7 @@ class RemoteRuntimeControlClient:
         self.role = role
         self.node_id = node_id
         self.capacity = capacity
+        self.registration_id = registration_id or uuid4().hex
         self._client = httpx.AsyncClient(
             base_url=base_url, timeout=timeout, transport=transport
         )
@@ -352,9 +406,11 @@ class RemoteRuntimeControlClient:
                 context=_context("system", f"register:{self.runtime_id}", self.runtime_id),
                 runtime_id=self.runtime_id,
                 runtime_type="agent",
+                capabilities={"runtime_governance_v2": True},
                 role=self.role,
                 node_id=self.node_id,
                 capacity=self.capacity,
+                registration_id=self.registration_id,
             ),
             RuntimeHeartbeatResponse,
         )
@@ -366,6 +422,7 @@ class RemoteRuntimeControlClient:
                 context=_context("system", f"heartbeat:{self.runtime_id}", self.runtime_id),
                 runtime_id=self.runtime_id,
                 capacity_available=self.capacity,
+                registration_id=self.registration_id,
             ),
             RuntimeHeartbeatResponse,
         )
@@ -377,6 +434,7 @@ class RemoteRuntimeControlClient:
                 context=_context("system", f"claim:{self.runtime_id}", self.runtime_id),
                 runtime_id=self.runtime_id,
                 role=self.role,
+                registration_id=self.registration_id,
                 limit=limit,
             ),
             AssignmentClaimResponse,
@@ -398,6 +456,7 @@ class RemoteRuntimeControlClient:
                 budget=RuntimeBudget(
                     max_steps=int(budget.get("max_steps", DEFAULT_RUNTIME_MAX_STEPS)),
                     max_output_tokens=int(budget.get("max_output_tokens", 8192)),
+                    policy_version=str(budget.get("policy_version", "1")),
                     max_cost=(
                         float(budget["max_cost"])
                         if budget.get("max_cost") is not None
@@ -408,12 +467,41 @@ class RemoteRuntimeControlClient:
                 lease_assertion=record.lease_assertion,
                 user_id=record.lease_assertion.user_id,
                 dept_id=record.lease_assertion.dept_id,
+                execution_claim_token=record.execution_claim_token,
+                execution_claim_expires_at=record.execution_claim_expires_at,
             )
             self._assignments[
                 (assignment.tenant_id, assignment.session_id, assignment.run_id)
             ] = (record.task_id, assignment)
             assignments.append(assignment)
         return assignments
+
+    async def renew_assignment(self, assignment: RuntimeAssignment) -> None:
+        task_id, _ = self._assignment(
+            assignment.tenant_id, assignment.session_id, assignment.run_id
+        )
+        if assignment.execution_claim_token is None:
+            raise RuntimeError("Runtime assignment has no execution claim")
+        response = await self._contract.call(
+            "/internal/v1/control/assignments/renew",
+            AssignmentRenewRequest(
+                context=_context(
+                    assignment.tenant_id,
+                    f"renew:{task_id}",
+                    assignment.run_id,
+                ),
+                task_id=task_id,
+                runtime_id=assignment.runtime_id,
+                registration_id=self.registration_id,
+                execution_claim_token=assignment.execution_claim_token,
+                lease_id=assignment.lease_id,
+                fencing_token=assignment.fencing_token,
+            ),
+            AssignmentRenewResponse,
+        )
+        assignment.lease_assertion = response.lease_assertion
+        assignment.lease_expires_at = response.lease_assertion.expires_at
+        assignment.execution_claim_expires_at = response.execution_claim_expires_at
 
     def _assignment(
         self, tenant_id: str, session_id: str, run_id: str
@@ -527,6 +615,107 @@ class RemoteRuntimeControlClient:
                 fencing_token=entry.fencing_token,
                 disposition=disposition,
                 outcome=outcome,
+                execution_claim_token=entry.execution_claim_token or "",
+            ),
+            AssignmentDispositionResponse,
+        )
+        for key, (known_task_id, _) in list(self._assignments.items()):
+            if known_task_id == task_id:
+                self._assignments.pop(key, None)
+
+    async def abandon_assignment(
+        self,
+        task_id: str,
+        *,
+        runtime_id: str,
+        lease_id: str,
+        fencing_token: int,
+    ) -> bool:
+        entry = next(
+            (
+                assignment
+                for known_task_id, assignment in self._assignments.values()
+                if known_task_id == task_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise RuntimeError("Runtime does not own this task")
+        response = await self._contract.call(
+            "/internal/v1/control/assignments/abandon",
+            AssignmentAbandonRequest(
+                context=_context(entry.tenant_id, f"abandon:{task_id}", entry.run_id),
+                task_id=task_id,
+                runtime_id=runtime_id,
+                lease_id=lease_id,
+                fencing_token=fencing_token,
+                execution_claim_token=entry.execution_claim_token,
+            ),
+            AssignmentAbandonResponse,
+        )
+        if response.accepted:
+            for key, (known_task_id, _) in list(self._assignments.items()):
+                if known_task_id == task_id:
+                    self._assignments.pop(key, None)
+        return response.accepted
+
+    async def suspend_assignment(self, task_id: str, reason: str) -> None:
+        entry = next(
+            (
+                assignment
+                for known_task_id, assignment in self._assignments.values()
+                if known_task_id == task_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise RuntimeError("Runtime does not own this task")
+        await self._contract.call(
+            "/internal/v1/control/assignments/disposition",
+            AssignmentDispositionRequest(
+                context=_context(entry.tenant_id, f"suspend:{task_id}", entry.run_id),
+                task_id=task_id,
+                runtime_id=entry.runtime_id,
+                lease_id=entry.lease_id,
+                fencing_token=entry.fencing_token,
+                disposition="suspend",
+                outcome=reason,
+                execution_claim_token=entry.execution_claim_token or "",
+            ),
+            AssignmentDispositionResponse,
+        )
+
+    async def suspend_with_checkpoint(
+        self,
+        task_id: str,
+        checkpoint: RuntimeCheckpoint,
+        reason: str,
+    ) -> None:
+        entry = next(
+            (
+                assignment
+                for known_task_id, assignment in self._assignments.values()
+                if known_task_id == task_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise RuntimeError("Runtime does not own this task")
+        await self._contract.call(
+            "/internal/v1/control/assignments/disposition",
+            AssignmentDispositionRequest(
+                context=_context(entry.tenant_id, f"suspend:{task_id}", entry.run_id),
+                task_id=task_id,
+                runtime_id=entry.runtime_id,
+                lease_id=entry.lease_id,
+                fencing_token=entry.fencing_token,
+                disposition="suspend",
+                outcome=reason,
+                execution_claim_token=entry.execution_claim_token or "",
+                checkpoint_state=CheckpointState(
+                    phase=checkpoint.phase,
+                    harness_state=dict(checkpoint.state),
+                ),
             ),
             AssignmentDispositionResponse,
         )

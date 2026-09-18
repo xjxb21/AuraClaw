@@ -32,6 +32,7 @@ from auraclaw.infrastructure.projection.postgres_task_store import PostgresTaskP
 from auraclaw.observability.service import ObservabilityProjector, ObservabilityService
 from auraclaw.projection.approval.projector import CompositeProjection, InMemoryApprovalProjection
 from auraclaw.projection.collaboration.projector import InMemoryCollaborationProjection
+from auraclaw.projection.ports import ProjectionWriter
 from auraclaw.projection.relay import OutboxRelay
 from auraclaw.projection.task.projector import InMemoryTaskProjection
 from auraclaw.runtime.model_gateway import ModelGateway, StaticCredentialResolver
@@ -78,22 +79,29 @@ def get_collaboration_projection() -> CollaborationProjection:
     return InMemoryCollaborationProjection()
 
 
+def session_outbox_projectors() -> tuple[ProjectionWriter, ...]:
+    """Projectors that must consume Session outbox in every topology."""
+    return (
+        get_task_projection(),
+        get_approval_projection(),
+        get_collaboration_projection(),
+    )
+
+
 @lru_cache
 def get_task_service() -> TaskService:
     projection = get_task_projection()
     approvals = get_approval_projection()
-    collaboration = get_collaboration_projection()
     event_store = get_event_store()
     relay = OutboxRelay(
         event_store,
         CompositeProjection(
-            projection,
-            approvals,
-            collaboration,
+            *session_outbox_projectors(),
             ObservabilityProjector(get_observability_service()),
         ),
     )
     return TaskService(
+        runtime_budget=get_settings().runtime_budget_snapshot(),
         event_store=event_store,
         relay=relay,
         reader=projection,
@@ -166,13 +174,18 @@ def get_runtime_event_publisher() -> SDKRuntimeEventPublisher:
     replay = get_runtime_replay_bus()
     allocator = (
         replay
-        if not settings.kafka_enabled and isinstance(replay, PostgresRuntimeEventStore)
+        if isinstance(replay, PostgresRuntimeEventStore)
         else None
     )
     sdk = RuntimeEventProducerSDK(
         producer,
         sequence_allocator=allocator,
         delta_flush_bytes=1,
+        max_concurrent=settings.runtime_event_publish_max_concurrent,
+        max_queued=settings.runtime_event_publish_max_queued,
+        queue_timeout_seconds=settings.runtime_event_publish_queue_timeout_seconds,
+        publish_timeout_seconds=settings.runtime_event_publish_timeout_seconds,
+        metric_writer=get_observability_store(),
     )
     return SDKRuntimeEventPublisher(sdk)
 
@@ -192,7 +205,12 @@ def get_streaming_ingestor() -> KafkaStreamingIngestor | None:
 
 @lru_cache
 def get_streaming_gateway() -> StreamingGateway:
-    return StreamingGateway(reader=get_task_projection(), bus=get_runtime_replay_bus())
+    settings = get_settings()
+    return StreamingGateway(
+        reader=get_task_projection(),
+        bus=get_runtime_replay_bus(),
+        delta_min_interval=settings.stream_delta_min_interval_seconds,
+    )
 
 
 @lru_cache
@@ -209,6 +227,7 @@ def get_model_gateway() -> ModelClient:
         name=settings.model_provider,
         timeout_seconds=settings.model_timeout_seconds,
         thinking_enabled=settings.model_thinking_enabled,
+        prompt_cache_key_enabled=settings.model_prompt_cache_key_enabled,
     )
     return ModelGateway(
         (adapter,),

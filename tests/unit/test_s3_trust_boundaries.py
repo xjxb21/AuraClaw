@@ -13,7 +13,11 @@ from auraclaw.artifact.internal_service import ArtifactInternalService
 from auraclaw.composition.services import create_service_app
 from auraclaw.config import Settings
 from auraclaw.contracts.commands import CommandContext
-from auraclaw.contracts.errors import AuraClawError
+from auraclaw.contracts.errors import (
+    ApprovalValidationError,
+    AuraClawError,
+    CredentialAccessError,
+)
 from auraclaw.contracts.events import Actor, NewEvent
 from auraclaw.contracts.hands import HANDS_TOOLS_LIST
 from auraclaw.contracts.internal import (
@@ -21,6 +25,7 @@ from auraclaw.contracts.internal import (
     AssignmentClaimResponse,
     AssignmentDispositionRequest,
     AssignmentDispositionResponse,
+    CredentialInvokeRequest,
     InternalRequestContext,
     LeaseAssertion,
     RuntimeHeartbeatResponse,
@@ -38,7 +43,7 @@ from auraclaw.contracts.tools import (
 from auraclaw.control.internal_service import ControlInternalService
 from auraclaw.control.ports import RunnableItem, RuntimeAssignment
 from auraclaw.credential_proxy.internal_service import CredentialProxyInternalService
-from auraclaw.infrastructure.artifacts.seaweedfs import SeaweedFSS3Presigner
+from auraclaw.infrastructure.artifacts.s3 import S3CompatiblePresigner
 from auraclaw.infrastructure.clients.artifact import RemoteArtifactWriter
 from auraclaw.infrastructure.clients.credential import RemoteCredentialProxy
 from auraclaw.infrastructure.clients.model import RemoteModelClient
@@ -193,19 +198,15 @@ async def test_session_http_rejects_unknown_workload_token() -> None:
     await remote.aclose()
 
 
-def test_production_task_api_uses_remote_session_and_fails_closed() -> None:
-    app = create_service_app(
-        "api",
-        _settings(
-            deployment_profile="production",
-            storage_backend="memory",
-        ),
-    )
-    assert app.state.session_access == "http"
-    with TestClient(app) as client:
-        readiness = client.get("/health/ready")
-        assert readiness.status_code == 503
-        assert readiness.json()["status"] == "degraded"
+def test_production_task_api_rejects_memory_storage() -> None:
+    with pytest.raises(ValueError, match="requires SQL storage"):
+        create_service_app(
+            "api",
+            _settings(
+                deployment_profile="production",
+                storage_backend="memory",
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -284,9 +285,7 @@ async def test_runtime_claims_signed_assignment_only_through_control_api() -> No
         resource_profile={},
         lease_expires_at=lease.expires_at,
     )
-    assert await store.assign(
-        "task-a", assignment, claim_token=runnable_claim.claim_token
-    )
+    assert await store.assign("task-a", assignment, claim_token=runnable_claim.claim_token)
     service = ControlInternalService(
         store,
         lease_verifier=LeaseAssertionVerifier(
@@ -347,6 +346,7 @@ async def test_runtime_claims_signed_assignment_only_through_control_api() -> No
                 lease_id=lease.lease_id,
                 fencing_token=lease.fencing_token,
                 disposition="finish",
+                execution_claim_token=claimed.assignments[0].execution_claim_token,
             ),
             AssignmentDispositionResponse,
         )
@@ -419,9 +419,7 @@ async def test_remote_runtime_executes_with_no_control_or_session_store() -> Non
     assignment = assignments[0]
     assert assignment.lease_assertion is not None
     assert assignment.lease_assertion.audience == "runtime"
-    await control.assert_fencing(
-        "session:tenant-a:session-b", assignment.fencing_token
-    )
+    await control.assert_fencing("session:tenant-a:session-b", assignment.fencing_token)
 
     session_store = InMemoryEventStore()
     session_service = SessionInternalService(
@@ -470,15 +468,18 @@ def test_production_runtime_composition_is_remote_only_and_has_no_provider_secre
     assert all("Store" not in type(item).__name__ for item in app.state.closeables)
 
 
-def test_production_hands_requires_signed_runtime_lease_capability() -> None:
+def test_hands_requires_signed_runtime_lease_capability() -> None:
     key = b"test-hands-capability-signing-key-0001"
     app = create_service_app(
         "hands",
         _settings(
-            deployment_profile="production",
+            deployment_profile="development",
             storage_backend="memory",
             runtime_id="runtime-a",
             runtime_workload_token="runtime-token",
+            task_api_workload_token="task-token",
+            credential_proxy_workload_token="credential-token",
+            action_hands_workload_token="hands-token",
             lease_signing_key=key.decode(),
         ),
     )
@@ -621,6 +622,49 @@ async def test_hands_uses_authenticated_remote_policy_and_credential_boundaries(
     await policy.aclose()
 
 
+class _UnavailablePolicy:
+    async def validate_decision(self, **_parameters: object) -> bool:
+        raise TimeoutError("policy timed out")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", [None, _UnavailablePolicy()])
+async def test_credential_invoke_fails_closed_before_adapter_side_effect(
+    policy: _UnavailablePolicy | None,
+) -> None:
+    invoked = False
+
+    async def adapter(_request: dict[str, object], _secret: str) -> dict[str, bool]:
+        nonlocal invoked
+        invoked = True
+        return {"ok": True}
+
+    service = CredentialProxyInternalService(
+        CredentialProxy(InMemoryVault({})),
+        adapters={"managed": adapter},
+        policy=policy,
+    )
+    with pytest.raises(CredentialAccessError, match="policy validation is unavailable"):
+        await service.invoke(
+            CredentialInvokeRequest(
+                context=InternalRequestContext(
+                    tenant_id="tenant-a",
+                    service_identity=ServiceIdentity.ACTION_HANDS,
+                    request_id="request-a",
+                    correlation_id="run-a",
+                    causation_id="decision-a",
+                ),
+                session_id="session-a",
+                credential_ref="credential-a",
+                operation="send",
+                target="managed",
+                method="POST",
+                policy_decision_id="decision-a",
+            )
+        )
+    assert invoked is False
+
+
 @pytest.mark.asyncio
 async def test_policy_approval_is_bound_to_action_and_human_response_identity() -> None:
     app = create_contract_app(
@@ -668,6 +712,10 @@ async def test_policy_approval_is_bound_to_action_and_human_response_identity() 
         policy_version="production-v1",
     )
     await task.record_human_response(record, decision="approved", feedback=None)
+    with pytest.raises(ApprovalValidationError, match="not committed"):
+        await task.record_human_response(record, decision="rejected", feedback=None)
+    with pytest.raises(ApprovalValidationError, match="different request"):
+        await hands.request_approval(replace(record, action_digest="changed-digest"))
     assert await hands.validate_approval(
         tenant_id="tenant-a",
         approval_id="approval-a",
@@ -713,7 +761,7 @@ async def test_policy_approval_is_bound_to_action_and_human_response_identity() 
 @pytest.mark.asyncio
 async def test_artifact_service_presigns_seaweedfs_upload_and_hands_has_no_s3_secret() -> None:
     service = ArtifactInternalService(
-        SeaweedFSS3Presigner(
+        S3CompatiblePresigner(
             "http://seaweed.test:8333",
             access_key="seaweed-access",
             secret_key="seaweed-secret",
@@ -761,15 +809,18 @@ def test_compose_injects_secrets_only_into_their_owner_services() -> None:
     def count_key(key: str) -> int:
         return len(re.findall(rf"^\s+{key}:", compose, re.MULTILINE))
 
-    # compose.test.yml uses _FILE secret mounts like prod
-    assert count_key("SEAWEEDFS_SECRET_KEY_FILE") == 1
-    assert count_key("SEAWEEDFS_ACCESS_KEY_FILE") == 1
+    # All deployment profiles use OBS-only _FILE secret mounts.
+    assert count_key("SEAWEEDFS_SECRET_KEY_FILE") == 0
+    assert count_key("OBS_AK_FILE") == 1
+    assert count_key("OBS_SK_FILE") == 1
+    assert count_key("SEAWEEDFS_ACCESS_KEY_FILE") == 0
     assert count_key("AURACLAW_MODEL_API_KEY_FILE") == 1
     assert count_key("AURACLAW_LEASE_SIGNING_KEY_FILE") == 3
     runtime = compose.split("  agent-runtime:", 1)[1].split("  model-gateway:", 1)[0]
     assert "DATABASE_URL" not in runtime
     assert "MODEL_API_KEY" not in runtime
     assert "SEAWEEDFS" not in runtime
+    assert "OBS_AK" not in runtime
     # agent-runtime needs platform network for Kafka/Redis egress
     assert "internal: true" in compose
 
@@ -783,12 +834,54 @@ def test_s3_database_roles_and_ops_clients_preserve_owner_boundaries() -> None:
     assert "credential TO auraclaw_credential" in roles
     assert "streaming TO auraclaw_streaming" in roles
     assert "model_gateway TO auraclaw_model" in roles
-    mysql_roles = (ROOT / "deploy/mysql/roles.sql").read_text()
-    assert "auraclaw_session" in mysql_roles
-    assert "auraclaw_task_query_ro" in mysql_roles
-    assert "`auraclaw`.`session_core_%`" in mysql_roles
-    assert "`auraclaw`.`control_%`" in mysql_roles
-    assert "`auraclaw`.`model_gateway_%`" in mysql_roles
     cli = (ROOT / "src/auraclaw/composition/cli.py").read_text()
     assert "RemoteAdminClient" in cli
     assert "PostgresOperationsStore" not in cli
+
+
+@pytest.mark.asyncio
+async def test_mcp_error_classification_survives_credential_http_boundary() -> None:
+    from auraclaw.contracts.errors import ConnectorExecutionError, McpTransportError
+
+    class Allow:
+        async def validate_decision(self, **kwargs):
+            return True
+
+    class FailedNetwork:
+        secret_required = False
+        config_revision = 1
+
+        async def __call__(self, request, secret):
+            raise McpTransportError(
+                "MCP server returned HTTP 503", code="mcp_http_error", remote_code=503
+            )
+
+    proxy = CredentialProxy(InMemoryVault({}))
+    service = CredentialProxyInternalService(
+        proxy, adapters={"mcp:fixture": FailedNetwork()}, policy=Allow()
+    )
+    app = create_contract_app(
+        "credential-proxy",
+        credential_routes(service),
+        workload_identities={"hands-token": ServiceIdentity.ACTION_HANDS},
+    )
+    client = RemoteCredentialProxy(
+        "http://credential.test", bearer_token="hands-token", transport=httpx.ASGITransport(app=app)
+    )
+    try:
+        with pytest.raises(ConnectorExecutionError) as caught:
+            await client.invoke(
+                tenant_id="tenant-a",
+                session_id="session-a",
+                tool_name="mcp:fixture",
+                credential_ref="none",
+                operation="mcp.invoke",
+                request={"config_revision": 1},
+                policy_decision_id="fixture-policy",
+            )
+        assert caught.value.code == "mcp_http_error"
+        assert caught.value.side_effect_status == "unknown"
+        assert caught.value.metadata["error_details"]["remote_code"] == 503
+        assert proxy.usage_audit()[0]["status"] == "failed"
+    finally:
+        await client.aclose()

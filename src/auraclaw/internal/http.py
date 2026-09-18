@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, NoReturn, TypeVar
@@ -21,6 +22,7 @@ from auraclaw.contracts.errors import (
     LeaseConflictError,
     NotFoundError,
     PolicyDeniedError,
+    SchemaValidationError,
     VersionConflictError,
 )
 from auraclaw.contracts.internal import (
@@ -91,6 +93,7 @@ def _error_code(exc: AuraClawError) -> InternalErrorCode:
         "credential_access_denied": InternalErrorCode.CREDENTIAL_DENIED,
         "artifact_access_denied": InternalErrorCode.ARTIFACT_DENIED,
         "invalid_transition": InternalErrorCode.INVALID_TRANSITION,
+        "tool_schema_invalid": InternalErrorCode.INVALID_REQUEST,
     }
     try:
         return InternalErrorCode(exc.code)
@@ -124,6 +127,7 @@ def _raise_contract_error(response: httpx.Response) -> NoReturn:
         InternalErrorCode.APPROVAL_INVALID: ApprovalValidationError,
         InternalErrorCode.CREDENTIAL_DENIED: CredentialAccessError,
         InternalErrorCode.ARTIFACT_DENIED: ArtifactAccessError,
+        InternalErrorCode.INVALID_REQUEST: SchemaValidationError,
     }
     exc_type = mapping.get(error.code, AuraClawError)
     raise exc_type(error.message, detail=detail)
@@ -135,6 +139,7 @@ def create_contract_app(
     *,
     stream_routes: Mapping[str, StreamContractRoute] | None = None,
     workload_identities: Mapping[str, ServiceIdentity] | None = None,
+    allow_unauthenticated: bool = False,
 ) -> FastAPI:
     app = FastAPI(title=f"AuraClaw {service_name} Internal API", version=INTERNAL_API_VERSION)
 
@@ -164,11 +169,11 @@ def create_contract_app(
         return JSONResponse(status_code=exc.status_code, content=error.model_dump(mode="json"))
 
     def _authenticate(request_model: ContractModel, raw_request: Request) -> None:
-        if workload_identities is None:
+        if allow_unauthenticated:
             return
         authorization = raw_request.headers.get("Authorization", "")
         token = authorization.removeprefix("Bearer ")
-        authenticated = workload_identities.get(token)
+        authenticated = (workload_identities or {}).get(token)
         context = getattr(request_model, "context", None)
         supplied = getattr(context, "service_identity", None)
         if authenticated is None or supplied != authenticated:
@@ -265,9 +270,22 @@ class InProcessContractClient:
 
 
 class HttpContractClient:
-    def __init__(self, client: httpx.AsyncClient, *, bearer_token: str | None = None) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        bearer_token: str | None = None,
+        retry_attempts: int = 1,
+        retry_backoff_seconds: float = 0.0,
+    ) -> None:
+        if retry_attempts < 1:
+            raise ValueError("internal contract retry attempts must be positive")
+        if retry_backoff_seconds < 0:
+            raise ValueError("internal contract retry backoff cannot be negative")
         self._client = client
         self._bearer_token = bearer_token
+        self._retry_attempts = retry_attempts
+        self._retry_backoff_seconds = retry_backoff_seconds
 
     def _headers(self) -> dict[str, str]:
         headers = {"X-AuraClaw-Contract-Version": INTERNAL_API_VERSION}
@@ -281,11 +299,25 @@ class HttpContractClient:
         request: RequestModel,
         response_model: type[ResponseModel],
     ) -> ResponseModel:
-        response = await self._client.post(
-            path,
-            json=request.model_dump(mode="json"),
-            headers=self._headers(),
-        )
+        response: httpx.Response | None = None
+        for attempt in range(self._retry_attempts):
+            try:
+                response = await self._client.post(
+                    path,
+                    json=request.model_dump(mode="json"),
+                    headers=self._headers(),
+                )
+            except httpx.TransportError:
+                if attempt + 1 >= self._retry_attempts:
+                    raise
+            else:
+                if response.status_code not in {502, 503, 504}:
+                    break
+                if attempt + 1 >= self._retry_attempts:
+                    break
+            if self._retry_backoff_seconds:
+                await asyncio.sleep(self._retry_backoff_seconds * (attempt + 1))
+        assert response is not None
         if response.is_error:
             _raise_contract_error(response)
         return response_model.model_validate(response.json())

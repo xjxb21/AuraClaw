@@ -78,7 +78,7 @@ def test_production_compose_enforces_replica_resource_and_security_boundaries() 
         identity = service["labels"]["auraclaw.service-identity"]
         assert identity == name
         identities.add(identity)
-        assert service["labels"]["auraclaw.database-role"]
+        assert "auraclaw.database-role" not in service.get("labels", {})
     assert identities == APPLICATION_SERVICES
     assert rendered["networks"]["auraclaw"]["internal"] is True
     assert rendered["networks"]["edge"].get("internal", False) is False
@@ -109,36 +109,40 @@ def test_production_compose_mounts_least_privilege_secrets() -> None:
 
     assert "migration_database_url" in secret_sources("migrate")
     assert all(
-        "migration_database_url" not in secret_sources(service)
-        for service in APPLICATION_SERVICES
+        "migration_database_url" not in secret_sources(service) for service in APPLICATION_SERVICES
     )
+    db_services = APPLICATION_SERVICES - {"agent-runtime"}
+    assert all("database_url" in secret_sources(service) for service in db_services)
+    assert "database_url" not in secret_sources("agent-runtime")
+    assert secrets["database_url"]["file"].endswith("/database_url")
     assert "model_api_key" in secret_sources("model-gateway")
     assert all(
         "model_api_key" not in secret_sources(service)
         for service in APPLICATION_SERVICES - {"model-gateway"}
     )
+    assert "action_hands_workload_token" in secret_sources("session")
+    assert (
+        services["session"]["environment"]["AURACLAW_ACTION_HANDS_WORKLOAD_TOKEN_FILE"]
+        == "/run/secrets/action_hands_workload_token"
+    )
     assert "vault_token" in secret_sources("credential-proxy")
+    assert "vault_approle_secret_id" in secret_sources("credential-proxy")
     assert all(
         "vault_token" not in secret_sources(service)
+        and "vault_approle_secret_id" not in secret_sources(service)
         for service in APPLICATION_SERVICES - {"credential-proxy"}
     )
-    assert {"seaweedfs_access_key", "seaweedfs_secret_key"} <= secret_sources(
-        "artifact-service"
-    )
+    assert {"obs_ak", "obs_sk"} <= secret_sources("artifact-service")
     assert all(
-        "seaweedfs_access_key" not in secret_sources(service)
-        and "seaweedfs_secret_key" not in secret_sources(service)
+        "obs_ak" not in secret_sources(service) and "obs_sk" not in secret_sources(service)
         for service in APPLICATION_SERVICES - {"artifact-service"}
     )
     assert "runtime_workload_token" in secret_sources("agent-runtime")
+    assert "credential_proxy_workload_token" in secret_sources("action-hands")
     assert "streaming_gateway_workload_token" in secret_sources("session")
     assert "streaming_gateway_workload_token" in secret_sources("streaming-gateway")
-    assert not any(
-        item.endswith("database_url") for item in secret_sources("agent-runtime")
-    )
-    assert secrets["runtime_workload_token"]["file"].endswith(
-        "/runtime_workload_token"
-    )
+    assert not any(item.endswith("database_url") for item in secret_sources("agent-runtime"))
+    assert secrets["runtime_workload_token"]["file"].endswith("/runtime_workload_token")
     assert secrets["lease_signing_key"]["file"].endswith("/lease_signing_key")
     assert {
         "chaintower_workload_token",
@@ -166,10 +170,16 @@ def test_secret_file_loading_is_allowlisted_precedence_safe_and_redacted(
     assert environ["AURACLAW_RUNTIME_WORKLOAD_TOKEN"] == "direct-secret"
 
     unavailable = tmp_path / "missing"
-    with pytest.raises(
-        ValueError, match="secret file is unavailable for AURACLAW_MODEL_API_KEY"
-    ):
+    with pytest.raises(ValueError, match="secret file is unavailable for AURACLAW_MODEL_API_KEY"):
         load_secret_files({"AURACLAW_MODEL_API_KEY_FILE": str(unavailable)})
+
+    empty_optional = tmp_path / "empty-optional"
+    empty_optional.write_text("")
+    optional_environ = {
+        "AURACLAW_CREDENTIAL_VAULT_TOKEN_FILE": str(empty_optional),
+    }
+    load_secret_files(optional_environ)
+    assert "AURACLAW_CREDENTIAL_VAULT_TOKEN" not in optional_environ
 
 
 def test_migration_discovery_orders_versions_rejects_duplicates_and_ignores_down(
@@ -193,11 +203,11 @@ def test_committed_files_do_not_contain_environment_secret_values() -> None:
         "AURACLAW_CREDENTIAL_VAULT_TOKEN",
         "SEAWEEDFS_ACCESS_KEY",
         "SEAWEEDFS_SECRET_KEY",
+        "OBS_AK",
+        "OBS_SK",
     }
     local_values = {
-        value
-        for name in secret_names
-        if (value := os.environ.get(name)) and len(value) >= 12
+        value for name in secret_names if (value := os.environ.get(name)) and len(value) >= 12
     }
     committed = "".join(
         path.read_text()
@@ -224,10 +234,11 @@ def test_env_templates_are_ready_to_copy() -> None:
     spec.loader.exec_module(module)
 
     debug_settings = Settings(_env_file=ROOT / ".env.dev.example")
-    assert debug_settings.storage_backend == "mysql"
+    assert debug_settings.storage_backend == "postgres"
+    assert debug_settings.sql_storage_enabled is True
     assert debug_settings.runtime_event_backend == "kafka"
-    assert debug_settings.kafka_host == "10.244.16.132"
-    assert debug_settings.artifact_backend == "seaweedfs"
+    assert debug_settings.kafka_host == "localhost"
+    assert debug_settings.artifact_backend == "obs"
     assert debug_settings.insecure_identity_headers_enabled
     assert debug_settings.deployment_profile == "development"
     assert debug_settings.lease_signing_key is not None
@@ -236,26 +247,43 @@ def test_env_templates_are_ready_to_copy() -> None:
     test = dotenv_values(ROOT / ".env.test.example")
     production = dotenv_values(ROOT / ".env.prod.example")
     for label, values in (("test", test), ("production", production)):
-        missing = [name for name in module.REQUIRED if not values.get(name)]
+        missing = [name for name in module.required_variables(values) if not values.get(name)]
         assert missing == [], f"{label} missing {missing}"
         assert values["AURACLAW_DEPLOYMENT_PROFILE"] == "production"
         assert values["AURACLAW_ALLOW_INSECURE_IDENTITY_HEADERS"] == "false"
+        assert values["AURACLAW_DATABASE_URL"]
+        assert "SESSION_DATABASE_URL" not in values
+        assert "TASK_QUERY_DATABASE_URL" not in values
 
     local_only = {
         "AURACLAW_DEPLOYMENT_PROFILE",
         "AURACLAW_HOST",
         "AURACLAW_ALLOW_INSECURE_IDENTITY_HEADERS",
+        "AURACLAW_STORAGE_BACKEND",
+        "AURACLAW_DB_DIALECT",
         "AURACLAW_MODEL_API_KEY",
         "AURACLAW_MODEL_BASE_URL",
         "AURACLAW_MODEL_NAME",
+        # Deployment profiles may still override this explicitly.
+        "AURACLAW_ARTIFACT_BACKEND",
         "AURACLAW_CREDENTIAL_VAULT_ADDR",
         "AURACLAW_CORS_ALLOW_ORIGINS",
         "AURACLAW_MIGRATIONS_DIRECTORY",
+        "AURACLAW_MIGRATE_TARGET",
         "AURACLAW_PORT",
         "AURACLAW_RUNTIME_ID",
         "AURACLAW_RUNTIME_ROLE",
         "AURACLAW_RUNTIME_NODE_ID",
         "AURACLAW_RUNTIME_CAPACITY",
+        # Local middleware endpoints (Postgres/Kafka) vs shared DEV_MIDDLEWARE.
+        "KAFKA_HOST",
+        "DB_HOST",
+        "DB_PORT",
+        "DB_USER",
+        "DB_PWD",
+        "DB_NAME",
+        "AURACLAW_DATABASE_URL",
+        "AURACLAW_MIGRATION_DATABASE_URL",
         # Local-dev HTTP proxy bypass only; never present on test/prod.
         "NO_PROXY",
         "no_proxy",
@@ -263,39 +291,21 @@ def test_env_templates_are_ready_to_copy() -> None:
     assert "NO_PROXY" in debug
     assert "NO_PROXY" not in test
     assert "NO_PROXY" not in production
+    assert "SESSION_DATABASE_URL" not in debug
     shared_keys = set(test) & set(debug) - local_only
-    mismatches = [
-        key for key in sorted(shared_keys) if test[key] != debug.get(key)
-    ]
+    mismatches = [key for key in sorted(shared_keys) if test[key] != debug.get(key)]
     assert mismatches == []
     assert debug["AURACLAW_RUNTIME_WORKLOAD_TOKEN"] == test["AURACLAW_RUNTIME_WORKLOAD_TOKEN"]
     assert debug["AURACLAW_RUNTIME_WORKLOAD_TOKEN"] == production["AURACLAW_RUNTIME_WORKLOAD_TOKEN"]
 
-    tokens = [
-        production[name] or ""
-        for name in module.REQUIRED
-        if name.endswith("_WORKLOAD_TOKEN")
-    ]
+    tokens = [production[name] or "" for name in module.WORKLOAD_TOKENS]
     assert all(len(token) >= 32 for token in tokens)
     assert len(set(tokens)) == len(tokens)
 
 
-def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
+def test_production_preflight_accepts_shared_database_url_and_unique_tokens(
     tmp_path: Path,
 ) -> None:
-    roles = {
-        "TASK_QUERY_DATABASE_URL": "auraclaw_task_query_ro",
-        "SESSION_DATABASE_URL": "auraclaw_session",
-        "PROJECTION_DATABASE_URL": "auraclaw_projection",
-        "CONTROL_DATABASE_URL": "auraclaw_control",
-        "HANDS_DATABASE_URL": "auraclaw_hands",
-        "POLICY_DATABASE_URL": "auraclaw_policy",
-        "CREDENTIAL_DATABASE_URL": "auraclaw_credential",
-        "ARTIFACT_DATABASE_URL": "auraclaw_artifact",
-        "STREAMING_DATABASE_URL": "auraclaw_streaming",
-        "MODEL_DATABASE_URL": "auraclaw_model",
-        "DELIVERY_DATABASE_URL": "auraclaw_delivery",
-    }
     tokens = (
         "TASK_API",
         "PROJECTION",
@@ -311,6 +321,7 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
     )
     lines = [
         "AURACLAW_IMAGE=registry.example/auraclaw:sha-0123456789",
+        "AURACLAW_DATABASE_URL=postgresql://auraclaw:secret@db/auraclaw",
         "AURACLAW_MIGRATION_DATABASE_URL=postgresql://migration:secret@db/auraclaw",
         "AURACLAW_LEASE_SIGNING_KEY=" + "l" * 48,
         "AURACLAW_MODEL_API_KEY=test-model-secret",
@@ -318,16 +329,15 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
         "AURACLAW_MODEL_NAME=test-model",
         "AURACLAW_CREDENTIAL_VAULT_ADDR=https://vault.example",
         "AURACLAW_CREDENTIAL_VAULT_TOKEN=test-vault-secret",
-        "SEAWEEDFS_HOST=seaweed.example",
-        "SEAWEEDFS_ACCESS_KEY=test-access",
-        "SEAWEEDFS_SECRET_KEY=test-secret",
+        "AURACLAW_ARTIFACT_BACKEND=obs",
+        "OBS_ENDPOINT=obsv3.example.com",
+        "OBS_BUCKET=auraclaw-artifacts",
+        "OBS_AK=test-obs-access",
+        "OBS_SK=test-obs-secret",
+        "OBS_REGION=example-region",
         "AURACLAW_CHAINTOWER_WORKLOAD_TOKEN=ct-" + "t" * 40,
         'AURACLAW_AGENT_CONTEXT_SIGNING_KEYS_JSON={"k1":"chaintower-agent-context-signing-key-01"}',
     ]
-    lines.extend(
-        f"{variable}=postgresql://{role}:secret@db/auraclaw"
-        for variable, role in roles.items()
-    )
     lines.extend(
         f"AURACLAW_{name}_WORKLOAD_TOKEN={index:02d}-" + "t" * 40
         for index, name in enumerate(tokens)
@@ -351,6 +361,9 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
         text=True,
     )
     assert materialized.returncode == 0, materialized.stdout + materialized.stderr
+    assert (secret_dir / "database_url").is_file()
+    assert (secret_dir / "vault_approle_secret_id").is_file()
+    assert not (secret_dir / "session_database_url").exists()
     result = subprocess.run(
         [
             sys.executable,
@@ -365,3 +378,64 @@ def test_production_preflight_accepts_isolated_roles_and_unique_tokens(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "Compose preflight passed"
+
+
+def test_compose_secret_materialization_accepts_approle_without_static_token(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env.test"
+    lines = (ROOT / ".env.test.example").read_text().splitlines()
+    replacements = {
+        "AURACLAW_CREDENTIAL_VAULT_TOKEN": "",
+        "AURACLAW_CREDENTIAL_VAULT_APPROLE_ROLE_ID": "test-role-id",
+        "AURACLAW_CREDENTIAL_VAULT_APPROLE_SECRET_ID": "test-secret-id",
+    }
+    rendered: list[str] = []
+    for line in lines:
+        key = line.split("=", 1)[0]
+        rendered.append(f"{key}={replacements[key]}" if key in replacements else line)
+    env_file.write_text("\n".join(rendered))
+    secret_dir = tmp_path / "secrets"
+
+    materialized = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/materialize_compose_secrets.py"),
+            "--env-file",
+            str(env_file),
+            "--output-dir",
+            str(secret_dir),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert materialized.returncode == 0, materialized.stdout + materialized.stderr
+    assert (secret_dir / "vault_token").read_text() == ""
+    assert (secret_dir / "vault_approle_secret_id").read_text() == "test-secret-id"
+
+    preflight = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/compose_preflight.py"),
+            "--env-file",
+            str(env_file),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert preflight.returncode == 0, preflight.stdout + preflight.stderr
+
+
+@pytest.mark.parametrize("profile", ["test", "prod"])
+def test_model_gateway_mounts_policy_caller_identity_for_auto_review(profile: str) -> None:
+    compose = (ROOT / f"compose.{profile}.yml").read_text()
+    gateway = compose.split("  model-gateway:", 1)[1].split("  action-hands:", 1)[0]
+    assert "AURACLAW_POLICY_WORKLOAD_TOKEN_FILE: /run/secrets/policy_workload_token" in gateway
+    assert "      - policy_workload_token" in gateway
+    # Reviewer still reaches the model through Model Gateway, not a provider credential.
+    policy = compose.split("  policy:", 1)[1].split("  credential-proxy:", 1)[0]
+    assert "MODEL_API_KEY" not in policy

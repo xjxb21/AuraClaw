@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import quote
 
 from pydantic import Field, SecretStr, TypeAdapter, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from auraclaw.contracts.capabilities import JavaApiServerDefinition
+
+# Shared agent-runtime pool registration role. Coordinator/worker/reviewer are
+# assignment roles chosen by Orchestrator, not values for AURACLAW_RUNTIME_ROLE.
+RUNTIME_POOL_ROLE = "agent"
 
 _SECRET_FILE_VARIABLES = {
     "AURACLAW_DATABASE_URL",
@@ -32,8 +37,15 @@ _SECRET_FILE_VARIABLES = {
     "AURACLAW_MODEL_API_KEY",
     "AURACLAW_SKILL_SIGNING_KEY",
     "AURACLAW_CREDENTIAL_VAULT_TOKEN",
+    "AURACLAW_CREDENTIAL_VAULT_APPROLE_SECRET_ID",
     "SEAWEEDFS_ACCESS_KEY",
     "SEAWEEDFS_SECRET_KEY",
+    "OBS_AK",
+    "OBS_SK",
+}
+_OPTIONAL_EMPTY_SECRET_FILE_VARIABLES = {
+    "AURACLAW_CREDENTIAL_VAULT_TOKEN",
+    "AURACLAW_CREDENTIAL_VAULT_APPROLE_SECRET_ID",
 }
 
 
@@ -51,6 +63,8 @@ def load_secret_files(environ: dict[str, str] | None = None) -> None:
         if path.stat().st_size > 64 * 1024:
             raise ValueError(f"secret file is too large for {variable}")
         value = path.read_text().rstrip("\r\n")
+        if not value and variable in _OPTIONAL_EMPTY_SECRET_FILE_VARIABLES:
+            continue
         if not value:
             raise ValueError(f"secret file is empty for {variable}")
         selected[variable] = value
@@ -92,7 +106,7 @@ def apply_local_dev_proxy_env(env_file: str | Path | None = None) -> None:
     """Apply NO_PROXY / clear HTTP(S)_PROXY for local `.env.dev` only.
 
     Corporate HTTP proxies on developer machines break access to private Kafka /
-    MySQL / SeaweedFS / Vault hosts. Server test and production Compose do not
+    PostgreSQL / SeaweedFS / Vault hosts. Server test and production Compose do not
     need this — they run without local proxy interference.
     """
     path = Path(env_file) if env_file is not None else None
@@ -127,6 +141,138 @@ def apply_local_dev_proxy_env(env_file: str | Path | None = None) -> None:
         os.environ.pop(key, None)
 
 
+_POSTGRESQL_TO_DB = {
+    "POSTGRESQL_HOST": "DB_HOST",
+    "POSTGRESQL_PORT": "DB_PORT",
+    "POSTGRESQL_DB_USER": "DB_USER",
+    "POSTGRESQL_DB_PWD": "DB_PWD",
+    "POSTGRESQL_AURACLAW_DB": "DB_NAME",
+}
+
+_KINGBASE_TO_DB = {
+    "KINGBASE_HOST": "DB_HOST",
+    "KINGBASE_PORT": "DB_PORT",
+    "KINGBASE_DB_USER": "DB_USER",
+    "KINGBASE_USER": "DB_USER",
+    "KINGBASE_DB_PWD": "DB_PWD",
+    "KINGBASE_PWD": "DB_PWD",
+    "KINGBASE_AURACLAW_DB": "DB_NAME",
+}
+
+
+def _settings_backend(
+    selected: Mapping[str, str],
+    settings_env_file: str | Path | None,
+    *extra_file_values: dict[str, str],
+) -> str:
+    settings_file_values = (
+        _parse_dotenv_values(Path(settings_env_file))
+        if settings_env_file is not None
+        else {}
+    )
+    for source in (selected, settings_file_values, *extra_file_values):
+        value = (source.get("AURACLAW_STORAGE_BACKEND") or "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def apply_postgresql_env_aliases(
+    environ: dict[str, str] | None = None,
+    *,
+    settings_env_file: str | Path | None = None,
+) -> None:
+    """Map local PostgreSQL credentials onto `DB_*` when backend is postgres.
+
+    Loads `POSTGRESQL_*` from `.postgresql.local.env` (or
+    `AURACLAW_POSTGRESQL_ENV_FILE` / `.postgresql.env`). Explicit process-env
+    wins over the file. When `AURACLAW_STORAGE_BACKEND=postgres`, resolved
+    values overwrite `DB_*`. Domain / store code continues to use only `DB_*`
+    and `resolved_database_url`.
+    """
+    selected = os.environ if environ is None else environ
+    postgresql_path = Path(
+        selected.get("AURACLAW_POSTGRESQL_ENV_FILE")
+        or (
+            ".postgresql.local.env"
+            if Path(".postgresql.local.env").is_file()
+            else ".postgresql.env"
+        )
+    )
+    postgresql_file_values = _parse_dotenv_values(postgresql_path)
+
+    def postgresql_value(key: str) -> str | None:
+        return selected.get(key) or postgresql_file_values.get(key)
+
+    backend = _settings_backend(selected, settings_env_file, postgresql_file_values)
+    has_postgresql = any(postgresql_value(source) for source in _POSTGRESQL_TO_DB)
+    if backend == "postgres":
+        for source, destination in _POSTGRESQL_TO_DB.items():
+            value = postgresql_value(source)
+            if value:
+                selected[destination] = value
+        selected.setdefault("AURACLAW_STORAGE_BACKEND", "postgres")
+        return
+
+    if has_postgresql and backend in {"", "auto"} and not selected.get("DB_HOST"):
+        for source, destination in _POSTGRESQL_TO_DB.items():
+            value = postgresql_value(source)
+            if value and not selected.get(destination):
+                selected[destination] = value
+
+
+def apply_kingbase_env_aliases(
+    environ: dict[str, str] | None = None,
+    *,
+    settings_env_file: str | Path | None = None,
+) -> None:
+    """Map KingBase credentials onto `DB_*` when the storage backend is kingbase.
+
+    Reads `KINGBASE_*` from the active settings env file (``.env.test`` / ``.env.prod``)
+    or process environment. When ``AURACLAW_STORAGE_BACKEND=kingbase``, resolved
+    ``KINGBASE_*`` values overwrite ``DB_*``. Inline ``DB_*`` in the same env file
+    are used when no ``KINGBASE_*`` alias is present. Domain / store code continues to
+    use only ``DB_*`` and ``resolved_database_url``.
+    """
+    selected = os.environ if environ is None else environ
+    settings_file_values = (
+        _parse_dotenv_values(Path(settings_env_file))
+        if settings_env_file is not None
+        else {}
+    )
+    optional_path = selected.get("AURACLAW_KINGBASE_ENV_FILE")
+    legacy_file_values = (
+        _parse_dotenv_values(Path(optional_path)) if optional_path else {}
+    )
+
+    def kingbase_value(key: str) -> str | None:
+        return (
+            selected.get(key)
+            or settings_file_values.get(key)
+            or legacy_file_values.get(key)
+        )
+
+    backend = _settings_backend(
+        selected, settings_env_file, settings_file_values, legacy_file_values
+    )
+
+    has_kingbase = any(kingbase_value(source) for source in _KINGBASE_TO_DB)
+    if backend == "kingbase":
+        for source, destination in _KINGBASE_TO_DB.items():
+            value = kingbase_value(source)
+            if value:
+                selected[destination] = value
+        selected.setdefault("AURACLAW_STORAGE_BACKEND", "kingbase")
+        return
+
+    # Fill empty DB_* from KingBase when backend is auto and no DB_HOST yet.
+    if has_kingbase and backend in {"", "auto"} and not selected.get("DB_HOST"):
+        for source, destination in _KINGBASE_TO_DB.items():
+            value = kingbase_value(source)
+            if value and not selected.get(destination):
+                selected[destination] = value
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env.dev", env_prefix="AURACLAW_", extra="ignore"
@@ -151,6 +297,7 @@ class Settings(BaseSettings):
     ingress_enabled: bool = True
     lease_signing_key: SecretStr | None = None
     allow_insecure_identity_headers: bool | None = None
+    test_uplink_insecure_identity: bool | None = None
     chaintower_workload_token: SecretStr | None = None
     agent_context_issuer: str = "chaintower"
     agent_context_audience: str = "auraclaw-task-api"
@@ -184,25 +331,46 @@ class Settings(BaseSettings):
     mcp_revision_reconcile_interval_seconds: float = Field(
         default=30.0, ge=5.0, le=3600.0
     )
+    mcp_reconcile_max_concurrent: int = Field(default=8, ge=1, le=1000)
+    mcp_reconcile_max_concurrent_per_tenant: int = Field(default=4, ge=1, le=1000)
+    mcp_reconcile_max_concurrent_per_host: int = Field(default=2, ge=1, le=1000)
+    mcp_reconcile_server_timeout_seconds: float = Field(
+        default=60.0, gt=0.0, le=3600.0
+    )
     mcp_allow_private_auth_none: bool | None = None
-    mcp_trust_remote_tool_annotations: bool = False
     skill_signing_key: SecretStr | None = None
+    skill_admission_retention_days: int = Field(default=365, ge=30, le=3650)
+    skill_admission_cleanup_interval_seconds: float = Field(
+        default=3600.0, ge=60.0, le=86400.0
+    )
+    skill_admission_cleanup_batch_size: int = Field(default=1000, ge=1, le=10_000)
+    skill_admission_metrics_window_hours: int = Field(default=24, ge=1, le=2160)
+    skill_admission_quarantine_alert_ratio: float = Field(default=0.25, ge=0, le=1)
+    skill_admission_quarantine_alert_min_samples: int = Field(
+        default=20, ge=1, le=1_000_000
+    )
     credential_vault_addr: str | None = None
     credential_vault_token: SecretStr | None = None
+    credential_vault_approle_role_id: str | None = None
+    credential_vault_approle_secret_id: SecretStr | None = None
+    credential_vault_approle_mount: str = "approle"
     credential_vault_mount: str = "secret"
     artifact_base_url: str = "http://127.0.0.1:8009"
     delivery_base_url: str = "http://127.0.0.1:8011"
+    delivery_circuit_failure_threshold: int = Field(default=3, ge=1, le=1000)
+    delivery_circuit_reset_seconds: float = Field(default=30.0, ge=0.1, le=3600.0)
+    delivery_circuit_probe_ttl_seconds: float = Field(default=10.0, ge=0.1, le=300.0)
     log_level: str = "INFO"
-    storage_backend: Literal["auto", "memory", "postgres", "mysql"] = "auto"
-    db_dialect: Literal["mysql", "postgres"] = "mysql"
-    database_url: str = "mysql+aiomysql://auraclaw:auraclaw@localhost:3306/auraclaw"
+    storage_backend: Literal["auto", "memory", "postgres", "kingbase"] = "auto"
+    db_dialect: Literal["postgres"] = "postgres"
+    database_url: str = "postgresql+asyncpg://auraclaw:auraclaw@localhost:5432/auraclaw"
     migration_database_url: SecretStr | None = None
     db_host: str | None = Field(default=None, validation_alias="DB_HOST")
-    db_port: int = Field(default=3306, validation_alias="DB_PORT")
+    db_port: int = Field(default=5432, validation_alias="DB_PORT")
     db_user: str | None = Field(default=None, validation_alias="DB_USER")
     db_password: str | None = Field(default=None, validation_alias="DB_PWD")
     db_name: str | None = Field(default=None, validation_alias="DB_NAME")
-    artifact_backend: Literal["auto", "local", "seaweedfs"] = "auto"
+    artifact_backend: Literal["auto", "local", "seaweedfs", "obs"] = "auto"
     artifact_root: Path = Path(".data/artifacts")
     seaweedfs_host: str | None = Field(default=None, validation_alias="SEAWEEDFS_HOST")
     seaweedfs_master_port: int = Field(
@@ -230,19 +398,82 @@ class Settings(BaseSettings):
     seaweedfs_path_style: bool = Field(
         default=True, validation_alias="SEAWEEDFS_PATH_STYLE"
     )
+    obs_endpoint: str | None = Field(default=None, validation_alias="OBS_ENDPOINT")
+    obs_bucket: str = Field(default="auraclaw-artifacts", validation_alias="OBS_BUCKET")
+    obs_ak: SecretStr | None = Field(default=None, validation_alias="OBS_AK")
+    obs_sk: SecretStr | None = Field(default=None, validation_alias="OBS_SK")
+    obs_region: str = Field(default="us-east-1", validation_alias="OBS_REGION")
+    obs_use_ssl: bool = Field(default=True, validation_alias="OBS_USE_SSL")
+    obs_path_style: bool = Field(default=False, validation_alias="OBS_PATH_STYLE")
+    obs_domain: str | None = Field(default=None, validation_alias="OBS_DOMAIN")
+    obs_tenant_id: str | None = Field(default=None, validation_alias="OBS_TENANT_ID")
     artifact_multipart_threshold: int = Field(
         default=16 * 1024 * 1024, ge=5 * 1024 * 1024
     )
     artifact_multipart_part_size: int = Field(
         default=8 * 1024 * 1024, ge=5 * 1024 * 1024
     )
+    artifact_claim_ttl_seconds: float = Field(default=30.0, ge=3.0, le=3600.0)
+    artifact_orphan_claim_limit: int = Field(default=1, ge=1, le=100)
+    hands_max_concurrent: int = Field(default=32, ge=1, le=10_000)
+    hands_max_concurrent_per_tenant: int = Field(default=8, ge=1, le=10_000)
+    hands_max_queued: int = Field(default=256, ge=1, le=100_000)
+    hands_max_queued_per_tenant: int = Field(default=32, ge=1, le=100_000)
+    hands_queue_timeout_seconds: float = Field(default=5.0, gt=0.0, le=3600.0)
+    delivery_max_concurrent: int = Field(default=8, ge=1, le=10_000)
+    delivery_max_concurrent_per_tenant: int = Field(default=2, ge=1, le=10_000)
+    delivery_claim_ttl_seconds: float = Field(default=30.0, gt=0.0, le=3600.0)
+    skill_reliability_max_concurrent: int = Field(default=8, ge=1, le=10_000)
+    skill_reliability_claim_ttl_seconds: float = Field(
+        default=30.0, gt=0.0, le=3600.0
+    )
+    skill_content_cache_max_bytes: int = Field(
+        default=64 * 1024 * 1024, ge=1024, le=4 * 1024 * 1024 * 1024
+    )
+    skill_content_cache_max_entries: int = Field(default=1024, ge=1, le=100_000)
+    skill_content_cache_ttl_seconds: float = Field(
+        default=3600.0, ge=60.0, le=86_400.0
+    )
+    runtime_skill_content_cache_max_bytes: int = Field(
+        default=16 * 1024 * 1024, ge=1024, le=1024 * 1024 * 1024
+    )
+    runtime_skill_content_cache_max_entries: int = Field(
+        default=1024, ge=1, le=100_000
+    )
+    runtime_skill_content_cache_ttl_seconds: float = Field(
+        default=900.0, ge=60.0, le=86_400.0
+    )
+    runtime_skill_prompt_max_bytes: int = Field(
+        default=256 * 1024, ge=1024, le=64 * 1024 * 1024
+    )
+    runtime_skill_prompt_max_estimated_tokens: int = Field(
+        default=65_536, ge=256, le=4_000_000
+    )
+    skill_transaction_retry_attempts: int = Field(default=3, ge=1, le=10)
+    skill_transaction_retry_base_delay_seconds: float = Field(
+        default=0.01, ge=0.0, le=1.0
+    )
+    resource_gateway_max_concurrent: int = Field(default=32, ge=1, le=10_000)
+    resource_gateway_max_queued: int = Field(default=128, ge=1, le=100_000)
+    resource_gateway_queue_timeout_seconds: float = Field(default=5.0, gt=0.0, le=3600.0)
     runtime_event_backend: Literal["auto", "memory", "kafka"] = "auto"
     kafka_host: str | None = Field(default=None, validation_alias="KAFKA_HOST")
     kafka_port: int = Field(default=9092, validation_alias="KAFKA_PORT")
     kafka_runtime_topic: str = "managed-agent.runtime-events"
     kafka_streaming_group: str = "streaming-ingestor"
+    kafka_skill_lifecycle_topic: str = "managed-agent.skill-lifecycle"
+    skill_lifecycle_replica_id: str | None = None
     runtime_event_retention_events: int = 1_000
+    runtime_event_publish_max_concurrent: int = Field(default=64, ge=1, le=10_000)
+    runtime_event_publish_max_queued: int = Field(default=1_024, ge=1, le=100_000)
+    runtime_event_publish_queue_timeout_seconds: float = Field(
+        default=5.0, gt=0.0, le=3600.0
+    )
+    runtime_event_publish_timeout_seconds: float = Field(
+        default=10.0, gt=0.0, le=3600.0
+    )
     stream_connection_queue_size: int = 128
+    stream_delta_min_interval_seconds: float = Field(default=0.02, ge=0.0, le=0.1)
     cors_allow_origins: str = ""
     runtime_poll_interval: float = 0.05
     # Shared production-topology worker ticks (Outbox → Feed / Projection).
@@ -258,10 +489,33 @@ class Settings(BaseSettings):
     sync_invoke_max_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     sync_invoke_poll_interval_seconds: float = Field(default=0.25, ge=0.05, le=5.0)
     sync_invoke_max_concurrent: int = Field(default=32, ge=1, le=1000)
-    runtime_id: str = "runtime-local-1"
-    runtime_role: str = "root"
-    runtime_node_id: str = "local"
+    runtime_id: str | None = None
+    runtime_role: str = RUNTIME_POOL_ROLE
+    runtime_node_id: str | None = None
     runtime_capacity: int = Field(default=1, ge=1)
+    runtime_budget_policy_version: Literal["1", "2"] = "1"
+    model_pricing: dict[str, Any] = Field(default_factory=dict)
+    runtime_max_steps: int = Field(default=48, ge=4, le=256)
+    runtime_max_output_tokens: int = Field(default=8192, ge=128, le=65536)
+    runtime_tree_max_steps: int = Field(default=480, ge=4, le=4096)
+    runtime_tree_max_output_tokens: int = Field(default=81920, ge=128, le=1048576)
+    runtime_max_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    runtime_tree_max_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+    def runtime_budget_snapshot(self) -> dict[str, Any]:
+        if (self.runtime_tree_max_steps < self.runtime_max_steps
+                or self.runtime_tree_max_output_tokens < self.runtime_max_output_tokens):
+            raise ValueError("tree quotas must cover the root Run")
+        if self.runtime_tree_max_cost is not None and (self.runtime_max_cost is None
+                or self.runtime_tree_max_cost < self.runtime_max_cost):
+            raise ValueError("cost-limited tree must cover a priced root Run")
+        return {"max_steps": self.runtime_max_steps,
+                "max_output_tokens": self.runtime_max_output_tokens,
+                "max_cost": self.runtime_max_cost, "tree_max_cost": self.runtime_tree_max_cost,
+                "tree_max_steps": self.runtime_tree_max_steps,
+                "tree_max_output_tokens": self.runtime_tree_max_output_tokens,
+                "policy_version": self.runtime_budget_policy_version}
+
     model_api_key: str | None = None
     model_base_url: str | None = None
     model_name: str | None = None
@@ -270,6 +524,8 @@ class Settings(BaseSettings):
     model_tenant_token_limit_per_hour: int = Field(default=1_000_000, ge=1)
     # None omits the field; True/False maps to OpenAI-compatible thinking.type enabled/disabled.
     model_thinking_enabled: bool | None = None
+    # Opt-in because some OpenAI-compatible providers reject unknown fields.
+    model_prompt_cache_key_enabled: bool = False
 
     @model_validator(mode="after")
     def validate_identity_settings(self) -> Settings:
@@ -281,49 +537,99 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_runtime_pool_role(self) -> Settings:
+        if self.runtime_role != RUNTIME_POOL_ROLE:
+            raise ValueError(
+                "AURACLAW_RUNTIME_ROLE must be "
+                f"{RUNTIME_POOL_ROLE!r}; got {self.runtime_role!r}. "
+                "Coordinator/worker/reviewer assignment roles are chosen by "
+                "Orchestrator, not by this setting."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_hands_capacity(self) -> Settings:
+        if self.hands_max_concurrent_per_tenant > self.hands_max_concurrent:
+            raise ValueError(
+                "hands per-tenant concurrency cannot exceed global concurrency"
+            )
+        if self.hands_max_queued_per_tenant > self.hands_max_queued:
+            raise ValueError("hands per-tenant queue cannot exceed global queue")
+        if self.delivery_max_concurrent_per_tenant > self.delivery_max_concurrent:
+            raise ValueError(
+                "delivery per-tenant concurrency cannot exceed global concurrency"
+            )
+        if (
+            self.mcp_reconcile_max_concurrent_per_tenant
+            > self.mcp_reconcile_max_concurrent
+            or self.mcp_reconcile_max_concurrent_per_host
+            > self.mcp_reconcile_max_concurrent
+        ):
+            raise ValueError("MCP partition concurrency cannot exceed global concurrency")
+        return self
+
+    @model_validator(mode="after")
+    def validate_database_urls(self) -> Settings:
+        urls = [self.database_url]
+        if self.migration_database_url is not None:
+            urls.append(self.migration_database_url.get_secret_value())
+        for url in urls:
+            lowered = url.lower()
+            if not lowered.startswith(
+                (
+                    "postgresql://",
+                    "postgresql+asyncpg://",
+                    "postgres://",
+                    "kingbase://",
+                    "kingbase+",
+                )
+            ):
+                raise ValueError(
+                    "database URLs must use PostgreSQL or Kingbase compatibility mode"
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_artifact_backend(self) -> Settings:
-        if self.artifact_backend != "seaweedfs":
+        if self.artifact_backend == "seaweedfs":
+            missing = []
+            if not self.seaweedfs_host:
+                missing.append("SEAWEEDFS_HOST")
+            if not self.seaweedfs_bucket.strip():
+                missing.append("SEAWEEDFS_BUCKET")
+            if (
+                self.seaweedfs_access_key is None
+                or not self.seaweedfs_access_key.get_secret_value()
+            ):
+                missing.append("SEAWEEDFS_ACCESS_KEY")
+            if (
+                self.seaweedfs_secret_key is None
+                or not self.seaweedfs_secret_key.get_secret_value()
+            ):
+                missing.append("SEAWEEDFS_SECRET_KEY")
+            if missing:
+                raise ValueError(f"SeaweedFS backend requires: {', '.join(missing)}")
+            return self
+        if self.artifact_backend != "obs":
             return self
         missing = []
-        if not self.seaweedfs_host:
-            missing.append("SEAWEEDFS_HOST")
-        if not self.seaweedfs_bucket.strip():
-            missing.append("SEAWEEDFS_BUCKET")
-        if (
-            self.seaweedfs_access_key is None
-            or not self.seaweedfs_access_key.get_secret_value()
-        ):
-            missing.append("SEAWEEDFS_ACCESS_KEY")
-        if (
-            self.seaweedfs_secret_key is None
-            or not self.seaweedfs_secret_key.get_secret_value()
-        ):
-            missing.append("SEAWEEDFS_SECRET_KEY")
+        if not self.obs_endpoint:
+            missing.append("OBS_ENDPOINT")
+        if not self.obs_bucket.strip():
+            missing.append("OBS_BUCKET")
+        if self.obs_ak is None or not self.obs_ak.get_secret_value():
+            missing.append("OBS_AK")
+        if self.obs_sk is None or not self.obs_sk.get_secret_value():
+            missing.append("OBS_SK")
+        if not self.obs_region.strip():
+            missing.append("OBS_REGION")
         if missing:
-            raise ValueError(f"SeaweedFS backend requires: {', '.join(missing)}")
+            raise ValueError(f"OBS backend requires: {', '.join(missing)}")
         return self
 
     @property
-    def resolved_db_dialect(self) -> Literal["mysql", "postgres"]:
-        if self.storage_backend == "postgres":
-            return "postgres"
-        if self.storage_backend == "mysql":
-            return "mysql"
-        url = (self.database_url or "").lower()
-        if (
-            url.startswith("postgresql:")
-            or url.startswith("postgres:")
-            or "+asyncpg" in url
-        ):
-            return "postgres"
-        if (
-            url.startswith("mysql:")
-            or "+aiomysql" in url
-            or "+asyncmy" in url
-            or "+pymysql" in url
-        ):
-            return "mysql"
-        return self.db_dialect
+    def resolved_db_dialect(self) -> Literal["postgres"]:
+        return "postgres"
 
     @property
     def resolved_database_url(self) -> str:
@@ -336,11 +642,14 @@ class Settings(BaseSettings):
             user = quote(self.db_user, safe="")
             password = quote(self.db_password, safe="")
             database = quote(self.db_name, safe="")
-            dialect = self.resolved_db_dialect
-            if dialect == "mysql":
-                return f"mysql+aiomysql://{user}:{password}@{self.db_host}:{self.db_port}/{database}"
             return f"postgresql+asyncpg://{user}:{password}@{self.db_host}:{self.db_port}/{database}"
-        return self.database_url
+        url = self.database_url
+        lowered = url.lower()
+        if lowered.startswith("kingbase+asyncpg://"):
+            return "postgresql+asyncpg://" + url.split("://", 1)[1]
+        if lowered.startswith("kingbase://"):
+            return "postgresql+asyncpg://" + url.split("://", 1)[1]
+        return url
 
     @property
     def resolved_migration_database_url(self) -> str:
@@ -352,23 +661,25 @@ class Settings(BaseSettings):
     def sql_storage_enabled(self) -> bool:
         if self.storage_backend == "memory":
             return False
-        if self.storage_backend in {"postgres", "mysql"}:
+        if self.storage_backend in {"postgres", "kingbase"}:
             return True
         return bool(self.db_host and self.db_user and self.db_name)
 
     @property
     def postgres_enabled(self) -> bool:
-        """True when primary SQL storage is PostgreSQL (backward-compatible name)."""
+        """True when primary SQL storage is PostgreSQL-compatible (incl. KingBase)."""
         return self.sql_storage_enabled and self.resolved_db_dialect == "postgres"
 
     @property
-    def mysql_enabled(self) -> bool:
-        return self.sql_storage_enabled and self.resolved_db_dialect == "mysql"
+    def kingbase_enabled(self) -> bool:
+        return self.sql_storage_enabled and self.storage_backend == "kingbase"
 
     @property
     def storage_label(self) -> str:
         if not self.sql_storage_enabled:
             return "memory"
+        if self.storage_backend == "kingbase":
+            return "kingbase"
         return self.resolved_db_dialect
 
     @property
@@ -384,12 +695,30 @@ class Settings(BaseSettings):
         return f"{self.kafka_host or '127.0.0.1'}:{self.kafka_port}"
 
     @property
-    def seaweedfs_enabled(self) -> bool:
+    def resolved_artifact_backend(self) -> Literal["local", "seaweedfs", "obs"]:
         if self.artifact_backend == "local":
-            return False
+            return "local"
         if self.artifact_backend == "seaweedfs":
-            return True
-        return self.seaweedfs_host is not None
+            return "seaweedfs"
+        if self.artifact_backend == "obs":
+            return "obs"
+        if self.obs_endpoint:
+            return "obs"
+        if self.seaweedfs_host is not None:
+            return "seaweedfs"
+        return "local"
+
+    @property
+    def object_storage_enabled(self) -> bool:
+        return self.resolved_artifact_backend in {"seaweedfs", "obs"}
+
+    @property
+    def seaweedfs_enabled(self) -> bool:
+        return self.resolved_artifact_backend == "seaweedfs"
+
+    @property
+    def obs_enabled(self) -> bool:
+        return self.resolved_artifact_backend == "obs"
 
     @property
     def seaweedfs_master(self) -> str:
@@ -406,6 +735,14 @@ class Settings(BaseSettings):
         return (
             f"{scheme}://{self.seaweedfs_host or '127.0.0.1'}:{self.seaweedfs_s3_port}"
         )
+
+    @property
+    def obs_s3_endpoint(self) -> str:
+        scheme = "https" if self.obs_use_ssl else "http"
+        endpoint = (self.obs_endpoint or "127.0.0.1").strip().rstrip("/")
+        if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            return endpoint
+        return f"{scheme}://{endpoint}"
 
     @property
     def allowed_cors_origins(self) -> list[str]:
@@ -448,6 +785,8 @@ class Settings(BaseSettings):
 
     @property
     def insecure_identity_headers_enabled(self) -> bool:
+        if self.test_uplink_insecure_identity is True:
+            return True
         if self.deployment_profile == "production":
             return False
         return self.allow_insecure_identity_headers is True
@@ -515,9 +854,25 @@ class Settings(BaseSettings):
             raise ValueError(f"unknown service: {service_name}") from exc
 
 
+def _validate_local_dev_storage(settings: Settings, env_file: str | Path | None) -> None:
+    if not _is_local_dev_env_file(env_file):
+        return
+    if settings.sql_storage_enabled:
+        return
+    raise ValueError(
+        "Local development (.env.dev) requires SQL storage so registrations and "
+        "projections survive process restarts. Set AURACLAW_STORAGE_BACKEND to "
+        "postgres or kingbase and configure DB_* credentials."
+    )
+
+
 @lru_cache
 def get_settings() -> Settings:
     load_secret_files()
     env_file = _resolve_settings_env_file()
     apply_local_dev_proxy_env(env_file)
-    return Settings(_env_file=env_file)
+    apply_postgresql_env_aliases(settings_env_file=env_file)
+    apply_kingbase_env_aliases(settings_env_file=env_file)
+    settings = Settings(_env_file=env_file)
+    _validate_local_dev_storage(settings, env_file)
+    return settings

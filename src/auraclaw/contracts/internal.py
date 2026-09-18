@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 INTERNAL_API_VERSION = "2026-07-22"
 
@@ -73,12 +73,14 @@ class LeaseAssertion(ContractModel):
     session_id: str
     run_id: str
     runtime_id: str | None = None
+    role: str = "root"
     user_id: str | None = None
     dept_id: str | None = None
     lease_id: str
     fencing_token: int = Field(ge=1)
     expires_at: datetime
     signature: str
+    execution_claim_token: str | None = None
 
 
 class EventInput(ContractModel):
@@ -121,6 +123,64 @@ class SessionFeedResponse(ContractModel):
     api_version: str = INTERNAL_API_VERSION
     events: tuple[dict[str, Any], ...]
     next_version: int | None = None
+
+
+class SessionRootFeedRequest(ContractModel):
+    context: InternalRequestContext
+    root_session_id: str = Field(min_length=1)
+    event_types: tuple[str, ...] | None = None
+    limit: int = Field(default=5000, ge=1, le=10000)
+
+
+class SessionRootFeedResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    events: tuple[dict[str, Any], ...]
+
+
+class SkillBindingReferenceRequest(ContractModel):
+    context: InternalRequestContext
+    package_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class SkillBindingReferenceResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    referenced: bool
+
+
+class SkillActiveBindingReferenceRequest(ContractModel):
+    context: InternalRequestContext
+    publisher: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    package_digest: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class SkillActiveBindingReferenceResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    referenced: bool
+
+
+class CollaborationCommandRequest(ContractModel):
+    context: InternalRequestContext
+    lease_assertion: LeaseAssertion
+    root_session_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    command_id: str = Field(min_length=1)
+    operation: Literal[
+        "get_graph",
+        "create_child",
+        "set_dependencies",
+        "request_review",
+        "cancel_child",
+        "join",
+        "publish_result",
+        "publish_review",
+    ]
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class CollaborationCommandResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    result: dict[str, Any]
 
 
 class OutboxClaimRequest(ContractModel):
@@ -221,6 +281,7 @@ class RuntimeRegistrationRequest(ContractModel):
     capabilities: dict[str, Any] = Field(default_factory=dict)
     capacity: int = Field(ge=0)
     draining: bool = False
+    registration_id: str = "legacy"
 
 
 class RuntimeHeartbeatRequest(ContractModel):
@@ -229,6 +290,7 @@ class RuntimeHeartbeatRequest(ContractModel):
     capacity_available: int = Field(ge=0)
     active_lease_ids: tuple[str, ...] = ()
     draining: bool = False
+    registration_id: str = "legacy"
 
 
 class RuntimeHeartbeatResponse(ContractModel):
@@ -243,6 +305,7 @@ class AssignmentClaimRequest(ContractModel):
     role: str
     capabilities: dict[str, Any] = Field(default_factory=dict)
     limit: int = Field(default=1, ge=1, le=100)
+    registration_id: str = "legacy"
 
 
 class AssignmentRecord(ContractModel):
@@ -257,6 +320,8 @@ class AssignmentRecord(ContractModel):
     resource_profile: dict[str, Any] = Field(default_factory=dict)
     budget: dict[str, Any] = Field(default_factory=dict)
     deadline: datetime | None = None
+    execution_claim_token: str
+    execution_claim_expires_at: datetime
 
 
 class AssignmentClaimResponse(ContractModel):
@@ -270,8 +335,26 @@ class AssignmentDispositionRequest(ContractModel):
     runtime_id: str
     lease_id: str
     fencing_token: int = Field(ge=1)
-    disposition: Literal["ack", "finish", "fail"]
+    disposition: Literal["ack", "finish", "fail", "suspend"]
     outcome: str | None = None
+    execution_claim_token: str | None = None
+    checkpoint_state: CheckpointState | None = None
+
+
+class AssignmentRenewRequest(ContractModel):
+    context: InternalRequestContext
+    task_id: str
+    runtime_id: str
+    registration_id: str
+    execution_claim_token: str
+    lease_id: str
+    fencing_token: int = Field(ge=1)
+
+
+class AssignmentRenewResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    lease_assertion: LeaseAssertion
+    execution_claim_expires_at: datetime
 
 
 class AssignmentDispositionResponse(ContractModel):
@@ -279,10 +362,26 @@ class AssignmentDispositionResponse(ContractModel):
     accepted: bool
 
 
+class AssignmentAbandonRequest(ContractModel):
+    context: InternalRequestContext
+    task_id: str
+    runtime_id: str
+    lease_id: str
+    fencing_token: int = Field(ge=1)
+    execution_claim_token: str | None = None
+
+
+class AssignmentAbandonResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    accepted: bool
+
+
 class ModelGenerateRequest(ContractModel):
+    purpose: Literal["execution", "approval_review"] = "execution"
     context: InternalRequestContext
     model_call_id: str
     run_id: str
+    session_id: str | None = None
     messages: tuple[dict[str, Any], ...]
     tools: tuple[dict[str, Any], ...] = ()
     capability: str = "general"
@@ -290,6 +389,9 @@ class ModelGenerateRequest(ContractModel):
     allowed_providers: tuple[str, ...] = ()
     data_classification: str = "internal"
     max_output_tokens: int = Field(default=8192, gt=0)
+    run_max_cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    runtime_metrics: dict[str, float] = Field(default_factory=dict, max_length=16)
+    prompt_cache_key: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class ModelGenerateResponse(ContractModel):
@@ -322,6 +424,8 @@ class ModelCancelResponse(ContractModel):
     api_version: str = INTERNAL_API_VERSION
     model_call_id: str
     cancelled: bool
+    status: str = "unknown"
+    provider_cancellable: bool = False
 
 
 class RuntimeServiceConfig(ContractModel):
@@ -335,6 +439,8 @@ class RuntimeServiceConfig(ContractModel):
 
 
 class PolicyEvaluateRequest(ContractModel):
+    session_id: str | None = None
+    run_id: str | None = None
     context: InternalRequestContext
     subject: str
     action: str
@@ -376,7 +482,7 @@ class ApprovalRequest(ContractModel):
     run_id: str
     action_digest: str
     policy_version: str
-    expires_at: datetime
+    expires_at: AwareDatetime
 
 
 class ApprovalCommandRequest(ContractModel):
@@ -395,7 +501,8 @@ class ApprovalCommandRequest(ContractModel):
     policy_version: str
     decision: str | None = None
     feedback: str | None = None
-    expires_at: datetime | None = None
+    actor_id: str | None = None
+    expires_at: AwareDatetime | None = None
 
 
 class ApprovalValidationResponse(ContractModel):
@@ -463,6 +570,7 @@ class ArtifactCreateUploadRequest(ContractModel):
     expected_size: int = Field(ge=0)
     expected_checksum: str
     classification: str = "internal"
+    retention_until: datetime | None = None
 
 
 class ArtifactUploadResponse(ContractModel):
@@ -507,6 +615,292 @@ class ArtifactDownloadResponse(ContractModel):
     expires_at: datetime
 
 
+class ArtifactDeleteRequest(ContractModel):
+    context: InternalRequestContext
+    artifact_id: str
+    version: int = Field(ge=1)
+    actor_id: str = Field(min_length=1, max_length=256)
+    reason_code: str = Field(min_length=1, max_length=128)
+    policy_decision_id: str = Field(min_length=1, max_length=256)
+    purpose: Literal["retention_expired", "skill_package_purge"] = "retention_expired"
+    remove_history: bool = False
+
+
+class ArtifactDeleteResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    artifact_id: str
+    version: int
+    status: Literal["deleted"] = "deleted"
+
+
+class ArtifactSkillPublicationClaimRequest(ContractModel):
+    context: InternalRequestContext
+    artifact_id: str
+    version: int = Field(ge=1)
+    command_id: str = Field(min_length=1, max_length=256)
+
+
+class ArtifactSkillPublicationClaimResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    artifact_ref: dict[str, Any]
+    claim_token: str
+    already_bound: bool = False
+
+
+class ArtifactSkillPublicationBindRequest(ContractModel):
+    context: InternalRequestContext
+    artifact_id: str
+    version: int = Field(ge=1)
+    claim_token: str = Field(min_length=1, max_length=256)
+    package_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class ArtifactSkillPublicationBindResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    status: Literal["bound"] = "bound"
+
+
+class ArtifactSkillOrphanClaimRequest(ContractModel):
+    context: InternalRequestContext
+    owner: str = Field(min_length=1, max_length=256)
+    limit: int = Field(default=100, ge=1, le=1000)
+
+
+class ArtifactSkillOrphanClaimResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    artifacts: tuple[dict[str, Any], ...] = ()
+
+
+class ArtifactSkillOrphanResolveRequest(ContractModel):
+    context: InternalRequestContext
+    artifact_id: str
+    version: int = Field(ge=1)
+    claim_token: str = Field(min_length=1, max_length=256)
+    referenced: bool
+    package_digest: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    policy_decision_id: str | None = Field(default=None, max_length=256)
+
+
+class ArtifactSkillOrphanResolveResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    status: Literal["retained", "deleted"]
+
+
+class SkillPublishInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    activate: bool = True
+    expected_installation_revision: int | None = Field(default=None, ge=0)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(default=0, ge=0)
+    files: dict[str, str] = Field(min_length=1, max_length=512)
+
+
+class SkillPublishInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    publication: dict[str, Any]
+
+
+class SkillPublishArtifactInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    activate: bool = True
+    expected_installation_revision: int | None = Field(default=None, ge=0)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(default=0, ge=0)
+    expected_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    artifact_ref: dict[str, Any]
+
+
+class SkillAdmissionListInternalRequest(ContractModel):
+    context: InternalRequestContext
+    outcome: Literal["accepted", "rejected", "quarantined"] | None = None
+    stage: str | None = Field(default=None, min_length=1, max_length=128)
+    content_policy_version: str | None = Field(default=None, min_length=1, max_length=128)
+    since: AwareDatetime | None = None
+    cursor: str | None = Field(default=None, min_length=1, max_length=2048)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class SkillAdmissionListInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    admissions: tuple[dict[str, Any], ...] = ()
+    next_cursor: str | None = None
+
+
+class SkillAdmissionMetricsInternalRequest(ContractModel):
+    context: InternalRequestContext
+    since: AwareDatetime | None = None
+
+
+class SkillAdmissionMetricsInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    metrics: tuple[dict[str, Any], ...] = ()
+
+
+class SkillInstallationInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    publisher: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    operation: Literal["install", "enable", "disable", "uninstall"]
+    force: bool = False
+    reason_code: str | None = Field(default=None, min_length=1, max_length=128)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(ge=1)
+
+
+class SkillInstallationInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    installation: dict[str, Any]
+
+
+class SkillRevokeInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    publisher: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=128)
+    reason_code: str = Field(min_length=1, max_length=128)
+    revocation_action: Literal["continue", "pause", "cancel"] = "cancel"
+    policy_version: str = Field(default="skill-revocation-v1", min_length=1, max_length=128)
+    policy_decision_id: str | None = Field(default=None, max_length=256)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(ge=1)
+
+
+class SkillRevokeInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    publication: dict[str, Any]
+
+
+class SkillRestoreInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    publisher: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=128)
+    reason_code: str = Field(min_length=1, max_length=128)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(ge=1)
+
+
+class SkillRestoreInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    publication: dict[str, Any]
+
+
+class SkillStateInternalRequest(ContractModel):
+    context: InternalRequestContext
+    publisher: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    version: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class SkillStateInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    installation: dict[str, Any] | None = None
+    publication: dict[str, Any] | None = None
+
+
+class SkillPackageStateInternalRequest(ContractModel):
+    context: InternalRequestContext
+    publisher: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=128)
+
+
+class SkillPackageStateInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    package: dict[str, Any]
+    skill_markdown: str | None = None
+
+
+class SkillPurgeInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    publisher: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=128)
+    reason_code: str = Field(min_length=1, max_length=128)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(ge=1)
+
+
+class SkillPurgeInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    package: dict[str, Any]
+
+
+class SkillPublisherRegisterInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    publisher: str = Field(min_length=1, max_length=128)
+    display_name: str = Field(min_length=1, max_length=256)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(default=0, ge=0)
+
+
+class SkillPublisherRotateKeyInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    publisher: str = Field(min_length=1, max_length=128)
+    key_id: str = Field(min_length=1, max_length=128)
+    public_key: str = Field(min_length=43, max_length=64)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(ge=1)
+
+
+class SkillPublisherRevokeKeyInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    publisher: str = Field(min_length=1, max_length=128)
+    key_id: str = Field(min_length=1, max_length=128)
+    reason_code: str = Field(min_length=1, max_length=128)
+    revocation_action: Literal["pause", "cancel"] = "cancel"
+    policy_version: str = Field(default="skill-revocation-v1", min_length=1, max_length=128)
+    policy_decision_id: str | None = Field(default=None, max_length=256)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(ge=1)
+
+
+class SkillPublisherStatusInternalRequest(ContractModel):
+    context: InternalRequestContext
+    actor_id: str = Field(min_length=1, max_length=256)
+    publisher: str = Field(min_length=1, max_length=128)
+    operation: Literal["suspend", "resume", "revoke"]
+    reason_code: str = Field(min_length=1, max_length=128)
+    revocation_action: Literal["pause", "cancel"] | None = None
+    policy_version: str | None = Field(default=None, max_length=128)
+    policy_decision_id: str | None = Field(default=None, max_length=256)
+    command_id: str = Field(min_length=1, max_length=256)
+    expected_revision: int = Field(ge=1)
+
+
+class SkillPublisherStateInternalRequest(ContractModel):
+    context: InternalRequestContext
+    publisher: str = Field(min_length=1, max_length=128)
+
+
+class SkillPublisherInternalResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    publisher: dict[str, Any]
+    keys: tuple[dict[str, Any], ...] = ()
+
+
+class SkillAdminSnapshotInternalRequest(ContractModel):
+    context: InternalRequestContext
+
+
+class SkillAdminSnapshotInternalResponse(ContractModel):
+    upgrades: tuple[dict[str, Any], ...] = ()
+    api_version: str = INTERNAL_API_VERSION
+    packages: tuple[dict[str, Any], ...] = ()
+    publications: tuple[dict[str, Any], ...] = ()
+    installations: tuple[dict[str, Any], ...] = ()
+    publishers: tuple[dict[str, Any], ...] = ()
+
+
 class AdminOperationRequest(ContractModel):
     context: InternalRequestContext
     operation_id: str
@@ -531,6 +925,7 @@ class McpRegistryAdminRequest(ContractModel):
     server_id: str | None = None
     config: dict[str, Any] | None = None
     target_revision: int | None = None
+    force_schema_update: bool = False
 
 
 class McpRegistryAdminResponse(ContractModel):
@@ -552,10 +947,32 @@ class McpRegistrySnapshotResponse(ContractModel):
     servers: tuple[dict[str, Any], ...] = ()
 
 
+class McpCapabilityTestRequest(ContractModel):
+    context: InternalRequestContext
+    server_id: str = Field(min_length=1)
+    capability_id: str = Field(min_length=1)
+    actor_id: str = Field(min_length=1)
+    dept_id: str | None = None
+    input: dict[str, Any] = Field(default_factory=dict)
+    expected_output: Any = None
+
+
+class McpCapabilityTestResponse(ContractModel):
+    api_version: str = INTERNAL_API_VERSION
+    status: Literal["passed", "failed"]
+    kind: str
+    output: Any = None
+    schema_valid: bool | None = None
+    expectation_matched: bool | None = None
+    duration_ms: int = Field(ge=0)
+    error: str | None = None
+
+
 class McpEgressCommandRequest(ContractModel):
     context: InternalRequestContext
     operation: Literal["apply", "revoke"]
     server_id: str
+    expected_revision: int | None = Field(default=None, ge=1)
     entry: dict[str, Any] | None = None
 
 
@@ -564,4 +981,3 @@ class McpEgressCommandResponse(ContractModel):
     server_id: str
     operation: str
     status: Literal["applied", "revoked"]
-

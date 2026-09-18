@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs
 
@@ -9,12 +10,11 @@ import pytest
 from auraclaw.action.ports import PolicyEvaluation
 from auraclaw.contracts.capabilities import (
     CapabilityStatus,
-    CapabilityTrustLevel,
     McpAuthStrategy,
     McpOAuthConfiguration,
     McpServerDefinition,
 )
-from auraclaw.contracts.errors import CredentialAccessError, PolicyDeniedError
+from auraclaw.contracts.errors import CredentialAccessError, McpTransportError, PolicyDeniedError
 from auraclaw.contracts.tools import CredentialReference, PolicyDecision
 from auraclaw.infrastructure.connectors.mcp.transport import ManagedRemoteMcpTransport
 from auraclaw.infrastructure.connectors.mcp.wire import (
@@ -101,10 +101,13 @@ class _Sender:
         return McpEgressResponse(
             status_code=200,
             headers={"content-type": "application/json"},
-            content=(
-                b'{"jsonrpc":"2.0","id":1,"result":'
-                b'{"value":"remote-access-token must not escape"}}'
-            ),
+            content=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": json.loads(request["content"])["id"],
+                    "result": {"value": "remote-access-token must not escape"},
+                }
+            ).encode(),
         )
 
 
@@ -128,8 +131,6 @@ def _server() -> McpServerDefinition:
             resource="https://mcp.example/v1/mcp",
             scopes=("tools.read", "tools.write"),
         ),
-        trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
-        allowed_tool_prefixes=("github.",),
         allowed_resource_schemes=("github",),
         allowed_prompt_prefixes=("github.",),
         status=CapabilityStatus.ACTIVE,
@@ -161,6 +162,25 @@ class _AllowPolicy:
             decision=PolicyDecision.ALLOW,
             decision_id="policy-remote-1",
             policy_version="m9-v1",
+        )
+
+
+class _PermissionPolicy:
+    def __init__(self) -> None:
+        self.attributes: list[dict[str, object]] = []
+
+    async def evaluate_action(self, **arguments: object) -> PolicyEvaluation:
+        attributes = arguments["attributes"]
+        assert isinstance(attributes, dict)
+        self.attributes.append(attributes)
+        return PolicyEvaluation(
+            decision=(
+                PolicyDecision.ALLOW
+                if attributes.get("permission") == "read-only"
+                else PolicyDecision.REQUIRE_APPROVAL
+            ),
+            decision_id="policy-read-only",
+            policy_version="m9-v2",
         )
 
 
@@ -211,9 +231,7 @@ def test_mcp_egress_uses_resource_indicator_pins_dns_and_hides_tokens() -> None:
             sender=sender,
         )
         proxy = CredentialProxy(
-            InMemoryVault(
-                {"vault/github-mcp#client_secret": "oauth-client-secret"}
-            )
+            InMemoryVault({"vault/github-mcp#client_secret": "oauth-client-secret"})
         )
         proxy.register_reference(
             "tenant-a",
@@ -268,13 +286,12 @@ def test_mcp_egress_uses_resource_indicator_pins_dns_and_hides_tokens() -> None:
             request=_request(),
             adapter=adapter,
         )
-        assert len(
-            [
-                call
-                for call in sender.calls
-                if call["url"] == "https://auth.example/oauth/token"
-            ]
-        ) == 1
+        assert (
+            len(
+                [call for call in sender.calls if call["url"] == "https://auth.example/oauth/token"]
+            )
+            == 1
+        )
         sender.sse = True
         streamed = await adapter(_request(), "oauth-client-secret")
         assert streamed["result"] == {"tools": []}
@@ -292,9 +309,7 @@ def test_mcp_egress_uses_resource_indicator_pins_dns_and_hides_tokens() -> None:
                 adapter=adapter,
             )
         wrong_scope_proxy = CredentialProxy(
-            InMemoryVault(
-                {"vault/github-mcp#client_secret": "oauth-client-secret"}
-            )
+            InMemoryVault({"vault/github-mcp#client_secret": "oauth-client-secret"})
         )
         wrong_scope_proxy.register_reference(
             "tenant-a",
@@ -399,8 +414,6 @@ def test_mcp_egress_allows_loopback_http_when_private_host_allowlisted() -> None
                 title="Java Agent Runtime MCP Gateway",
                 endpoint="http://127.0.0.1:48080/rpc-api/agent-runtime/mcp",
                 credential_ref="vault/java-mcp#client_secret",
-                trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
-                allowed_tool_prefixes=("",),
                 allowed_private_hosts=("127.0.0.1",),
                 status=CapabilityStatus.ACTIVE,
                 enabled=True,
@@ -426,10 +439,7 @@ def test_mcp_egress_allows_loopback_http_when_private_host_allowlisted() -> None
             "local-java-mcp-debug",
         )
         assert sender.calls
-        assert (
-            sender.calls[0]["url"]
-            == "http://127.0.0.1:48080/rpc-api/agent-runtime/mcp"
-        )
+        assert sender.calls[0]["url"] == "http://127.0.0.1:48080/rpc-api/agent-runtime/mcp"
         assert sender.calls[0]["approved_ip"] == "127.0.0.1"
 
     asyncio.run(scenario())
@@ -445,7 +455,6 @@ def test_mcp_egress_rejects_public_http_even_when_host_allowlisted() -> None:
             endpoint="http://mcp.example.com/mcp",
             credential_ref="vault/github-mcp#client_secret",
             auth_strategy=McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT,
-            allowed_tool_prefixes=("github.",),
             allowed_private_hosts=("mcp.example.com",),
             status=CapabilityStatus.ACTIVE,
             enabled=True,
@@ -494,9 +503,7 @@ def test_hands_remote_transport_passes_only_reference_and_policy_evidence() -> N
         assert call["policy_decision_id"] == "policy-remote-1"
         assert call["tool_name"] == "mcp:github-mcp"
         assert "oauth-client-secret" not in repr(call)
-        assert notifications == [
-            ("github-mcp", "notifications/tools/list_changed")
-        ]
+        assert notifications == [("github-mcp", "notifications/tools/list_changed")]
 
         with pytest.raises(PolicyDeniedError, match="tenant scope"):
             await transport.send(
@@ -519,9 +526,39 @@ def test_hands_remote_transport_rejects_mismatched_response_id() -> None:
             credentials=MismatchedCredentials(),
             policy=_AllowPolicy(),
         )
-        with pytest.raises(ValueError, match="response id"):
+        with pytest.raises(McpTransportError, match="response id"):
             await transport.send(
                 McpJsonRpcRequest(id="expected", method="tools/list"),
+                trusted_context=_trusted(),
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["resources/read", "prompts/get", "tools/call"])
+def test_hands_remote_transport_skips_approval_for_read_only_mcp_calls(
+    method: str,
+) -> None:
+    async def scenario() -> None:
+        credentials = _Credentials()
+        policy = _PermissionPolicy()
+        transport = ManagedRemoteMcpTransport(
+            _server(),
+            credentials=credentials,
+            policy=policy,
+        )
+        response = await transport.send(
+            McpJsonRpcRequest(id=7, method=method),
+            trusted_context=_trusted(),
+            read_only=True,
+        )
+        assert response.result == {"tools": []}
+        assert credentials.calls[0]["policy_decision_id"] == "policy-read-only"
+        assert policy.attributes[0]["permission"] == "read-only"
+
+        with pytest.raises(PolicyDeniedError, match="policy denied"):
+            await transport.send(
+                McpJsonRpcRequest(id=8, method="tools/call"),
                 trusted_context=_trusted(),
             )
 
@@ -539,8 +576,6 @@ def test_mcp_egress_sends_department_snapshot_headers() -> None:
             endpoint="https://mcp.example/v1/mcp",
             credential_ref="vault/chaintower-mcp#workload",
             auth_strategy=McpAuthStrategy.WORKLOAD_TRUSTED_CONTEXT,
-            trust_level=CapabilityTrustLevel.TENANT_VERIFIED,
-            allowed_tool_prefixes=("github.",),
             status=CapabilityStatus.ACTIVE,
             enabled=True,
         )
@@ -594,3 +629,110 @@ def test_mcp_server_configuration_is_typed_and_secret_free() -> None:
     serialized = server.model_dump_json()
     assert "oauth-client-secret" not in serialized
     assert "vault/github-mcp#client_secret" in serialized
+
+
+@pytest.mark.parametrize("name", ["github.issue.get", "outside.issue.get", "lookup"])
+def test_mcp_egress_does_not_restrict_tool_name_prefix(name: str) -> None:
+    async def scenario() -> None:
+        sender = _Sender()
+        adapter = ManagedMcpEgressAdapter(_server(), resolver=_Resolver(), sender=sender)
+        request = _request()
+        request["params"]["name"] = name
+        await adapter(request, "oauth-client-secret")
+        assert json.loads(sender.calls[-1]["content"])["params"]["name"] == name
+        assert sender.calls[-1]["headers"]["Mcp-Name"] == name
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("name", [None, "", "   ", 42, [], {}])
+def test_mcp_egress_rejects_invalid_tool_name_before_network(name: object) -> None:
+    async def scenario() -> None:
+        sender = _Sender()
+        adapter = ManagedMcpEgressAdapter(_server(), resolver=_Resolver(), sender=sender)
+        request = _request()
+        request["params"]["name"] = name
+        with pytest.raises(CredentialAccessError, match="non-empty string"):
+            await adapter(request, "oauth-client-secret")
+        assert sender.calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "method,params",
+    [
+        ("resources/read", {"uri": "https://outside.example/data"}),
+        ("prompts/get", {"name": "outside.review"}),
+    ],
+)
+def test_mcp_egress_keeps_resource_and_prompt_filters(method: str, params: dict) -> None:
+    async def scenario() -> None:
+        sender = _Sender()
+        adapter = ManagedMcpEgressAdapter(_server(), resolver=_Resolver(), sender=sender)
+        request = _request()
+        request["method"] = method
+        request["params"].update(params)
+        with pytest.raises(CredentialAccessError, match="outside .*allowlist"):
+            await adapter(request, "oauth-client-secret")
+        assert sender.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_shared_mcp_uses_bound_platform_credential_and_keeps_caller_audit() -> None:
+    async def scenario() -> None:
+        server = _server().model_copy(update={"tenant_id": None})
+        adapter = ManagedMcpEgressAdapter(server, resolver=_Resolver(), sender=_Sender())
+        proxy = CredentialProxy(InMemoryVault({server.credential_ref: "oauth-client-secret"}))
+        assert server.credential_ref is not None
+        proxy.register_reference(
+            "platform",
+            CredentialReference(
+                credential_ref=server.credential_ref, provider=server.server_id,
+                account_scope=adapter.credential_scope, allowed_operations=("mcp.invoke",),
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            ),
+        )
+        await proxy.invoke(
+            tenant_id="tenant-a", session_id="session-a", tool_name=server.server_id,
+            credential_ref=server.credential_ref, operation="mcp.invoke",
+            request=_request(), adapter=adapter,
+        )
+        assert proxy.usage_audit()[0]["tenant_id"] == "tenant-a"
+        with pytest.raises(CredentialAccessError):
+            await proxy.invoke(
+                tenant_id="tenant-a", session_id="session-a", tool_name=server.server_id,
+                credential_ref="vault/other#secret", operation="mcp.invoke",
+                request=_request(), adapter=adapter,
+            )
+        await proxy.revoke_reference("platform", server.credential_ref)
+        with pytest.raises(CredentialAccessError):
+            await proxy.invoke(
+                tenant_id="tenant-a", session_id="session-a", tool_name=server.server_id,
+                credential_ref=server.credential_ref, operation="mcp.invoke",
+                request=_request(), adapter=adapter,
+            )
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("owner", ["tenant-other", "platform"])
+def test_tenant_owned_mcp_cannot_borrow_its_credential_from_another_tenant(owner: str) -> None:
+    async def scenario() -> None:
+        server = _server().model_copy(update={"tenant_id": owner})
+        adapter = ManagedMcpEgressAdapter(server, resolver=_Resolver(), sender=_Sender())
+        proxy = CredentialProxy(InMemoryVault({server.credential_ref: "oauth-client-secret"}))
+        assert server.credential_ref is not None
+        proxy.register_reference(owner, CredentialReference(
+            credential_ref=server.credential_ref, provider=server.server_id,
+            account_scope=adapter.credential_scope, allowed_operations=("mcp.invoke",),
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        ))
+        with pytest.raises(CredentialAccessError, match="outside tenant scope"):
+            await proxy.invoke(
+                tenant_id="tenant-a", session_id="session-a", tool_name=server.server_id,
+                credential_ref=server.credential_ref, operation="mcp.invoke",
+                request=_request(), adapter=adapter,
+            )
+        assert not proxy.usage_audit()
+    asyncio.run(scenario())

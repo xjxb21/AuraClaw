@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import Any
 
+from auraclaw.contracts.approval_mode import ApprovalConfiguration
 from auraclaw.contracts.events import CanonicalEvent
 from auraclaw.contracts.state import RunStatus, SessionStatus
+from auraclaw.domain.runtime_budget import usage
 
 
 class ProjectionGapError(RuntimeError):
@@ -17,12 +20,19 @@ class UnsupportedEventError(RuntimeError):
 
 
 KNOWN_TASK_EVENTS = {
+    "runtime.budget.reserved",
+    "runtime.progress.recorded",
     "session.created",
+    "session.approval_mode_changed",
+    "policy.review.requested",
+    "policy.review.completed",
+    "policy.mode.resolved",
     "user.message.appended",
     "run.requested",
     "run.scheduled",
     "run.started",
     "model.turn.completed",
+    "model.input.prepared",
     "model.output.completed",
     "tool.call.requested",
     "tool.call.completed",
@@ -61,6 +71,7 @@ KNOWN_TASK_EVENTS = {
     "delivery.succeeded",
     "delivery.failed",
     "delivery.dead_lettered",
+    "delivery.reconciling",
 }
 
 
@@ -116,9 +127,7 @@ class InMemoryTaskProjection:
             for (view_tenant, _session_id), view in self._tasks.items()
             if view_tenant == tenant_id
         ]
-        return page_task_views(
-            views, kind=kind, status=status, cursor=cursor, limit=limit
-        )
+        return page_task_views(views, kind=kind, status=status, cursor=cursor, limit=limit)
 
     async def clear(self) -> None:
         async with self._lock:
@@ -170,12 +179,70 @@ class InMemoryTaskProjection:
             "source": "chat",
             "schedule_id": None,
             "occurrence_id": None,
+            "approval": {},
+            **ApprovalConfiguration().public_dict(),
             "projection_version": 0,
         }
 
     @staticmethod
     def _apply(view: dict[str, Any], event: CanonicalEvent) -> None:
         payload = event.payload
+        if event.type == "run.requested":
+            view["runtime_budget"] = {
+                "run_id": payload.get("run_id"),
+                "limits": payload.get("budget", {}),
+                "_facts": {},
+            }
+        if event.type in {"runtime.budget.reserved", "model.turn.completed", "tool.call.completed"}:
+            budget = dict(view.get("runtime_budget", {}))
+            if budget.get("run_id") == event.run_id:
+                facts = dict(budget.get("_facts", {}))
+                identity = payload.get(
+                    "reservation_id",
+                    payload.get("model_call_id", payload.get("tool_invocation_id")),
+                )
+                # Keep only accounting data; business tool output is never copied here.
+                minimal = {
+                    k: payload[k]
+                    for k in (
+                        "reservation_id",
+                        "model_call_id",
+                        "tool_invocation_id",
+                        "kind",
+                        "output_tokens",
+                        "usage",
+                    )
+                    if k in payload
+                }
+                if event.type == "tool.call.completed":
+                    result = payload.get("result", {})
+                    minimal["result"] = {
+                        "error_code": result.get("error_code"),
+                        "metadata": {
+                            "dispatch_started": result.get("metadata", {}).get("dispatch_started")
+                        },
+                    }
+                facts[f"{event.type}:{identity}"] = {
+                    "type": event.type,
+                    "run_id": event.run_id,
+                    "payload": minimal,
+                }
+                budget.update(
+                    _facts=facts,
+                    usage=usage(
+                        [SimpleNamespace(**fact) for fact in facts.values()], str(event.run_id)
+                    ),
+                )
+                view["runtime_budget"] = budget
+        if "approval" in payload and event.type in {
+            "session.created",
+            "child.created",
+            "run.requested",
+            "session.resumed",
+            "session.approval_mode_changed",
+        }:
+            approval = ApprovalConfiguration.model_validate(payload["approval"]).public_dict()
+            view.update(approval=approval, **approval)
         if event.type == "session.created":
             view.update(
                 goal=payload["goal"],
@@ -313,6 +380,18 @@ class InMemoryTaskProjection:
                 lineage={"review": payload},
             )
         elif event.type == "run.failed":
+            failure = payload.get("error")
+            if isinstance(failure, dict):
+                error = dict(failure)
+            elif failure is None:
+                error = {}
+            else:
+                error = {"message": str(failure)}
+            error_code = payload.get("error_code")
+            if isinstance(error_code, str) and error_code:
+                error.setdefault("code", error_code)
+            if isinstance(payload.get("error_details"), dict):
+                error["details"] = dict(payload["error_details"])
             view.update(
                 status=(
                     SessionStatus.READY.value
@@ -321,7 +400,7 @@ class InMemoryTaskProjection:
                 ),
                 run_status=RunStatus.FAILED.value,
                 current_stage="failed",
-                error=payload.get("error"),
+                error=error or None,
             )
         elif event.type == "run.cancelled":
             view.update(
@@ -386,8 +465,7 @@ class InMemoryTaskProjection:
                             "artifact_refs": payload.get("artifact_refs", []),
                             "output_summary": payload.get("output_summary"),
                         }
-                        if activation.get("skill_activation_id")
-                        == payload["skill_activation_id"]
+                        if activation.get("skill_activation_id") == payload["skill_activation_id"]
                         else {}
                     ),
                 }

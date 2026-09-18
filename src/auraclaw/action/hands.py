@@ -10,6 +10,7 @@ from auraclaw.action.ports import ResourceReader
 from auraclaw.action.tool_gateway import ToolGateway, ToolRegistry
 from auraclaw.contracts.hands import (
     HandsCancelResponse,
+    HandsInvocationStatusResponse,
     HandsPage,
     HandsPromptDescriptor,
     HandsPromptResult,
@@ -51,7 +52,6 @@ class HandsGateway:
         *,
         cursor: str | None = None,
     ) -> HandsPage[HandsToolDescriptor]:
-        del trusted
         tools = tuple(
             HandsToolDescriptor(
                 name=capability.name,
@@ -64,6 +64,10 @@ class HandsGateway:
                 risk_level=capability.risk_level.value,
             )
             for capability in self._registry.discover()
+            if (
+                capability.invocation_ref is None
+                or capability.invocation_ref.tenant_id in {None, trusted.tenant_id}
+            )
         )
         return _page(tools, cursor, self._page_size)
 
@@ -130,9 +134,7 @@ class HandsGateway:
         deadline = _optional_utc(trusted.deadline)
         if call.deadline is not None:
             requested = _as_utc(call.deadline)
-            deadline = (
-                min(deadline, requested) if deadline is not None else requested
-            )
+            deadline = min(deadline, requested) if deadline is not None else requested
         invocation = ToolInvocation(
             tool_invocation_id=call.tool_invocation_id,
             tenant_id=trusted.tenant_id,
@@ -150,13 +152,38 @@ class HandsGateway:
             approval_id=call.approval_id,
             credential_ref=call.credential_ref,
             user_id=trusted.user_id,
+            dept_id=trusted.dept_id,
+            actor_role=(
+                trusted.lease_assertion.role if trusted.lease_assertion is not None else None
+            ),
         )
         result = await self._gateway.execute(invocation)
         return _tool_result(result)
 
-    async def cancel_invocation(self, tool_invocation_id: str) -> HandsCancelResponse:
-        cancelled = await self._gateway.cancel(tool_invocation_id)
+    async def cancel_invocation(
+        self, trusted: HandsTrustedContext, tool_invocation_id: str
+    ) -> HandsCancelResponse:
+        cancelled = await self._gateway.cancel(tool_invocation_id, tenant_id=trusted.tenant_id)
         return HandsCancelResponse(cancelled=cancelled)
+
+    async def get_invocation_status(
+        self, trusted: HandsTrustedContext, tool_invocation_id: str
+    ) -> HandsInvocationStatusResponse:
+        status = await self._gateway.get_authoritative_status(trusted.tenant_id, tool_invocation_id)
+        if status is None or (status.root_session_id, status.session_id, status.run_id) != (
+            trusted.root_session_id,
+            trusted.session_id,
+            trusted.run_id,
+        ):
+            return HandsInvocationStatusResponse(found=False)
+        return HandsInvocationStatusResponse(
+            found=True,
+            status=status.status,
+            side_effect_status=status.side_effect_status,
+            error_code=status.error_code,
+            cancel_requested=status.cancel_requested,
+            result=_tool_result(status.result) if status.result is not None else None,
+        )
 
 
 def _tool_result(result: ToolResult) -> HandsToolResult:

@@ -10,6 +10,8 @@ from uuid import uuid4
 from auraclaw.contracts.commands import CommandContext
 from auraclaw.contracts.errors import VersionConflictError
 from auraclaw.contracts.events import CanonicalEvent, NewEvent, utc_now
+from auraclaw.domain.runtime_budget import govern
+from auraclaw.domain.skill_execution import has_active_skill_reference
 from auraclaw.session.ports import AppendResult, ClaimedOutboxRecord, SessionSnapshot
 
 DELIVERY_TRIGGER_EVENTS = {
@@ -19,7 +21,18 @@ DELIVERY_TRIGGER_EVENTS = {
     "approval.requested",
     "child.result_published",
 }
-CONTROL_TRIGGER_EVENTS = {"run.requested", "session.resumed", "dependency.changed"}
+CONTROL_TRIGGER_EVENTS = {
+    "skill.invocation.requested",
+    "run.requested",
+    "session.resumed",
+    "approval.approved",
+    "approval.rejected",
+    "dependency.changed",
+    "child.result_published",
+    "review.completed",
+    "run.failed",
+    "run.cancelled",
+}
 
 
 @dataclass
@@ -78,6 +91,55 @@ class InMemoryEventStore:
             key=lambda event: (event.tenant_id, event.session_id, event.aggregate_version),
         )
 
+    async def has_skill_package_reference(self, tenant_id: str, package_digest: str) -> bool:
+        for event in await self.load_all(tenant_id):
+            if event.type != "skill.activated":
+                continue
+            direct = event.payload.get("package_digest")
+            activation = event.payload.get("activation")
+            binding = activation.get("binding") if isinstance(activation, dict) else None
+            nested = binding.get("package_digest") if isinstance(binding, dict) else None
+            if direct == package_digest or nested == package_digest:
+                return True
+        return False
+
+    async def has_active_skill_reference(
+        self,
+        tenant_id: str,
+        publisher: str,
+        name: str,
+        package_digest: str | None = None,
+    ) -> bool:
+        return has_active_skill_reference(
+            await self.load_all(tenant_id), publisher, name, package_digest
+        )
+
+    async def load_root(
+        self,
+        tenant_id: str,
+        root_session_id: str,
+        *,
+        event_types: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> list[CanonicalEvent]:
+        allowed = set(event_types) if event_types is not None else None
+        events = [
+            event
+            for (stream_tenant, _), stream in self._streams.items()
+            if stream_tenant == tenant_id
+            for event in stream
+            if event.root_session_id == root_session_id
+            and (allowed is None or event.type in allowed)
+        ]
+        events.sort(
+            key=lambda event: (
+                event.occurred_at,
+                event.session_id,
+                event.aggregate_version,
+            )
+        )
+        return events if limit is None else events[:limit]
+
     async def get_snapshot(self, tenant_id: str, session_id: str) -> SessionSnapshot | None:
         return self._snapshots.get((tenant_id, session_id))
 
@@ -102,6 +164,10 @@ class InMemoryEventStore:
         async with self._lock:
             previous = self._commands.get(command_key)
             if previous is not None:
+                if command_result.get("_request_fingerprint") != previous.get(
+                    "_request_fingerprint"
+                ):
+                    raise VersionConflictError("command was reused with a different request")
                 return AppendResult(events=[], command_result=dict(previous), deduplicated=True)
 
             stream = self._streams.setdefault(stream_key, [])
@@ -110,6 +176,11 @@ class InMemoryEventStore:
                     f"expected Session version {context.expected_version}, got {len(stream)}"
                 )
 
+            root_events = [e for (tenant, _), rows in self._streams.items()
+                           if tenant == context.tenant_id for e in rows
+                           if e.root_session_id == root_session_id]
+            events = govern(root_events, events, session_id=session_id,
+                            root_session_id=root_session_id, run_id=run_id)
             canonical: list[CanonicalEvent] = []
             for offset, event in enumerate(events, start=1):
                 stored = CanonicalEvent(
@@ -235,8 +306,7 @@ class InMemoryEventStore:
                 # A live claim or poison record must block later events.
                 blocked_sessions.add(session_key)
                 claim_expired = (
-                    record.claim_expires_at is not None
-                    and record.claim_expires_at <= now
+                    record.claim_expires_at is not None and record.claim_expires_at <= now
                 )
                 available = record.claimed_by is None or claim_expired
                 if record.poisoned or not available:

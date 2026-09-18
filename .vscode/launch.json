@@ -8,10 +8,23 @@
       "module": "auraclaw",
       "args": ["serve", "--host", "0.0.0.0"],
       "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "envFile": "${workspaceFolder}/.env.dev",
+      "env": {
+        "PYTHONUTF8": "1"
+      },
       "console": "integratedTerminal",
-      "justMyCode": false
+      "justMyCode": true,
+      "subProcess": false,
+      "windows": {
+        "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+      },
+      "osx": {
+        "python": "${workspaceFolder}/.venv/bin/python"
+      },
+      "linux": {
+        "python": "${workspaceFolder}/.venv/bin/python"
+      }
     },
     {
       "name": "AuraMCP run",
@@ -20,15 +33,30 @@
       "module": "auramcp",
       "args": ["run", "--host", "127.0.0.1", "--port", "8020"],
       "cwd": "${workspaceFolder}/../AuraMCP",
-      "python": "${workspaceFolder}/../AuraMCP/.venv/bin/python",
+      "python": "${workspaceFolder}/../AuraMCP/.venv/Scripts/python.exe",
       "envFile": "${workspaceFolder}/../AuraMCP/.env",
       "console": "integratedTerminal",
-      "justMyCode": false
+      "justMyCode": true,
+      "subProcess": false,
+      "windows": {
+        "python": "${workspaceFolder}/../AuraMCP/.venv/Scripts/python.exe"
+      },
+      "osx": {
+        "python": "${workspaceFolder}/../AuraMCP/.venv/bin/python"
+      },
+      "linux": {
+        "python": "${workspaceFolder}/../AuraMCP/.venv/bin/python"
+      }
     }
   ],
   "compounds": [
     {
-      "name": "AuraClaw + AuraMCP",
+      "name": "AuraClaw 12 服务",
+      "configurations": ["AuraClaw serve"],
+      "stopAll": true
+    },
+    {
+      "name": "AuraClaw 12 服务 + AuraMCP",
       "configurations": ["AuraClaw serve", "AuraMCP run"],
       "stopAll": true
     }
